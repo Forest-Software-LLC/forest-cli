@@ -1,0 +1,10 @@
+{
+  "name": "demoproject",
+  "description": "A new Forest package",
+  "version": "0.1.0",
+  "platform": "roblox",
+  "main": "init.lua",
+  "dependencies": {
+    "edentest1": "0.0.4"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "forest-cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "forest-cli": "cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node cli.ts"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^11.1.0",
+    "dotenv": "^16.5.0",
+    "inquirer": "^9.2.12"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.1",
+    "typescript": "^5.4.0"
+  },
+  "main": "index.js",
+  "author": "",
+  "license": "ISC",
+  "description": ""
+}
