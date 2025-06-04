@@ -20,9 +20,11 @@ export async function installCommand(targetPackage? : string, options? : { versi
         error(`Failed to fetch package information: ${ e }`);
         return;
     }
-    
 
+    
+    
     const info = JSON.parse(readFileSync('forest.json', 'utf-8'));
+    console.log('Package information:', packageInfo);
 
     if (targetPackage) {
         // Installing a specific package
@@ -37,7 +39,7 @@ export async function installCommand(targetPackage? : string, options? : { versi
             return;
         }
 
-        info.dependencies[targetPackage] = options?.version || 'latest';
+        info.dependencies[targetPackage] = packageInfo.version;
 
         success(`Package ${targetPackage} added to dependencies.`);
 
