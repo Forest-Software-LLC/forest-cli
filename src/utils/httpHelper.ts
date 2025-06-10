@@ -1,6 +1,7 @@
 
 import { storeTokens, getStoredTokens, loginCommand } from "../commands/login";
 import got, { OptionsOfJSONResponseBody, Response} from 'got';
+import ora from 'ora';
 
 function tryRefresh() {
     let tokens = getStoredTokens();
@@ -28,23 +29,36 @@ function tryRefresh() {
     })
 }
 
-export async function makeRequest(url: string, options: OptionsOfJSONResponseBody = {}, _isRetry : boolean = false): Promise<Response> {
-    console.log('Request URL:', process.env.FOREST_API_URL + url);
+export async function makeRequest(url: string, options: OptionsOfJSONResponseBody = {}, progressCallback? : (isUpload : boolean, progress : number) => (void)): Promise<Response> {
+    //console.log('Request URL:', process.env.FOREST_API_URL + url);
+
+    if (progressCallback) {
+        progressCallback(true, 0);
+    }
 
     let tokens = getStoredTokens();
     
-    const response = await got(process.env.FOREST_API_URL + url, {
-        ...options,
-        responseType : 'json',
-        throwHttpErrors: false,
-        headers: {
-            'Authorization': `Bearer ${tokens.accessToken}`,
-            ...options.headers,
-        },
-    })
+    let response;
+    
+    try {
+        const req = got(process.env.FOREST_API_URL + url, {
+            ...options,
+            responseType : 'json',
+            throwHttpErrors: false,
+            headers: {
+                'Authorization': `Bearer ${tokens.accessToken}`,
+                ...options.headers,
+            },
+        })
+        
+        response = await req;
+
+    } catch (error) {
+        throw error;
+    }
 
     // Check if the response is unauthorized (401)
-    if (response.statusCode === 401 && !_isRetry) {
+    if (response.statusCode === 401) {
         console.log('Unauthorized request, attempting to refresh token...');
 
         try {

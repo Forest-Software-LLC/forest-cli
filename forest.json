@@ -1,11 +1,10 @@
 {
-  "name": "my-project",
+  "name": "project-forest",
   "description": "A new Forest package",
   "version": "0.1.0",
   "platform": "roblox",
   "main": "init.lua",
   "dependencies": {
-    "edentest1": "0.0.4",
-    "my-project": "0.1.0"
+    "test-2a": "^0.1.0"
   }
 }

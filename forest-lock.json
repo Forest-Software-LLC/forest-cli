@@ -1,37 +1,54 @@
 {
-    "lockVersion" : 1,
-    "packages" : {
-        "@u/a" : {
-            "version" : "1.0.0",
-            "resolved" : "https://registry.forestpm.dev/@u/a/",
-            "integrity" : "sha512-abc1234567890abcdefg1234567890abcdefg1234567890abcdefg1234567890abcdefg1234567890abcdefg==",
-            "dependencies" : {
-                "@u/b" : {
-                    "version" : "1.0.0",
-                    "primary" : true
-                }
-            }
+  "fileVersion": 1,
+  "packages": {
+    "test-2a": [
+      {
+        "version": "0.1.0",
+        "resolved": "https://registry.forestpm.dev/",
+        "integrity": "abc-1234",
+        "dependencies": {
+          "test-a": {
+            "version": "0.1.0",
+            "primary": true
+          },
+          "test-b": {
+            "version": "0.1.0",
+            "primary": true
+          },
+          "test-c": {
+            "version": "0.1.0",
+            "primary": true
+          }
         },
-
-        "@u2/c" : {
-            "version" : "1.0.0",
-            "resolved" : "https://registry.forestpm.dev/@u/a/",
-            "integrity" : "sha512-abc1234567890abcdefg1234567890abcdefg1234567890abcdefg1234567890abcdefg1234567890abcdefg==",
-            "dependencies" : {
-                "@u/b" : {
-                    "version" : "1.0.1",
-                    "primary" : false
-                }
-            }
-        }
-    },
-    "subDepenencies" : {
-        "@u/b" : [
-            {
-                "version" : "1.0.0",
-                "resolved" : "https://registry.forestpm.dev/@u/b/",
-                "integrity" : "sha512-xyz1234567890abcdefg1234567890abcdefg1234567890abcdefg1234567890abcdefg1234567890abcdefg=="
-            }
-        ]
-    }
+        "location": "packages"
+      }
+    ],
+    "test-c": [
+      {
+        "version": "0.1.0",
+        "resolved": "https://registry.forestpm.dev/",
+        "integrity": "abc-1234",
+        "dependencies": {},
+        "location": "packages/test-c"
+      }
+    ],
+    "test-a": [
+      {
+        "version": "0.1.0",
+        "resolved": "https://registry.forestpm.dev/",
+        "integrity": "abc-1234",
+        "dependencies": {},
+        "location": "packages/test-a"
+      }
+    ],
+    "test-b": [
+      {
+        "version": "0.1.0",
+        "resolved": "https://registry.forestpm.dev/",
+        "integrity": "abc-1234",
+        "dependencies": {},
+        "location": "packages/test-b"
+      }
+    ]
+  }
 }
