@@ -1,30 +1,32 @@
-import { info, success, error } from '../utils/logger.js';
+import { Message } from '../utils/logger.js';
 import inquirer from 'inquirer';
 import { writeFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
+import { lockfileGen } from '../utils/lockfileGen.js';
 
 import { makeRequest } from '../utils/httpHelper.js';
 
 
 export async function installCommand(targetPackage? : string, options? : { version? : string }) {
+    const msg = new Message('Installing package...');
+
     if (!existsSync('forest.json')) {
-        error('No forest.json found in the current directory. Please run `forest init` to create a new package.');
+        msg.fail('No forest.json found in the current directory. Please run `forest init` to create a new package.');
         return;
     }
 
     let packageInfo;
     try {
-        packageInfo = await makeRequest(`v1/package/get?packageId=${targetPackage}&version=${options?.version || 'latest'}`, {
+        packageInfo = await makeRequest(`v1/package/get?packageId=${targetPackage}&version=${encodeURIComponent(options?.version || 'latest')}`, {
             method : "GET",
         })
     } catch (e) {
-        error(`Failed to fetch package information: ${ e }`);
+        msg.fail(`Failed to fetch package information: ${ e }`);
         return;
     }
 
     
     
     const info = JSON.parse(readFileSync('forest.json', 'utf-8'));
-    console.log('Package information:', packageInfo);
 
     if (targetPackage) {
         // Installing a specific package
@@ -34,17 +36,22 @@ export async function installCommand(targetPackage? : string, options? : { versi
         }
 
         if (info.dependencies[targetPackage]) {
-            error(`Package ${targetPackage} is already installed.`);
+            msg.info(`Package ${targetPackage} is already installed.`);
             
             return;
         }
 
-        info.dependencies[targetPackage] = packageInfo.version;
-
-        success(`Package ${targetPackage} added to dependencies.`);
+        info.dependencies[targetPackage] = "^" + packageInfo.version;
 
         writeFileSync('forest.json', JSON.stringify(info, null, 2));
     }
 
     // Check that packages are all installed
+
+    // Generate lockfile
+
+    const lockfileContent = await lockfileGen(info, msg);
+    writeFileSync('forest-lock.json', lockfileContent);
+
+    msg.success(`Package ${targetPackage} added!`);
 }

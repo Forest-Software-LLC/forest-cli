@@ -7,6 +7,8 @@ import ignore from 'ignore';
 import FormData from 'form-data';
 import { PassThrough } from 'stream';
 import { getStreamAsBuffer } from 'get-stream';
+import { SingleBar, Presets } from 'cli-progress';
+import { Message } from '../utils/logger.js';
 
 import { Readable } from 'stream';
 
@@ -61,18 +63,17 @@ async function createTarballBuffer(directory: string): Promise<Buffer> {
 }
 
 export async function publishCommand() {
-    info('Publishing package...');
-   
+    let msg = new Message("Publishing package...");
+
     if (!existsSync('forest.json')) {
-        throw new Error('No forest.json found in the current directory. Please run `forest init` to create a new package.');
+      msg.fail('No forest.json found in the current directory. Please run `forest init` to create a new package.');
+      return;
     }
 
     const packageInfo = JSON.parse(readFileSync('forest.json', 'utf-8'));
 
     packageInfo.public = true
     const tarStream = await createTarballBuffer(process.cwd());
-
-    console.log(tarStream instanceof Readable); 
 
     const formData = new FormData();
     console.log(JSON.stringify(packageInfo));
@@ -88,7 +89,8 @@ export async function publishCommand() {
         body : formData
     }).then(async (response) => {
         console.log('Response status:', response);
-    }).catch((error) => {
-        console.error('Error during package upload:', error);
+        msg.success('Package uploaded successfully!');
+    }).catch((error) => {        
+        msg.fail(`Failed to upload package: ${error.message}`);
     })
 }
