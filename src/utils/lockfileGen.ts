@@ -12,7 +12,7 @@ type Package = {
     version : string,
     resolved : string,
     integrity : string,
-    location? : string,
+    location : string,
     dependencies : Record<string, PackageDependency>,
 }
 
@@ -98,61 +98,83 @@ export async function lockfileGen(forestJson: ForestJson, msg : Message) : Promi
     };
 
 
-    async function makeDepTree(packageName : string, version : string, location : string) {
+    async function makeDepTree(packageName : string, version : string, location : string) : Promise<boolean> {
+        // Fetch package information from the registry
         let response : {version : string, dependencies?: Record<string, string>};
         try {
             response = await makeRequest(`v1/package/get?packageId=${packageName}&version=${encodeURIComponent(version)}`, {
                 method : "GET",
             })
         } catch (error) {
-            console.error(`Failed to fetch package information for ${packageName} @ ${version}:`, error);
-            return null
+            throw new Error(`Failed to fetch package information for ${packageName} @ ${version}: ${error}`);
         }
 
+        // Ensure the package exists in the lockfile
         if (!lockfileContent.packages[packageName]) {
             lockfileContent.packages[packageName] = [];
         }
 
-        let depsDict : Record<string, PackageDependency> = {};
-        lockfileContent.packages[packageName].push({ 
-            version : response.version,
-            resolved: `https://registry.forestpm.dev/`,
-            integrity: `abc-1234`,
-            dependencies : depsDict,
-            location
-        });
-
-        
-        for (const [depName, depVersion] of Object.entries(response.dependencies || {})) {
-            if (!semver.validRange(depVersion)) {
-                console.warn(`Skipping invalid version range for dependency ${depName}: ${depVersion}`);
-                return;
-            }
-
-            let currentInstalledVersions : Array<string> = [];
-            if (lockfileContent.packages[depName]) {
-                currentInstalledVersions = lockfileContent.packages[depName].map(pkg => pkg.version);
-            }
-
+        // Validate the package version
+        const packageVersion = response.version;
+        if (!semver.validRange(packageVersion)) {
+            throw new Error(`Skipping invalid version range for dependency ${packageName}: ${packageVersion}`);
             
-            let depExists = semver.maxSatisfying(currentInstalledVersions, depVersion);
-            //console.log(depExists, depName, currentInstalledVersions)
+        }
 
-            depsDict[depName] = {
-                version: depVersion as string,
-                primary: depExists == undefined,
-            };
+        // Check if the package is already installed
+        let currentInstalledVersions : Array<string> = [];
+        if (lockfileContent.packages[packageName]) {
+            currentInstalledVersions = lockfileContent.packages[packageName].map(pkg => pkg.version);
+        }
 
-            if (depExists == undefined) {
-                await makeDepTree(depName, depVersion as string, location + "/" + packageName + "/packages");
+        // Check if the package version already exists in the lockfile, if it does, skip adding it.
+        let depExists = semver.maxSatisfying(currentInstalledVersions, packageVersion);
+        if (!depExists) {
+            let depsDict : Record<string, PackageDependency> = {};
+            lockfileContent.packages[packageName].push({ 
+                version : response.version,
+                resolved: `https://registry.forestpm.dev/`,
+                integrity: `abc-1234`,
+                dependencies : depsDict,
+                location
+            });
+
+            for (const [depName, depVersion] of Object.entries(response.dependencies || {})) {
+                depsDict[depName] = {
+                    version: depVersion as string,
+                    primary: await makeDepTree(depName, depVersion as string, location + "/" + packageName + "/packages")
+                };
+            }
+        } else {
+            // Ensure primary is always the highest in the directory structure
+            const existingPackage = lockfileContent.packages[packageName].find(pkg => pkg.version === depExists)!;
+            if (existingPackage.location.split("/").length > location.split("/").length) {
+                // If the existing package is in a higher directory, update its location
+                existingPackage.location = location;
+                
+                for (const [_, depInfo] of Object.entries(lockfileContent.packages)) {
+                    for (const pkg of depInfo) {
+                        if (pkg.dependencies[packageName]) {
+                            pkg.dependencies[packageName].primary = false; // Mark as primary
+                        }
+                    }
+                }
+
+                return true; // Mark as primary
             }
         }
+
+        return depExists == null;
     }
 
     msg.update("Updating workspace dependencies...");
     
-    for (const [name, version] of Object.entries(forestJson.dependencies || {})) {
-        await makeDepTree(name, version, "packages");
+    try {
+        for (const [name, version] of Object.entries(forestJson.dependencies || {})) {
+           await makeDepTree(name, version, "packages") // Top level will always be primary
+        }
+    } catch (error) {
+        throw error;
     }
 
     makeDirectories(lockfileContent);
