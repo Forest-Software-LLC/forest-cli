@@ -5,6 +5,7 @@
   "platform": "roblox",
   "main": "init.lua",
   "dependencies": {
-    "test-2a": "^0.1.0"
+    "test-2a": "^0.1.0",
+    "test-3a": "^0.1.0"
   }
 }

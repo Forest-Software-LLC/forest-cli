@@ -1,5 +1,5 @@
 
-import { storeTokens, getStoredTokens, loginCommand } from "../commands/login";
+import { storeTokens, getStoredTokens, loginCommand } from "../commands/login.ts";
 import got, { OptionsOfJSONResponseBody, Response} from 'got';
 import ora from 'ora';
 
@@ -29,7 +29,7 @@ function tryRefresh() {
     })
 }
 
-export async function makeRequest(url: string, options: OptionsOfJSONResponseBody = {}, progressCallback? : (isUpload : boolean, progress : number) => (void)): Promise<Response> {
+export async function makeRequest(url: string, options: OptionsOfJSONResponseBody = {}, progressCallback? : (isUpload : boolean, progress : number) => (void)): Promise<any> {
     //console.log('Request URL:', process.env.FOREST_API_URL + url);
 
     if (progressCallback) {

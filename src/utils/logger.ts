@@ -33,22 +33,22 @@ export class Message {
 
     success(message?: string) {
         this.spinner.stopAndPersist({
-            symbol: `${chalk.green('✔')}`,
+            symbol: `${chalk.green('🌳')}`,
             text: `${chalk.green.bold(message)}`,
         });
     }
 
     fail(message?: string) {
         this.spinner.stopAndPersist({
-            symbol: `${chalk.red('✖')}`,
+            symbol: `${chalk.red('🥀')}`,
             text: `${chalk.red.bold(message)}`,
         });
     }
 
     info(message?: string) {
         this.spinner.stopAndPersist({
-            symbol: `${chalk.cyan('›')}`,
-            text: `${chalk.cyan(message)}`,
+            symbol: `${chalk.cyan('🌤️')}`,
+            text: ` ${chalk.cyan(message)}`,
         });
     }
 }

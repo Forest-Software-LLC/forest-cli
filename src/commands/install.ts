@@ -1,5 +1,4 @@
 import { Message } from '../utils/logger.js';
-import inquirer from 'inquirer';
 import { writeFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
 import { lockfileGen } from '../utils/lockfileGen.js';
 

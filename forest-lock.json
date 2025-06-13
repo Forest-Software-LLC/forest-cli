@@ -23,22 +23,13 @@
         "location": "packages"
       }
     ],
-    "test-c": [
-      {
-        "version": "0.1.0",
-        "resolved": "https://registry.forestpm.dev/",
-        "integrity": "abc-1234",
-        "dependencies": {},
-        "location": "packages/test-c"
-      }
-    ],
     "test-a": [
       {
         "version": "0.1.0",
         "resolved": "https://registry.forestpm.dev/",
         "integrity": "abc-1234",
         "dependencies": {},
-        "location": "packages/test-a"
+        "location": "packages/test-2a/packages"
       }
     ],
     "test-b": [
@@ -47,7 +38,56 @@
         "resolved": "https://registry.forestpm.dev/",
         "integrity": "abc-1234",
         "dependencies": {},
-        "location": "packages/test-b"
+        "location": "packages/test-2a/packages"
+      }
+    ],
+    "test-c": [
+      {
+        "version": "0.1.0",
+        "resolved": "https://registry.forestpm.dev/",
+        "integrity": "abc-1234",
+        "dependencies": {},
+        "location": "packages/test-2a/packages"
+      }
+    ],
+    "test-3a": [
+      {
+        "version": "0.1.0",
+        "resolved": "https://registry.forestpm.dev/",
+        "integrity": "abc-1234",
+        "dependencies": {
+          "test-a": {
+            "version": "0.1.0",
+            "primary": false
+          },
+          "test-2a": {
+            "version": "0.1.0",
+            "primary": false
+          },
+          "test-2b": {
+            "version": "0.1.0",
+            "primary": true
+          }
+        },
+        "location": "packages"
+      }
+    ],
+    "test-2b": [
+      {
+        "version": "0.1.0",
+        "resolved": "https://registry.forestpm.dev/",
+        "integrity": "abc-1234",
+        "dependencies": {
+          "test-a": {
+            "version": "0.1.0",
+            "primary": false
+          },
+          "test-c": {
+            "version": "0.1.0",
+            "primary": false
+          }
+        },
+        "location": "packages/test-3a/packages"
       }
     ]
   }

@@ -1,15 +1,17 @@
 {
   "compilerOptions": {
     "target": "es2020",
-    "module": "es2020",
-    "moduleResolution": "node",
-    "outDir": "./",
+    "module": "node16",
+    "moduleResolution": "node16",
+    "outDir": "./dist",
     "rootDir": "./",
     "esModuleInterop": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
     "resolveJsonModule": true,
     "strict": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true
   },
-  "include": ["cli.ts", "src"]
+  "include": ["cli.ts", "src/**/*"]
 }

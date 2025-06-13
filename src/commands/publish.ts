@@ -7,7 +7,6 @@ import ignore from 'ignore';
 import FormData from 'form-data';
 import { PassThrough } from 'stream';
 import { getStreamAsBuffer } from 'get-stream';
-import { SingleBar, Presets } from 'cli-progress';
 import { Message } from '../utils/logger.js';
 
 import { Readable } from 'stream';
