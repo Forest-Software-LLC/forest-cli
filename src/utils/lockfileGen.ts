@@ -87,7 +87,7 @@ export function makeDirectories(lockfileJson : LockFile) {
 
         const luaPath = `${prefix}${pathFromRoot}["${depInfo.name}"]`; // Remove the last part (the package name)
 
-        writeFileSync(`${location}/init.lua`, `--Pointer file\nreturn require(${luaPath})`, { encoding: "utf-8",  });
+        writeFileSync(`${location}/init.lua`, `--Pointer file (${targetLocation + "/" + depInfo.name})\nreturn require(${luaPath})`, { encoding: "utf-8",  });
     }
 }
 
@@ -166,12 +166,11 @@ export async function lockfileGen(forestJson: ForestJson, msg : Message) : Promi
 
         return depExists == null;
     }
-
-    msg.update("Updating workspace dependencies...");
     
     try {
         for (const [name, version] of Object.entries(forestJson.dependencies || {})) {
-           await makeDepTree(name, version, "packages") // Top level will always be primary
+            msg.update(`Processing dependency ${name} @ ${version}...`);
+            await makeDepTree(name, version, "packages") // Top level will always be primary
         }
     } catch (error) {
         throw error;
