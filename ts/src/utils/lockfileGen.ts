@@ -1,7 +1,9 @@
-import { makeRequest } from "./httpHelper.ts"
+import { makeRequest } from "./httpHelper.js"
 import semver from "semver";
 import type { Message } from "./logger.ts";
+import fetchAndExtract from "./fetchAndExtract.js";
 import { existsSync, mkdirSync, writeFileSync } from "fs";
+import cliProgress from "cli-progress";
 
 type PackageDependency = {
     version: string,
@@ -30,10 +32,18 @@ export type ForestJson = {
 }
 
 
-export function makeDirectories(lockfileJson : LockFile) {
+export async function makeDirectories(lockfileJson : LockFile) {
     if (!existsSync("packages")) {
         mkdirSync("packages");
     }
+
+    const multibar = new cliProgress.MultiBar({
+        clearOnComplete: true,
+        hideCursor: true,
+        format: ' {name} | {bar} | {percentage}% ',
+    }, cliProgress.Presets.legacy);
+
+    let running = [];
 
     const nonPrimaryDeps : Record<string, {name : string, version : string}> = {};
 
@@ -44,7 +54,17 @@ export function makeDirectories(lockfileJson : LockFile) {
                 mkdirSync(dirPath,  { recursive: true });
             }
 
+            const bar = multibar.create(100, 0, { name: `${packageName} @ ${version.version}` });
+            
             //TODO: Stream in the actual package files from the registry
+            running.push(fetchAndExtract(`https://registry.forestpm.dev/public/eden.tgz`, dirPath, bar)
+                .then(() => {
+                    bar.update(100);
+                    multibar.remove(bar);
+                })
+                .catch(err => {
+                    throw new Error(`Failed to fetch and extract package ${packageName} @ ${version.version}: ${err}`);
+                }))
 
             let hasPrimaryDependency = false;
             let dependencyCount = 0;
@@ -77,7 +97,6 @@ export function makeDirectories(lockfileJson : LockFile) {
         const targetLocation = lockfileJson.packages[depInfo.name]?.find(pkg => pkg.version === depInfo.version)?.location;
         if (!targetLocation) {
             throw new Error(`Target location for ${depInfo.name} @ ${depInfo.version} not found in lockfile.`);
-            continue;
         }
 
         let pathFromRoot = targetLocation.split("/").slice(1).join(`"]["`); // Remove the first part (the packages folder)
@@ -89,6 +108,9 @@ export function makeDirectories(lockfileJson : LockFile) {
 
         writeFileSync(`${location}/init.lua`, `--Pointer file (${targetLocation + "/" + depInfo.name})\nreturn require(${luaPath})`, { encoding: "utf-8",  });
     }
+
+    await Promise.all(running);
+    multibar.stop();
 }
 
 export async function lockfileGen(forestJson: ForestJson, msg : Message) : Promise<string> {
@@ -176,7 +198,7 @@ export async function lockfileGen(forestJson: ForestJson, msg : Message) : Promi
         throw error;
     }
 
-    makeDirectories(lockfileContent);
+    await makeDirectories(lockfileContent);
 
     return JSON.stringify(lockfileContent, null, 2);
 }

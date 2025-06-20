@@ -1,0 +1,59 @@
+how to solve
+
+- loop through deps
+- Get all versions for each
+- get versions for all of those versions deps
+- if we've already fetched a dep and its versions, dont need to do it again
+
+- OPTIMIZE: Only fetch deps for versions that are compatible with the current scope
+- if we fetch deps that use a version that introduces new scope, then fetch those deps as well.
+
+
+worst case is that someone has like 200 versions that somehow all have different deps
+Kinda sucks at scale, but caching could make this work well
+
+1. create layer 1 by getting deps of all the packages in this layer
+2. for layer 2, insert 
+
+-- a[1], a1[a], a11[!]
+
+a = ["^1" = ["a1", "a2"], "^2" = "a3"]
+
+a = ["^1, ^2] -- if no versions that satisfy both ranges, warn and install 2
+b = [">=1.2.0","^1.0.0"]
+
+What if there is an older version of a dep that would've had a supported version of a?
+
+
+a, b
+[1,2]
+[1]a1, [1]a2, [1]a3
+[a,b]
+[a]a11, [a]a12, [a]a13, [a]a14
+----
+
+x, a11, a12, a13, a14 a2, a3, b
+
+-- working a11 
+-- no deps
+
+a
+ 1 = 1
+ 2 = 2 -- Hot spot, try to install this version if it matches, if not, move to next highest hot spot ordered 2ndarily by version
+ 3 = 1
+
+
+Temp solution
+1. Top level, get latest versions and consider those absolute
+2. Layer by layer, check 
+
+
+1. For the layer, get all the packages that have overlaping deps
+a->b c->b
+2. Cache those version ranges
+3. Now, when resolving B, only resolve the packages that satisfy both of those ranges.
+4. if ranges are out of sync, then fetch both max satifying for both.
+
+What modules need X?
+What versions of X satisfy those modules?
+- Install the min number of versions

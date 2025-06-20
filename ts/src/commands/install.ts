@@ -60,7 +60,7 @@ export async function installCommand(targetPackage? : string, options? : { versi
                 return;
             }
 
-            makeDirectories(lockContent);
+            await makeDirectories(lockContent);
 
         }
         

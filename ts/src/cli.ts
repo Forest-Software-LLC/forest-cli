@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { loginCommand } from './src/commands/login.js';
-import { publishCommand } from './src/commands/publish.js';
-import { initCommand } from './src/commands/initialize.js';
-import { installCommand } from './src/commands/install.js';
+import { loginCommand } from './commands/login.js';
+import { publishCommand } from './commands/publish.js';
+import { initCommand } from './commands/initialize.js';
+import { installCommand } from './commands/install.js';
 
 import { config } from 'dotenv';
 config({ path: process.env.NODE_ENV ? `${process.env.NODE_ENV}.env` : ".env" });
