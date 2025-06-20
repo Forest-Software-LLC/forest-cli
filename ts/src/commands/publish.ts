@@ -1,17 +1,11 @@
-import { success, info } from '../utils/logger.js';
 import { makeRequest } from '../utils/httpHelper.js';
-import { readFileSync, writeFileSync, existsSync, createReadStream } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { create } from 'tar';
 import path from 'path';
 import ignore from 'ignore';
 import FormData from 'form-data';
 import { PassThrough } from 'stream';
-import { getStreamAsBuffer } from 'get-stream';
 import { Message } from '../utils/logger.js';
-
-import { Readable } from 'stream';
-
-import got from "got"
 
 export function loadForestIgnore(directory : string) {
   const ig = ignore();
@@ -56,9 +50,12 @@ async function createTarballBuffer(directory: string): Promise<Buffer> {
     .on('error', (err) => tarStream.destroy(err as Error)) // Handle errors by destroying the stream
     .pipe(tarStream);
 
-  // Collect the entire tarball into a Buffer (only ~10 MB max)
-  const buffer = await getStreamAsBuffer(tarStream);
-  return buffer;
+  // Collect into a Buffer via async iteration
+  const chunks: Buffer[] = [];
+  for await (const chunk of tarStream) {
+    chunks.push(chunk as Buffer);
+  }
+  return Buffer.concat(chunks);
 }
 
 export async function publishCommand() {

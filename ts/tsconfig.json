@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "node16",           // emit require()/module.exports
+    "moduleResolution": "node16",   // use Node-16+ “exports” aware resolution
+    "outDir": "dist",
+    "rootDir": ".",
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "allowJs": false,
+    "jsx": "preserve",
+    // noEmitOnError, etc.
+    "plugins": [
+      { "transform": "typescript-transform-paths" }
+    ]
+  },
+  "include": ["src/cli.ts", "src/**/*"],
+  "exclude": ["node_modules"]
+}

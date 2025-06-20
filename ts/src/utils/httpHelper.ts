@@ -1,7 +1,6 @@
 
-import { storeTokens, getStoredTokens, loginCommand } from "../commands/login.ts";
+import { storeTokens, getStoredTokens, loginCommand } from "../commands/login.js";
 import got, { OptionsOfJSONResponseBody, Response} from 'got';
-import ora from 'ora';
 
 function tryRefresh() {
     let tokens = getStoredTokens();
@@ -71,7 +70,7 @@ export async function makeRequest(url: string, options: OptionsOfJSONResponseBod
     }
 
     const responseBody = response.body as any
-    if (!response.ok) {
+    if (response.statusCode >= 200 || response.statusCode < 300) {
         console.log("Request failed with status:", response.statusCode);
 
         if (responseBody && responseBody.error) {
