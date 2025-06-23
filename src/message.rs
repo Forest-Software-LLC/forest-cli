@@ -48,6 +48,10 @@ impl Message {
         }
     }
 
+    pub fn destroy(self) {
+        self.spinner.finish_and_clear();
+    }
+
     /// Update the spinner's message text.
     pub fn update(&self, message: &str) {
         self.spinner.set_message(message.to_string());
