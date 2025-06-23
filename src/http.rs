@@ -7,6 +7,7 @@ use std::{env, sync::Arc};
 /// Body for API requests: either JSON or a builder for multipart form.
 #[derive(Clone)]
 pub enum RequestBody {
+    #[allow(dead_code)]
     Json(Value),
     Multipart(Arc<dyn Fn() -> Form + Send + Sync>),
 }

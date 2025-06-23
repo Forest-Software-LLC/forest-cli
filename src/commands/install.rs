@@ -108,8 +108,11 @@ pub async fn install_command(
                 );
                 return Ok(());
             }
-            // Create directories in blocking context
+            msg.destroy();
             make_directories(&serde_json::from_value(lock_content.clone()).unwrap()).await?;
+
+            msg = Message::new("");
+
         }
 
         msg.emit(MessageType::Success, "Installed all dependencies!");
