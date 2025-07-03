@@ -37,8 +37,8 @@ impl Message {
         let spinner = ProgressBar::new_spinner();
         let style = ProgressStyle::with_template("{spinner:.green} {msg}")
             .unwrap()
-            .tick_strings(&["▂","▃","▅","▆","▇","█","▓","▒","░"," "]);
-            //.tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]);
+            //.tick_strings(&["▂","▃","▅","▆","▇","█","▓","▒","░"," "]);
+            .tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]);
         spinner.set_style(style);
         spinner.enable_steady_tick(Duration::from_millis(70));
         spinner.set_message(message.to_string());

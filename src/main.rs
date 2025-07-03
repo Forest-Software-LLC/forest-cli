@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use dotenvy::dotenv;
 use std::thread;
 use std::time::Duration;
 
@@ -11,6 +10,8 @@ mod lockfile_solver;
 mod fetch_and_extract;
 mod commands;
 use commands::{login_command, install_command, init_command, publish_command};
+
+use std::env;
 
 /// Forest CLI - Package manager
 #[derive(Parser)]
@@ -62,11 +63,12 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env based on NODE_ENV or fallback to ".env"
-    if let Ok(env) = std::env::var("NODE_ENV") {
-        let file = format!("{}.env", env);
-        let _ = dotenvy::from_filename(&file);
+    if env::var("ENV") == Ok("dev".to_string()) {
+        env::set_var("FOREST_API_URL", "http://localhost:3001/");
+        env::set_var("FRONTEND_URL", "http://localhost:3000/");
     } else {
-        dotenv().ok();
+        env::set_var("FOREST_API_URL", "https://api.forestpm.dev/");
+        env::set_var("FRONTEND_URL", "https://forestpm.dev/");
     }
 
     let cli = Cli::parse();

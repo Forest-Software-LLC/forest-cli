@@ -3,6 +3,7 @@ use std::{env, fs, path::{Path}, sync::Arc};
 use serde_json::Value;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use walkdir::WalkDir;
+use dialoguer::{theme::ColorfulTheme, Input, Select};
 use flate2::{write::GzEncoder, Compression};
 use tar::Builder;
 use reqwest::{multipart::{Form, Part}};
@@ -65,6 +66,12 @@ pub async fn publish_command() -> Result<()> {
     let msg = Message::new("Publishing package...");
     let cwd = env::current_dir().context("Failed to get current directory")?;
 
+    let session_resp = api_request("v1/auth/session", reqwest::Method::GET, None)
+        .await
+        .context("Failed to fetch session information")?;
+
+    println!("Session: {:?}", session_resp);
+
     // Ensure manifest exists
     let manifest_path = cwd.join("forest.json");
     if !manifest_path.exists() {
@@ -75,8 +82,65 @@ pub async fn publish_command() -> Result<()> {
     // Read and parse manifest
     let mut manifest: Value = serde_json::from_str(&fs::read_to_string(&manifest_path)?)
         .context("Failed to parse forest.json")?;
+    
+    // TODO: Fetch user info from API to see what orgs they are allowed to publish to.
+
+    if !manifest["name"].is_string() {
+        // Prompt for project name with validation
+        let name: String = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("Project name")
+            .validate_with(|input: &String| {
+                if input.is_empty() {
+                    Err("Package name cannot be empty")
+                } else if input.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+                    Ok(())
+                } else {
+                    Err("Invalid package name. Only lowercase letters, numbers, and hyphens are allowed.".into())
+                }
+            })
+            .interact_text()?;
+
+        manifest["name"] = Value::String(name);
+    }
+
+    if !manifest["description"].is_string() {
+        // Prompt for description with default
+        let description: String = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("Project description")
+            .default("A Forest package".into())
+            .interact_text()?;
+
+        manifest["description"] = Value::String(description);
+    }
+
+    
+
+    let current_version = manifest["version"].as_str().unwrap_or("0.1.0").to_string();
+    let version: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("What version is this? (SemVer format, e.g. 1.0.0)")
+        .default(current_version.clone())
+        .validate_with(|input: &String| {
+            if input.is_empty() {
+                Err("Version cannot be empty")
+            } else if semver::Version::parse(input).is_ok() {
+                Ok(())
+            } else {
+                Err("Invalid version. Versions should be in the SemVer format 'MAJOR.MINOR.PATCH'".into())
+            }
+        })
+        .interact_text()?;
+
+    manifest["version"] = Value::String(version);
+
+
     // Set public flag
-    manifest["public"] = Value::Bool(true);
+    let public = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("What visibility should this package have?")
+        .default(0)
+        .items(&["Public", "Private"])
+        .interact()?;
+
+    manifest["public"] = Value::Bool(public == 0);
 
     msg.update("Got manifest, preparing tarball...");
 

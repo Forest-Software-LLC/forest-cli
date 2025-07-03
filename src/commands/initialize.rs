@@ -1,14 +1,14 @@
 use anyhow::Result;
-use dialoguer::{Input, Select};
+use dialoguer::{theme::ColorfulTheme, Select};
 use serde_json::json;
 use std::{env, fs, path::PathBuf};
 
-use crate::message::{success, info};
+use crate::message::{success, info, warn};
 
 /// Initialize a new Forest package in a subdirectory.
 pub async fn init_command() -> Result<()> {
     // Prompt for project name with validation
-    let name: String = Input::new()
+    /*let name: String = Input::new()
         .with_prompt("Project name")
         .validate_with(|input: &String| {
             if input.is_empty() {
@@ -20,40 +20,49 @@ pub async fn init_command() -> Result<()> {
             }
         })
         .interact_text()?;
+    */
 
     // Prompt for description with default
-    let description: String = Input::new()
+    /*let description: String = Input::new()
         .with_prompt("Project description")
         .default("A new Forest package".into())
         .interact_text()?;
+    */
+
+    if PathBuf::from("./forest.json").exists() {
+        warn("forest.json already exists in the current directory. Please remove it before initializing a new project.");
+        return Ok(());
+    }
+
+
+    success("Welcome to Forest Package Manager!");
 
     // Prompt for platform select
     let platforms = &["Roblox", "UEFN"];
-    let selection = Select::new()
-        .with_prompt("Platform")
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Platform (Use arrow keys to navigate)")
         .items(platforms)
         .default(0)
         .interact()?;
     let platform = platforms[selection].to_lowercase();
 
-
-    //▂▃▅▆▇█ ▓▒░
     // Build the manifest object
     let manifest = json!({
-        "name": name,
-        "description": description,
-        "version": "0.1.0",
-        "platform": platform,
-        "main": "init.lua",
+        //"name": name,
+        //"description": description,
+        //"version": "0.1.0",
         "dependencies": serde_json::Map::<String, serde_json::Value>::new(),
+        "platform": platform,
+        //"main": "init.lua",
     });
     let content = serde_json::to_string_pretty(&manifest)?;
 
     // Determine target directory
-    let mut dir = env::current_dir()?;
-    dir.push(&manifest["name"].as_str().unwrap());
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
+    let dir = env::current_dir()?;
+    let packages_dir = dir.clone().join("packages");
+
+    if !packages_dir.exists() {
+        fs::create_dir_all(&packages_dir)?;
     }
 
     // Write forest.json
