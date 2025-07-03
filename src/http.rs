@@ -23,7 +23,7 @@ pub async fn api_request(
     endpoint: &str,
     method: Method,
     body: Option<RequestBody>,
-) -> Result<Value> {
+) -> Result<(Value, StatusCode)> {
     let api_url = env::var("FOREST_API_URL").context("FOREST_API_URL must be set")?;
     let mut tokens = get_stored_tokens()?;
     let client = Client::new();
@@ -89,6 +89,6 @@ pub async fn api_request(
         let err = body_json.get("error").and_then(Value::as_str).unwrap_or("Unknown error");
         Err(anyhow!("Request failed {}: {}", status, err))
     } else {
-        Ok(body_json)
+        Ok((body_json, status))
     }
 }

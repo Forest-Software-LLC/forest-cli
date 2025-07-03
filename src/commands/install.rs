@@ -40,7 +40,7 @@ pub async fn install_command(
             encode(&pkg),
             encode(&ver)
         );
-        let package_info = match api_request(&endpoint, Method::GET, None).await {
+        let (package_info, status_code) = match api_request(&endpoint, Method::GET, None).await {
             Ok(data) => data,
             Err(e) => {
                 msg.emit(
@@ -50,6 +50,17 @@ pub async fn install_command(
                 return Ok(());
             }
         };
+
+        if !status_code.is_success() {
+            msg.emit(
+                MessageType::Fail,
+                &format!(
+                    "Failed to fetch package information for {}: HTTP {}",
+                    pkg, status_code
+                ),
+            );
+            return Ok(());
+        }
 
         // Check existing install
         if deps.contains_key(&pkg) {
