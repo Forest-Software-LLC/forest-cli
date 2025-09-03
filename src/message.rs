@@ -16,7 +16,7 @@ pub enum MessageType {
 }
 
 pub fn success(text: &str) {
-    println!("{} {}", "🌳".green(), text.green().bold());
+    println!("{} {}", "🌳".green(), text.green());
 }
 
 pub fn fail(text: &str) {
@@ -28,7 +28,7 @@ pub fn warn(text: &str) {
 }
 
 pub fn info(text: &str) {
-    println!("{} {}", "ℹ️".cyan(), text.cyan().bold());
+    println!("{} {}", "ℹ️".cyan(), text.cyan());
 }
 
 impl Message {

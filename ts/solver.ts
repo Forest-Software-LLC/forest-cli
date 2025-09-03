@@ -182,6 +182,7 @@ export async function getLockfilePackages(rootDeps : Record<string, string>) : P
             throw new Error(`No versions found for ${name} matching range ${versionRange}`);
         }
 
+        // Instead of the latest version, it should be the latest version within the range
         const agreedVersion = bucketVersions.sort((a, b) => semver.rcompare(a, b))[0]; // Get the latest version within the range
         buildTree(name, agreedVersion, "~");
     }

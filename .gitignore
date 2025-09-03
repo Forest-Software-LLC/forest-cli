@@ -16,5 +16,11 @@ Cargo.lock
 node_modules/
 .env
 
+ts/
 demo/
 packages/
+
+notes.txt
+
+package.json
+package-lock.json
