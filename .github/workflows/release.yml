@@ -84,6 +84,8 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-22.04
+    environment: 
+      name: release
     steps:
       - uses: actions/checkout@v4
 
@@ -109,8 +111,8 @@ jobs:
           BIN_NAME: ${{ env.BIN_NAME }}
           LATEST_ALIAS: ${{ env.LATEST_ALIAS }}
           MIRROR_BINARIES_TO_LATEST: ${{ env.MIRROR_BINARIES_TO_LATEST }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          S3_ENDPOINT: ${{ vars.S3_ENDPOINT }}
           R2_ACCESS_ID: ${{ secrets.R2_ACCESS_ID }}
           R2_ACCESS_SECRET: ${{ secrets.R2_ACCESS_SECRET }}
           CDN_BASE: ${{ vars.CDN_BASE || '' }}
