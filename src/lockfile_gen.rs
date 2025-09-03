@@ -5,10 +5,10 @@ use serde_json::Value;
 use urlencoding::encode;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::http::api_request;
-use crate::lockfile_solver::{get_lockfile_packages, LockfileEntry};
+use crate::lockfile_solver::{get_lockfile_packages, LockfileEntry, get_dupe_name};
 use crate::message::Message;
 use crate::fetch_and_extract::fetch_and_extract;
+//use crate::utils::digest_package_name;
 
 
 /// The overall lockfile structure.
@@ -41,16 +41,31 @@ pub async fn make_directories(lockfile: &LockFile) -> Result<()> {
 
     let mut path_cache : HashMap<String, HashMap<String, String>>   = HashMap::new();
     for (pkg_name, versions) in &lockfile.packages {
+       // let pkg_name_info = digest_package_name(pkg_name_string);
         for version_data in versions {
             let mut path_parts: Vec<&str> = version_data.location.split('/').collect();
             path_parts.remove(0);
+
+            // get all packages with the same number of path parts
+            let same_level_packages: Vec<String> = lockfile.packages.keys()
+                .filter(|k| {
+                    let path = lockfile.packages.get(*k)
+                        .and_then(|v| v.first())
+                        .map_or(false, |v| v.location.split('/').count()-1 == path_parts.len());
+                    
+                    path
+                })
+                .cloned()
+                .collect();
+
+            let dir_pkg_name = &get_dupe_name(pkg_name.clone(), same_level_packages);
 
             let mut path: String = format!("./packages/{}/packages", path_parts.join("/packages/"));
             if path_parts.is_empty() {
                 path = "./packages".to_string();
             }
 
-            let dir_path = Path::new(&path).join(pkg_name);
+            let dir_path = Path::new(&path).join(dir_pkg_name);
             if !dir_path.exists() {
                 fs::create_dir_all(&dir_path)?;
             }
@@ -60,7 +75,7 @@ pub async fn make_directories(lockfile: &LockFile) -> Result<()> {
             bar.set_style(style.clone());
             bar.set_message(format!("{} @ {}", pkg_name, version_data.version));
             
-            let url = "https://registry.forestpm.dev/public/eden.tgz".to_string();
+            let url = version_data.resolved.clone();
             let dir_clone = dir_path.clone();
             let bar_clone = bar.clone();
 
@@ -74,7 +89,7 @@ pub async fn make_directories(lockfile: &LockFile) -> Result<()> {
             // Store the path in cache
             path_cache.entry(pkg_name.clone())
                 .or_default()
-                .insert(version_data.version.clone(), format!("{}/{}", path.clone(), pkg_name));
+                .insert(version_data.version.clone(), format!("{}/{}", path.clone(), dir_pkg_name));
         }
     }
 
@@ -175,8 +190,14 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message) -> Result<Lock
                 .collect()
         }); 
 
+    let platform: String = forest_json
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing platform in forest.json"))?
+        .to_string(); // clone the value so we don't hold a borrow
+
     msg.finish(crate::message::MessageType::Success, "Generating lockfile...");
-    let lockfile_packages = get_lockfile_packages(roots).await
+    let lockfile_packages = get_lockfile_packages(roots, platform).await
         .context("Failed to resolve lockfile packages")?;
 
     let lockfile : LockFile = LockFile {

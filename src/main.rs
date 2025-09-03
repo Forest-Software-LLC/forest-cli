@@ -9,6 +9,7 @@ mod lockfile_gen;
 mod lockfile_solver;
 mod fetch_and_extract;
 mod commands;
+mod utils;
 use commands::{login_command, install_command, init_command, publish_command};
 
 use std::env;
@@ -63,13 +64,13 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env based on NODE_ENV or fallback to ".env"
-    if env::var("ENV") == Ok("dev".to_string()) {
+    //if env::var("ENV") == Ok("dev".to_string()) {
         env::set_var("FOREST_API_URL", "http://localhost:3001/");
         env::set_var("FRONTEND_URL", "http://localhost:3000/");
-    } else {
-        env::set_var("FOREST_API_URL", "https://api.forestpm.dev/");
-        env::set_var("FRONTEND_URL", "https://forestpm.dev/");
-    }
+    //} else {
+    //    env::set_var("FOREST_API_URL", "https://api.forestpm.dev/");
+   //     env::set_var("FRONTEND_URL", "https://forestpm.dev/");
+    //}
 
     let cli = Cli::parse();
 
@@ -93,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Updating package... (this feature is not yet implemented)");
         }
         Commands::TestSpinner => {
-            let mut msg = message::Message::new("Testing spinner...");
+            let mut msg = message::Message::new("Testing spinner!");
             thread::sleep(Duration::from_secs(10)); // Sleep for 2 seconds
             msg.emit(message::MessageType::Success, "Spinner test completed successfully.");
         }

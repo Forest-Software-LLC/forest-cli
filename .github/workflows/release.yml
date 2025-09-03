@@ -1,0 +1,115 @@
+name: Build & Publish to R2
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  BIN_NAME: forest-cli                  # ← change to your Rust binary/crate name
+  DEFAULT_PREFIX: cli
+  DIST_DIR: dist
+  LATEST_ALIAS: latest
+  MIRROR_BINARIES_TO_LATEST: "false"   # set "true" to also copy binaries into releases/latest/
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Linux deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config libssl-dev
+
+      - name: Build (release)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [[ "${{ matrix.target }}" == *"musl"* ]]; then
+            export RUSTFLAGS="-C target-feature=+crt-static"
+          fi
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip (smaller binaries)
+        if: startsWith(matrix.os, 'ubuntu') || startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BIN="target/${{ matrix.target }}/release/${BIN_NAME}"
+          (command -v llvm-strip && llvm-strip "$BIN") || (command -v strip && strip "$BIN") || true
+
+      - name: Stage outputs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TAG="${GITHUB_REF_NAME:-manual-${GITHUB_RUN_NUMBER}}"
+          EXT=""
+          if [[ "${{ matrix.os }}" == windows-* ]]; then EXT=".exe"; fi
+          SRC="target/${{ matrix.target }}/release/${BIN_NAME}${EXT}"
+          OUT="${BIN_NAME}-${TAG}-${{ matrix.target }}${EXT}"
+          cp "$SRC" "$OUT"
+          echo "Built $OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: built-binaries
+          path: |
+            *.exe
+            *-apple-darwin
+            *-unknown-linux-*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: built-binaries
+          path: ${{ env.DIST_DIR }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      # No package.json committed — install tools on the runner only
+      - name: Install TS tools globally
+        run: |
+          npm i -g tsx @aws-sdk/client-s3
+
+      - name: Release to R2 (checksums + latest.json + upload)
+        env:
+          DIST_DIR: ${{ env.DIST_DIR }}
+          TAG: ${{ github.ref_name }}
+          BIN_NAME: ${{ env.BIN_NAME }}
+          LATEST_ALIAS: ${{ env.LATEST_ALIAS }}
+          MIRROR_BINARIES_TO_LATEST: ${{ env.MIRROR_BINARIES_TO_LATEST }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          R2_ACCESS_ID: ${{ secrets.R2_ACCESS_ID }}
+          R2_ACCESS_SECRET: ${{ secrets.R2_ACCESS_SECRET }}
+          CDN_BASE: ${{ vars.CDN_BASE || '' }}
+        run: node --loader tsx scripts/release.ts

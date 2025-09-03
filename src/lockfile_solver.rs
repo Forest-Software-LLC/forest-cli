@@ -16,15 +16,19 @@
 // ---------------------
 use std::collections::{HashMap, VecDeque};
 use anyhow::{Result, Context};
-use reqwest::{Client, Method};
+use reqwest::{Method};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use crate::http::api_request;
+use crate::utils::{digest_package_name, PackageName };
 
 /// Tracks per-version resolution state
 #[derive(Debug)]
 struct VersionState {
     resolved: bool,
     dependencies: HashMap<String, String>,
+    integrity: String,
+    access_url : String
 }
 
 /// Holds buckets (grouped ranges) and per-version state
@@ -40,7 +44,7 @@ type ResolvedVersions = HashMap<String, PackageState>;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LockfileEntry {
     pub version: String,
-    resolved: String,
+    pub resolved: String,
     integrity: String,
     pub location: String,
     pub dependencies: HashMap<String, String>,
@@ -48,41 +52,42 @@ pub struct LockfileEntry {
 
 type LockfilePackages = HashMap<String, Vec<LockfileEntry>>;
 
-/// HTTP responses
-#[derive(Deserialize)]
-struct VersionsData { versions: Vec<String> }
+pub fn get_dupe_name(target : String, deps : Vec<String>) -> String {
+    let dep_name_info = digest_package_name(&target);
 
-#[derive(Deserialize)]
-struct PackageInfo { dependencies: Option<HashMap<String, String>> }
+    let mut exists = false;
+    for target_name in &deps {
+        if target_name == &target {
+            continue; // Skip exact matches
+        }
 
-const BASE_URL: &str = "http://localhost:3000/";
+        let target_name_info = digest_package_name(target_name);
+        if target_name_info.name == dep_name_info.name {
+            exists = true;
+            break;
+        }
+    }
 
-async fn make_request<T: serde::de::DeserializeOwned>(
-    client: &Client,
-    method: Method,
-    path: &str,
-) -> Result<T> {
-    let url = format!("{}{}", BASE_URL, path);
-    let resp = client
-        .request(method, &url)
-        .header("Content-Type", "application/json")
-        .send().await
-        .with_context(|| format!("Failed request to {}", url))?
-        .error_for_status()
-        .with_context(|| format!("HTTP error from {}", url))?;
-    let data = resp.json::<T>().await
-        .with_context(|| format!("Invalid JSON from {}", url))?;
-    Ok(data)
+
+    return if exists {
+        format!("{}-{}", dep_name_info.scope, dep_name_info.name)
+    } else {
+        dep_name_info.name
+    };
 }
 
-pub async fn get_lockfile_packages(root_deps: HashMap<String, String>) -> Result<LockfilePackages> {
-    let client = Client::new();
+pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform : String) -> Result<LockfilePackages> {
     let mut resolved: ResolvedVersions = HashMap::new();
-    let mut queue: VecDeque<(String, String)> = root_deps.clone().into_iter().collect();
+
+    // Make queue with digest_package_name
+
+    let mut queue: VecDeque<(PackageName, String, u8)> = root_deps.clone().into_iter()
+        .map(|(name, range)| (digest_package_name(&name), range, 1))
+        .collect();
 
     // 1) Resolve dependency graph into buckets & versions
-    while let Some((name, version_range)) = queue.pop_front() {
-        let pkg_state = resolved.entry(name.clone())
+    while let Some((name, version_range, depth)) = queue.pop_front() {
+        let pkg_state = resolved.entry(name.full_name.clone())
             .or_insert_with(|| PackageState {
                 buckets: HashMap::new(),
                 versions: HashMap::new(),
@@ -90,27 +95,42 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>) -> Result
 
         // fetch available versions
         if pkg_state.versions.is_empty() {
-            let path = format!("v1/package/user1/{}", name);
-            let data: VersionsData = make_request(&client, Method::GET, &path).await
-                .with_context(|| format!("Failed to fetch versions for {}", name))?;
-            for v in data.versions {
+            let path = format!("v1/package/{}/{}/{}", name.scope, platform, name.name);
+            let (version_data, versions_status) = api_request(&path, Method::GET, None, None).await
+                .with_context(|| format!("Failed to fetch package info for {}", name.full_name))?;
+
+            if !versions_status.is_success() {
+                Err(anyhow::anyhow!(
+                    "Failed to fetch package info for {}: HTTP {}",
+                    name.full_name, versions_status
+                ))?;
+            }
+            let versions = version_data.get("versions")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| anyhow::anyhow!("Invalid versions data for {}", name.full_name))?;
+
+            for val in versions {
+                let ver = String::from(val.as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Version is not a string for {}", name.full_name))?);
+
+                //println!("Found version {} for package {}", ver, name.full_name);
                 pkg_state.versions.insert(
-                    v.clone(),
-                    VersionState { resolved: false, dependencies: HashMap::new() }
+                    ver,
+                    VersionState { resolved: false, dependencies: HashMap::new(), integrity: String::new(), access_url: String::new() }
                 );
             }
         }
 
         // filter by range
         let req = VersionReq::parse(&version_range)
-            .with_context(|| format!("Invalid range {} for {}", version_range, name))?;
+            .with_context(|| format!("Invalid range {} for {}", version_range, name.full_name))?;
         let all_versions: Vec<String> = pkg_state.versions.keys().cloned().collect();
         let mut matches: Vec<String> = all_versions.iter()
             .filter(|v| Version::parse(v).map(|ver| req.matches(&ver)).unwrap_or(false))
             .cloned()
             .collect();
         if matches.is_empty() {
-            anyhow::bail!("No versions found for {} matching {}", name, version_range);
+            anyhow::bail!("No versions found for {} matching {}", name.full_name, version_range);
         }
 
         // determine bucket
@@ -139,14 +159,47 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>) -> Result
         // fetch dependencies if not resolved
         let vs = pkg_state.versions.get_mut(&agreed).unwrap();
         if vs.resolved { continue; }
-        let path = format!("v1/package/user1/{}/{}", name, agreed);
-        let info: PackageInfo = make_request(&client, Method::GET, &path).await
-            .with_context(|| format!("Failed to fetch {}@{}", name, agreed))?;
+        let path = format!("v1/package/{}/{}/{}/{}", name.scope, platform, name.name, agreed);
+
+        let (package_info, status) = api_request(&path, Method::GET, None, None).await
+            .with_context(|| format!("Failed to fetch package info for {}@{}", name.full_name, agreed))?;
+
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Failed to fetch package info for {}@{}: HTTP {}",
+                name.full_name, agreed, status
+            ));
+        }
+
         vs.resolved = true;
-        let deps = info.dependencies.unwrap_or_default();
-        vs.dependencies = deps.clone();
-        for (dn, dr) in deps {
-            queue.push_front((dn, dr));
+
+        let deps = package_info.get("dependencies")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| anyhow::anyhow!("Invalid dependencies data for {}@{}", name.full_name, agreed))?;
+
+        let deps_hm: HashMap<String, String> = deps.clone().into_iter()
+            .map(|(k, v)| {
+                let s = v.as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Dependency version for {}@{} is not a string", name.full_name, agreed))
+                    .unwrap()
+                    .to_string();
+                (k, s)
+            })
+            .collect();
+
+        vs.dependencies = deps_hm.clone();
+        vs.integrity = package_info.get("integrity")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        vs.access_url = package_info.get("accessUrl")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        for (dep_name, dep_range) in deps_hm {
+            queue.push_front((digest_package_name(&dep_name), dep_range, depth + 1));
         }
     }
 
@@ -166,8 +219,8 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>) -> Result
             }
             entries.push(LockfileEntry {
                 version: bucket_ver.clone(),
-                resolved: "https://registry.forestpm.dev/".into(),
-                integrity: "abc-1234".into(),
+                resolved: vs.access_url.clone(),//"https://registry.forestpm.dev/".into(),
+                integrity: vs.integrity.clone(),
                 location: String::new(),
                 dependencies: deps,
             });
@@ -176,6 +229,8 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>) -> Result
     }
 
     // 3) Annotate locations with tree positions
+    
+
     fn build_tree(
         name: &str,
         version: &str,
@@ -194,20 +249,44 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>) -> Result
                     .map(|(dn, dv)| (dn.clone(), dv.clone()))
                     .collect();
 
-                for (dn, dv) in deps {
+                // Also collect dependency keys for each dependency
+
+                for (dn, dv) in deps.clone().into_iter() {
+                    let dep_names: Vec<String> = deps.iter().map(|(dn, _)| dn.clone()).collect();
+                    let name_for_next = get_dupe_name(dn.clone(), dep_names);
                     let next_loc = format!("{}/{}", loc, name);
-                    build_tree(&dn, &dv, &next_loc, lockfile);
+                    build_tree(&name_for_next, &dv, &next_loc, lockfile);
                 }
             }
         }
     }
 
-    for (name, _) in &root_deps {
+    for (name, ver_range) in &root_deps {
         if let Some(state) = resolved.get(name) {
-            let mut keys: Vec<&String> = state.buckets.keys().collect();
-            keys.sort_by(|a,b| Version::parse(b).unwrap().cmp(&Version::parse(a).unwrap()));
-            if let Some(first) = keys.first() {
-                build_tree(name, first, "~", &mut lockfile);
+            // Only get keys that satisfy the version range
+            let req = VersionReq::parse(ver_range)
+                .with_context(|| format!("Invalid range {} for {}", ver_range, name))?;
+
+            let mut versions: Vec<String> = state.versions.keys()
+                .filter(|v| req.matches(&Version::parse(v).unwrap()))
+                .cloned()
+                .collect();
+
+            if versions.is_empty() {
+                return Err(anyhow::anyhow!("No versions found for {} matching {}", name, ver_range));
+            }
+
+            versions.sort_by(|a,b| Version::parse(b).unwrap().cmp(&Version::parse(a).unwrap()));
+
+            if let Some(first) = versions.first() {
+                // Collect dependencies to avoid holding a mutable borrow during recursion
+                let deps: Vec<(String, String)> = root_deps.clone().iter()
+                    .map(|(dn, dv)| (dn.clone(), dv.clone()))
+                    .collect();
+
+                let dep_names: Vec<String> = deps.iter().map(|(dn, _)| dn.clone()).collect();
+                let name_for_next =  get_dupe_name(name.clone(), dep_names);
+                build_tree(&name_for_next, first, "~", &mut lockfile);
             }
         }
     }
@@ -221,6 +300,6 @@ pub async fn test() -> Result<()> {
     roots.insert("test-2a".into(), "^0.1.0".into());
     roots.insert("test-3a".into(), "^0.1.0".into());
     roots.insert("test-b".into(), "^0.1.0".into());
-    get_lockfile_packages(roots).await?;
+    get_lockfile_packages(roots, "roblox".to_string()).await?;
     Ok(())
 }

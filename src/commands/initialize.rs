@@ -34,9 +34,6 @@ pub async fn init_command() -> Result<()> {
         return Ok(());
     }
 
-
-    success("Welcome to Forest Package Manager!");
-
     // Prompt for platform select
     let platforms = &["Roblox", "UEFN"];
     let selection = Select::with_theme(&ColorfulTheme::default())

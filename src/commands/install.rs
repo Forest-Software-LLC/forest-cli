@@ -30,17 +30,41 @@ pub async fn install_command(
     if !info.get("dependencies").map_or(false, |v| v.is_object()) {
         info["dependencies"] = Value::Object(Map::new());
     }
+
+    let platform = info
+        .get("platform")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing platform in forest.json"))?
+        .to_string(); // clone the value so we don't hold a borrow
+
     let deps = info.get_mut("dependencies").unwrap().as_object_mut().unwrap();
 
     if let Some(pkg) = target_package {
+
+        let mut package_identifiers : Vec<&str> = pkg.split("/").collect();
+
+
+        if package_identifiers.len() != 2 {
+            msg.finish(
+                MessageType::Fail,
+                "Invalid package identifier. Use format: <scope>/<name> -v [version]",
+            );
+            return Ok(());
+        }        
+
+        if package_identifiers[0].starts_with('@') {
+            package_identifiers[0] = &package_identifiers[0][1..];
+        }
         // Fetch package info
         let ver: String = version.unwrap_or_else(|| "latest".to_string());
         let endpoint = format!(
-            "v1/package/get?packageId={}&version={}",
-            encode(&pkg),
-            encode(&ver)
+            "v1/package/{}/{}/{}/{}",
+            encode(package_identifiers[0]), // scope
+            encode(&platform), // platform
+            encode(package_identifiers[1]), // name 
+            encode(&ver) // version
         );
-        let (package_info, status_code) = match api_request(&endpoint, Method::GET, None).await {
+        let (package_info, status_code) = match api_request(&endpoint, Method::GET, None, None).await {
             Ok(data) => data,
             Err(e) => {
                 msg.emit(
@@ -109,11 +133,11 @@ pub async fn install_command(
                 &fs::read_to_string("forest-lock.json")?
             )?;
             let file_version = lock_content
-                .get("fileVersion")
+                .get("file_version")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             if file_version != 1 {
-                msg.emit(
+                msg.finish(
                     MessageType::Fail,
                     "Unsupported lockfile version. Delete forest-lock.json and run `forest i` again.",
                 );
@@ -126,7 +150,7 @@ pub async fn install_command(
 
         }
 
-        msg.emit(MessageType::Success, "Installed all dependencies!");
+        msg.finish(MessageType::Success, "Installed all dependencies!");
     }
 
     Ok(())

@@ -1,6 +1,6 @@
 use crate::tokens::{get_stored_tokens, store_tokens};
-use anyhow::{anyhow, Context, Result};
-use reqwest::{Client, Method, StatusCode, multipart::Form};
+use anyhow::{Context, Result};
+use reqwest::{header, multipart::Form, Client, Method, StatusCode};
 use serde_json::Value;
 use std::{env, sync::Arc};
 
@@ -23,6 +23,7 @@ pub async fn api_request(
     endpoint: &str,
     method: Method,
     body: Option<RequestBody>,
+    headers: Option<header::HeaderMap>,
 ) -> Result<(Value, StatusCode)> {
     let api_url = env::var("FOREST_API_URL").context("FOREST_API_URL must be set")?;
     let mut tokens = get_stored_tokens()?;
@@ -31,10 +32,18 @@ pub async fn api_request(
     // Builder function for a new request with the given token
     let build_req = |token: &str| {
         let url = format!("{}{}", api_url, endpoint);
-        println!("Requesting {} {}", method, url);
+        //println!("Requesting {} {}", method, url);
         let mut req = client.request(method.clone(), &url)
             .bearer_auth(token)
             .header("Accept", "application/json");
+
+
+        // Add custom headers if provided
+        if let Some(ref hdrs) = headers {
+            for (key, value) in hdrs.iter() {
+                req = req.header(key, value);
+            }
+        }
 
         if let Some(ref b) = body {
             match b {
@@ -73,7 +82,10 @@ pub async fn api_request(
             store_tokens(at, rt)?;
             tokens = get_stored_tokens()?;
         } else {
-            return Err(anyhow!("Token refresh failed, please login again"));
+            return Ok((
+                serde_json::json!({ "error": "Failed to refresh token" }),
+                StatusCode::UNAUTHORIZED
+            ));
         }
         // Retry with new token
         resp = build_req(&tokens.access_token)
@@ -85,10 +97,7 @@ pub async fn api_request(
     // Parse response body
     let status = resp.status();
     let body_json: Value = resp.json().await.context("Failed to parse JSON response")?;
-    if !status.is_success() {
-        let err = body_json.get("error").and_then(Value::as_str).unwrap_or("Unknown error");
-        Err(anyhow!("Request failed {}: {}", status, err))
-    } else {
-        Ok((body_json, status))
-    }
+        //let err = body_json.get("error").and_then(Value::as_str).unwrap_or("Unknown error");
+       
+    Ok((body_json, status))
 }
