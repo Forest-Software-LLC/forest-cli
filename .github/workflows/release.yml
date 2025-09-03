@@ -11,7 +11,6 @@ env:
   DEFAULT_PREFIX: cli
   DIST_DIR: dist
   LATEST_ALIAS: latest
-  OPENSSL_DIR: /opt/openssl-musl
   MIRROR_BINARIES_TO_LATEST: "false"   # set "true" to also copy binaries into releases/latest/
 
 jobs:
@@ -42,7 +41,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools pkg-config libssl-dev
+          sudo apt-get install -y musl-tools pkg-config
 
       - name: Build (release)
         shell: bash
