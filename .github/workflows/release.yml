@@ -41,7 +41,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools pkg-config
+          sudo apt-get install -y pkg-config
 
       - name: Build (release)
         shell: bash
@@ -85,6 +85,8 @@ jobs:
     needs: build
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: built-*
@@ -95,8 +97,6 @@ jobs:
         with:
           node-version: 20
 
-      - name: Checkout repository
-        uses: actions/checkout@v3
       # No package.json committed — install tools on the runner only
       - name: Install TS tools globally
         run: |
@@ -114,4 +114,4 @@ jobs:
           R2_ACCESS_ID: ${{ secrets.R2_ACCESS_ID }}
           R2_ACCESS_SECRET: ${{ secrets.R2_ACCESS_SECRET }}
           CDN_BASE: ${{ vars.CDN_BASE || '' }}
-        run: node --loader tsx scripts/release.ts
+        run: npx -y -p tsx -p @aws-sdk/client-s3 tsx scripts/release.ts
