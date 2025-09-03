@@ -97,10 +97,10 @@ jobs:
         with:
           node-version: 20
 
-      # No package.json committed — install tools on the runner only
-      - name: Install TS tools globally
+      - name: Install TS deps
         run: |
-          npm i -g tsx @aws-sdk/client-s3
+          echo '{}' > package.json
+          npm i --no-save --no-package-lock tsx @aws-sdk/client-s3
 
       - name: Release to R2 (checksums + latest.json + upload)
         env:
@@ -114,4 +114,4 @@ jobs:
           R2_ACCESS_ID: ${{ secrets.R2_ACCESS_ID }}
           R2_ACCESS_SECRET: ${{ secrets.R2_ACCESS_SECRET }}
           CDN_BASE: ${{ vars.CDN_BASE || '' }}
-        run: npx -y -p tsx -p @aws-sdk/client-s3 tsx scripts/release.ts
+        run: npx tsx scripts/release.ts
