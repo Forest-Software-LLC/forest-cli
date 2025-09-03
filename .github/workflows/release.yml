@@ -7,10 +7,11 @@ on:
       - "v*.*.*"
 
 env:
-  BIN_NAME: forest-cli                  # ← change to your Rust binary/crate name
+  BIN_NAME: forest                  # ← change to your Rust binary/crate name
   DEFAULT_PREFIX: cli
   DIST_DIR: dist
   LATEST_ALIAS: latest
+  OPENSSL_DIR: /opt/openssl-musl
   MIRROR_BINARIES_TO_LATEST: "false"   # set "true" to also copy binaries into releases/latest/
 
 jobs:
@@ -42,6 +43,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools pkg-config libssl-dev
+          # Download and build OpenSSL for musl (if not already done)
+          export OPENSSL_VERSION=1.1.1w
+          curl -O https://www.openssl.org/source/openssl-$OPENSSL_VERSION.tar.gz
+          tar xzf openssl-$OPENSSL_VERSION.tar.gz
+          cd openssl-$OPENSSL_VERSION
+          CC=musl-gcc ./Configure linux-x86_64 no-shared no-dso --prefix=/opt/openssl-musl
+          make && sudo make install
+          echo "OPENSSL_DIR=/opt/openssl-musl" >> $GITHUB_ENV
 
       - name: Build (release)
         shell: bash
