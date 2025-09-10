@@ -139,6 +139,24 @@ pub async fn publish_command() -> Result<()> {
     });
     // TODO: Fetch user info from API to see what orgs they are allowed to publish to.
 
+    let (userdata_resp, _) = api_request(format!("v1/user/{}", current_user).as_str(), reqwest::Method::GET, None, None)
+        .await
+        .context("Failed to get user information")?;
+
+    let org_authors = userdata_resp.get("orgs") // "orgs" is an array of org data with { "name" : string, "rank" : string}
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Failed to parse user org data"))?;
+
+    let mut author_options = vec![format!("{} (You)", current_user)];
+    for org in org_authors {
+        let org_name = org.get("name").and_then(Value::as_str).unwrap();
+        let org_rank  = org.get("rank").and_then(Value::as_str).unwrap();
+        
+        if org_rank == "admin" || org_rank == "owner" {
+            // Only allow orgs where user is admin or owner
+            author_options.push(org_name.to_string());
+        }
+    }
 
     if !forest_json["name"].is_string() {
         // Prompt for project name with validation
@@ -159,7 +177,7 @@ pub async fn publish_command() -> Result<()> {
     }
     
     if !forest_json["author"].is_string() {
-        let authors = vec![format!("{} (You)", current_user)];
+        let authors = author_options;
         let author = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Author name")
             .default(0)
@@ -187,7 +205,7 @@ pub async fn publish_command() -> Result<()> {
     if forest_json["name"].is_string() && forest_json["platform"].is_string() {
         let platform = forest_json["platform"].as_str().unwrap().to_lowercase();
         let name = forest_json["name"].as_str().unwrap().to_lowercase();
-        let (latest_package_data, status_code) = api_request(&format!("v1/package/newuser1/{}/{}/latest", platform, name), reqwest::Method::GET, None, None)
+        let (_latest_package_data, status_code) = api_request(&format!("v1/package/newuser1/{}/{}/latest", platform, name), reqwest::Method::GET, None, None)
             .await
             .context("Failed to fetch latest package data")?;
 
@@ -290,6 +308,8 @@ pub async fn publish_command() -> Result<()> {
     let (upload_response, upload_status) = api_request("v1/package/upload", reqwest::Method::POST, Some(http::RequestBody::Multipart(form_builder)), Some(hdrs))
         .await
         .context("Failed to upload package")?;
+
+    println!("Upload response: {:?}", upload_response);
     
     if !upload_status.is_success() {
         msg.finish(MessageType::Fail, &format!("Failed to upload package: HTTP {}", upload_status));

@@ -18,8 +18,20 @@ fn tokens_file() -> PathBuf {
 /// Read the JSON file at `~/.forest_tokens.json` and deserialize it.
 pub fn get_stored_tokens() -> Result<Tokens> {
     let path = tokens_file();
+
+
+    println!("Looking for stored tokens at {:?}", path);
+    if path.exists() == false {
+        return Ok(Tokens {
+            access_token: String::new(),
+            refresh_token: String::new(),
+        });
+    } else {
+        println!("Using stored tokens from {:?}", path);
+    }
+
     let contents = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read tokens file at {:?}", path))?;
+        .unwrap();
     let tokens = serde_json::from_str(&contents)?;
     Ok(tokens)
 }
