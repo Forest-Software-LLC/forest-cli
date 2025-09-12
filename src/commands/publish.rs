@@ -3,13 +3,19 @@ use std::{env, fs, path::{Path}, sync::Arc};
 use serde_json::Value;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use walkdir::WalkDir;
-use dialoguer::{theme::ColorfulTheme, Input, Select};
+use dialoguer::{console, theme::ColorfulTheme, Input, Select};
 use flate2::{write::GzEncoder, Compression};
 use tar::Builder;
 use reqwest::{multipart::{Form, Part}, StatusCode};
 
-use crate::{http::{self, api_request}, message::{fail, warn}};
+use crate::licensce_helper::{get_mit_license_text, detect_license, sanitize_spdx};
+use crate::{http::{self, api_request}, message::{fail, warn, info}};
 use crate::message::{Message, MessageType};
+
+fn open_url(url: &str) -> anyhow::Result<()> {
+    open::that(url)?;
+    Ok(())
+}
 
 fn version_builder(current_version: &str) -> String {
     let mut field = Select::with_theme(&ColorfulTheme::default())
@@ -135,9 +141,14 @@ pub async fn publish_command() -> Result<()> {
         .context("Failed to parse forest.json")?;
 
     let mut metadata: Value = serde_json::json!({
-        "public": true,
+        
     });
-    // TODO: Fetch user info from API to see what orgs they are allowed to publish to.
+
+    
+    
+
+
+    // Fetch user info from API to see what orgs they are allowed to publish to.
 
     let (userdata_resp, _) = api_request(format!("v1/user/{}", current_user).as_str(), reqwest::Method::GET, None, None)
         .await
@@ -152,12 +163,15 @@ pub async fn publish_command() -> Result<()> {
         let org_name = org.get("name").and_then(Value::as_str).unwrap();
         let org_rank  = org.get("rank").and_then(Value::as_str).unwrap();
         
+        // TODO: actually check write permissions if not admin/owner
+
         if org_rank == "admin" || org_rank == "owner" {
             // Only allow orgs where user is admin or owner
             author_options.push(org_name.to_string());
         }
     }
 
+    let mut did_set_name_or_author = false;
     if !forest_json["name"].is_string() {
         // Prompt for project name with validation
         let name: String = Input::with_theme(&ColorfulTheme::default())
@@ -174,6 +188,7 @@ pub async fn publish_command() -> Result<()> {
             .interact_text()?;
 
         forest_json["name"] = Value::String(name);
+        did_set_name_or_author = true;
     }
     
     if !forest_json["author"].is_string() {
@@ -190,6 +205,8 @@ pub async fn publish_command() -> Result<()> {
         } else {
             Value::String(authors[author].to_string())
         };
+
+        did_set_name_or_author = true;
     }
 
     if !forest_json["description"].is_string() {
@@ -202,19 +219,52 @@ pub async fn publish_command() -> Result<()> {
         forest_json["description"] = Value::String(description);
     }
 
+    let mut versions = vec![];
     if forest_json["name"].is_string() && forest_json["platform"].is_string() {
         let platform = forest_json["platform"].as_str().unwrap().to_lowercase();
         let name = forest_json["name"].as_str().unwrap().to_lowercase();
-        let (_latest_package_data, status_code) = api_request(&format!("v1/package/newuser1/{}/{}/latest", platform, name), reqwest::Method::GET, None, None)
+        let (versions_resp, status_code) = api_request(&format!("v1/package/{}/{}/{}", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None)
+            .await
+            .context("Failed to fetch package versions")?;
+
+        if status_code.is_success() {
+            let versions_array = versions_resp.get("versions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            // Versions array is {version : string, createdAt: string}[]
+
+            versions = versions_array.iter()
+                .filter_map(|v| v.get("version").and_then(Value::as_str))
+                .map(String::from)
+                .collect::<Vec<String>>();
+        }
+
+        let (latest_package_data, status_code) = api_request(&format!("v1/package/{}/{}/{}/latest", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None)
             .await
             .context("Failed to fetch latest package data")?;
 
         if status_code.is_success() {
+            metadata["public"] = latest_package_data["public"].clone();
+            println!("Latest package visibility: {:?}", metadata["public"]);
             // Do something with latest_package_data
+            if did_set_name_or_author {
+                let version_confirm = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt(format!("Package @{}/{} already exists, publish package anyways?", forest_json["author"].as_str().unwrap(), forest_json["name"].as_str().unwrap()))
+                    .default(0)
+                    .items(&["Yes", "No"])
+                    .interact()?;
+
+                if version_confirm == 1 {
+                    fail("Publishing cancelled.");
+                    return Ok(());
+                }
+            }
+        } else {
+            println!("No existing package found, defaulting to public visibility.");
         }
     }
-
-   
     
  
     let mut new_version = if forest_json["version"].is_string() {
@@ -237,6 +287,8 @@ pub async fn publish_command() -> Result<()> {
         .validate_with(|input: &String| {
             if input.is_empty() {
                 Err(anyhow::anyhow!("Version cannot be empty"))
+            } else if versions.iter().any(|v| v == input) {
+                Err(anyhow::anyhow!("Version already exists. Please choose a different version."))
             } else if semver::Version::parse(input).is_ok() {
                 Ok(())
             } else {
@@ -246,26 +298,126 @@ pub async fn publish_command() -> Result<()> {
         .interact_text()?;
 
         new_version = Value::String(version).as_str().unwrap().to_string();
+        
     }
-    
-
-    println!("New version: {}", new_version);
+    // Set version in forest.json
+    forest_json["version"] = Value::String(new_version);
 
     // Set public flag
-    let public = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("What visibility should this package have?")
-        .default(0)
-        .items(&["Public", "Private"])
-        .interact()?;
+    if !metadata["public"].is_boolean() {
+        // Prompt for public/private
+        let public = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("What visibility should this package have?")
+            .default(0)
+            .items(&["Public", "Private"])
+            .interact()?;
 
-    metadata["public"] = Value::Bool(public == 0);
+        metadata["public"] = Value::Bool(public == 0);
+    }
 
 
-     // Write forest.json with new version
-    forest_json["version"] = Value::String(new_version);
-    fs::write(&manifest_path, serde_json::to_string_pretty(&forest_json)?)
-        .context("Failed to write updated forest.json")?;
+    // Get readme if exists
+    let readme_path = cwd.join("README.md");
+    if readme_path.exists() {
+        let readme_contents = fs::read_to_string(&readme_path)
+            .context("Failed to read README.md")?;
+        metadata["readme"] = Value::String(readme_contents);
+    } else {
+        if metadata["public"] == Value::Bool(true) {
+            warn("No README.md found. It's required to include a README for public packages.");
+            let create_readme = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Would you like Forest to insert an empty README.md?")
+                .default(0)
+                .items(&["Yes", "No, I'll add my own."])
+                .interact()?;
 
+            if create_readme == 0 {
+                fs::write(cwd.join("README.md"), "# Package README\n\nThis is the README for the package.".to_string())
+                    .context("Failed to write README.md")?;
+                info("Created empty README.md. Please edit it to include information about how to use your package.");
+                
+                return Ok(());
+            } else {
+                fail("Publishing cancelled. Please add a README.md and try again.");
+                return Ok(());
+            }
+        } else {
+            info("No README.md found. It's recommended to include a README for private packages, but not required.");
+            metadata["readme"] = Value::String(String::new());
+        }
+    }
+
+
+
+    // Find license file and infer license type
+    // Attempt to locate a license file and infer its type, then compare with forest.json.
+
+    if let Some((license_spdx, inferred )) = detect_license(&cwd) {
+        let mut target_spdx = license_spdx.clone();
+        if inferred {
+            let correct_license = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt(format!("Detected license: '{}' Is this correct?", license_spdx))
+                .default(0)
+                .items(&["Yes", "No"])
+                .interact()?;
+
+            if correct_license == 1 {
+                target_spdx.clear();
+            }
+        }
+
+        if target_spdx.is_empty() {
+            let identifier: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Forest does not recognize the license in your license file. Please provide a valid SPDX License identifier.")
+                .default(license_spdx.to_string())
+                .interact_text()?;
+
+            target_spdx = sanitize_spdx(identifier.as_str()).to_string();
+        }
+
+        forest_json["license"] = Value::String(target_spdx);
+    } else {
+        let license_option = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("No license file found. Forest requires PUBLIC packages to have a license file. What would you like to do?")
+            .default(2)
+            .items(&["Generate MIT License (Permissive & minimal conditions)", "Cancel and manually add a license", "Find a license (Open in browser)"])
+            .interact()?;
+
+        match license_option {
+            0 => {
+                let copyright_holder: String = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Copyright Holder Name")
+                    .default(current_user.to_string())
+                    .interact_text()?;
+                // Generate MIT license file
+                let mit_text = get_mit_license_text(&copyright_holder);
+
+                fs::write(cwd.join("LICENSE"), mit_text)
+                    .context("Failed to write LICENSE file")?;
+
+                info("Generated LICENSE file with MIT license.");
+            }
+            1 => {
+                fail("Publishing cancelled. Please add a license file and try again.");
+                return Ok(());
+            }
+            2 => {
+                // Open browser to license info page
+                if open_url("https://choosealicense.com/").is_ok() {
+                    info("Opened browser to https://choosealicense.com/");
+                } else {
+                    fail("Failed to open browser.");
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        
+    }
+
+    
+
+    
 
     let msg = Message::new("Got manifest, preparing tarball...");
 
@@ -308,16 +460,22 @@ pub async fn publish_command() -> Result<()> {
     let (upload_response, upload_status) = api_request("v1/package/upload", reqwest::Method::POST, Some(http::RequestBody::Multipart(form_builder)), Some(hdrs))
         .await
         .context("Failed to upload package")?;
-
-    println!("Upload response: {:?}", upload_response);
     
     if !upload_status.is_success() {
-        msg.finish(MessageType::Fail, &format!("Failed to upload package: HTTP {}", upload_status));
-        fail(&format!("Upload failed with status: {}", upload_status));
+        let error_msg = upload_response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or(upload_status.as_str());
+        msg.finish(MessageType::Fail, &format!("Failed to upload package: {}", error_msg));
         return Ok(());
     }
 
     msg.finish(MessageType::Success, "Package uploaded successfully!");
+
+    // Write forest.json with new version
+    
+    fs::write(&manifest_path, serde_json::to_string_pretty(&forest_json)?)
+        .context("Failed to write updated forest.json")?;
 
     Ok(())
 }
