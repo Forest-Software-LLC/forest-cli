@@ -9,6 +9,7 @@ mod lockfile_gen;
 mod lockfile_solver;
 mod fetch_and_extract;
 mod commands;
+mod licensce_helper;
 mod utils;
 use commands::{login_command, install_command, init_command, publish_command};
 
@@ -47,18 +48,6 @@ enum Commands {
     /// Remove a package from the project
     #[command(alias = "chop")]
     Remove,
-
-    /// Update the package to the latest version
-    #[command(alias = "water")]
-    Update,
-
-    /// Test spinner
-    #[command(name = "spin")]
-    TestSpinner,
-
-    /// Test lockfile solver
-    #[command(name = "test-solver")]
-    TestSolver,
 }
 
 #[tokio::main]
@@ -89,18 +78,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Remove => {
             println!("Chopping package... (this feature is not yet implemented)");
-        }
-        Commands::Update => {
-            println!("Updating package... (this feature is not yet implemented)");
-        }
-        Commands::TestSpinner => {
-            let mut msg = message::Message::new("Testing spinner!");
-            thread::sleep(Duration::from_secs(10)); // Sleep for 2 seconds
-            msg.emit(message::MessageType::Success, "Spinner test completed successfully.");
-        }
-        Commands::TestSolver => {
-            // Placeholder for lockfile solver test
-            lockfile_solver::test().await?;
         }
     }
 
