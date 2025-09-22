@@ -28,7 +28,8 @@ struct VersionState {
     resolved: bool,
     dependencies: HashMap<String, String>,
     integrity: String,
-    access_url : String
+    access_url : String,
+    archive_root: String
 }
 
 /// Holds buckets (grouped ranges) and per-version state
@@ -46,6 +47,7 @@ pub struct LockfileEntry {
     pub version: String,
     pub resolved: String,
     integrity: String,
+    pub root : String,
     pub location: String,
     pub dependencies: HashMap<String, String>,
 }
@@ -109,14 +111,17 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform 
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| anyhow::anyhow!("Invalid versions data for {}", name.full_name))?;
 
-            for val in versions {
-                let ver = String::from(val.as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Version is not a string for {}", name.full_name))?);
+            for ver_info in versions {
+                let ver = ver_info.get("version")
+                    .ok_or_else(|| anyhow::anyhow!("Missing version field for {}", name.full_name))?
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid version field for {}", name.full_name))?.to_string();
+                
 
                 //println!("Found version {} for package {}", ver, name.full_name);
                 pkg_state.versions.insert(
                     ver,
-                    VersionState { resolved: false, dependencies: HashMap::new(), integrity: String::new(), access_url: String::new() }
+                    VersionState { resolved: false, dependencies: HashMap::new(), integrity: String::new(), access_url: String::new(), archive_root: String::new() }
                 );
             }
         }
@@ -198,6 +203,12 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform 
             .map(|s| s.to_string())
             .unwrap_or_default();
 
+        vs.archive_root = package_info.get("archiveRoot")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or("".to_string());
+
+
         for (dep_name, dep_range) in deps_hm {
             queue.push_front((digest_package_name(&dep_name), dep_range, depth + 1));
         }
@@ -223,6 +234,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform 
                 integrity: vs.integrity.clone(),
                 location: String::new(),
                 dependencies: deps,
+                root: vs.archive_root.clone(),
             });
         }
         lockfile.insert(pkg.clone(), entries);
@@ -295,7 +307,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform 
 }
 
 
-pub async fn test() -> Result<()> {
+pub async fn _test() -> Result<()> {
     let mut roots = HashMap::new();
     roots.insert("test-2a".into(), "^0.1.0".into());
     roots.insert("test-3a".into(), "^0.1.0".into());

@@ -78,9 +78,10 @@ pub async fn make_directories(lockfile: &LockFile) -> Result<()> {
             let url = version_data.resolved.clone();
             let dir_clone = dir_path.clone();
             let bar_clone = bar.clone();
+            let root_clone = version_data.root.clone(); 
 
             let handle = std::thread::spawn(move || -> Result<()> {
-                fetch_and_extract(&url, &dir_clone, bar_clone)?;
+                fetch_and_extract(&url, &dir_clone, &root_clone, bar_clone)?;
                 bar.finish_and_clear();
                 Ok(())
             });

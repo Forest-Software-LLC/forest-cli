@@ -1,6 +1,4 @@
 use clap::{Parser, Subcommand};
-use std::thread;
-use std::time::Duration;
 
 mod tokens;
 mod http;
@@ -11,7 +9,7 @@ mod fetch_and_extract;
 mod commands;
 mod licensce_helper;
 mod utils;
-use commands::{login_command, install_command, init_command, publish_command};
+use commands::{login_command, install_command, init_command, publish_command, remove_command};
 
 use std::env;
 
@@ -47,7 +45,10 @@ enum Commands {
 
     /// Remove a package from the project
     #[command(alias = "chop")]
-    Remove,
+    Remove {
+        /// Package name
+        package: String,
+    },
 }
 
 #[tokio::main]
@@ -76,8 +77,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Install { package, version } => {
             install_command(package, version).await?;
         }
-        Commands::Remove => {
-            println!("Chopping package... (this feature is not yet implemented)");
+        Commands::Remove { package } => {
+            remove_command(package).await?;
         }
     }
 
