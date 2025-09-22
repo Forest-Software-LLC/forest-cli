@@ -3,7 +3,7 @@ use std::{env, fs, path::{Path}, sync::Arc};
 use serde_json::Value;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use walkdir::WalkDir;
-use dialoguer::{console, theme::ColorfulTheme, Input, Select};
+use dialoguer::{theme::ColorfulTheme, Input, Select};
 use flate2::{write::GzEncoder, Compression};
 use tar::Builder;
 use reqwest::{multipart::{Form, Part}, StatusCode};
@@ -144,9 +144,48 @@ pub async fn publish_command() -> Result<()> {
         
     });
 
-    
+
+    // Find init.lua file in the first or second level of the directory
+    let mut init_lua_path = cwd.join(forest_json["root"].as_str().unwrap_or("init.luau"));
+    if !init_lua_path.exists() {
+        // Search in second level directories
+        for entry in fs::read_dir(&cwd)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                let nested_init = path.join("init.luau");
+                if nested_init.exists() {
+                    init_lua_path = nested_init;
+                    break;
+                }
+            }
+        }
+        
+    }
+
+    if !init_lua_path.exists() {
+        warn("Failed to resolve root for init.luau");
+        let target_root: String = Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("Root file (init.luau) not found. Please provide the relative path to your root file. (e.g. src/init.luau)")
+            .validate_with(|input: &String| {
+                if input.is_empty() {
+                    Err(anyhow::anyhow!("Path cannot be empty"))
+                } else if fs::metadata(cwd.join(input)).is_ok() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("File does not exist at the provided path"))
+                }
+            })
+            .interact_text()?;
+
+        forest_json["root"] = Value::String(target_root);
+    } else {
+        forest_json["root"] = Value::String(init_lua_path.strip_prefix(&cwd).unwrap().to_string_lossy().to_string());
+    }
+
     
 
+    
 
     // Fetch user info from API to see what orgs they are allowed to publish to.
 

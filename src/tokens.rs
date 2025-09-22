@@ -19,15 +19,11 @@ fn tokens_file() -> PathBuf {
 pub fn get_stored_tokens() -> Result<Tokens> {
     let path = tokens_file();
 
-
-    println!("Looking for stored tokens at {:?}", path);
     if path.exists() == false {
         return Ok(Tokens {
             access_token: String::new(),
             refresh_token: String::new(),
         });
-    } else {
-        println!("Using stored tokens from {:?}", path);
     }
 
     let contents = fs::read_to_string(&path)
