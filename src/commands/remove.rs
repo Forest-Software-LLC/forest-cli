@@ -54,7 +54,5 @@ pub async fn remove_command(
         &format!("Package {} removed!", target_package),
     );
 
-    msg.finish(MessageType::Success, "Dependencies updated!");
-
     Ok(())
 }
