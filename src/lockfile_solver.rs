@@ -26,7 +26,7 @@ use crate::utils::{digest_package_name, PackageName };
 #[derive(Debug)]
 struct VersionState {
     resolved: bool,
-    dependencies: HashMap<String, String>,
+    dependencies: HashMap<String, DepSpec>,
     integrity: String,
     access_url : String,
     archive_root: String
@@ -49,45 +49,27 @@ pub struct LockfileEntry {
     integrity: String,
     pub root : String,
     pub location: String,
-    pub dependencies: HashMap<String, String>,
+    pub dependencies: HashMap<String, DepSpec>,
 }
 
 type LockfilePackages = HashMap<String, Vec<LockfileEntry>>;
 
-pub fn get_dupe_name(target : String, deps : Vec<String>) -> String {
-    let dep_name_info = digest_package_name(&target);
-
-    let mut exists = false;
-    for target_name in &deps {
-        if target_name == &target {
-            continue; // Skip exact matches
-        }
-
-        let target_name_info = digest_package_name(target_name);
-        if target_name_info.name == dep_name_info.name {
-            exists = true;
-            break;
-        }
-    }
-
-
-    return if exists {
-        format!("{}-{}", dep_name_info.scope, dep_name_info.name)
-    } else {
-        dep_name_info.name
-    };
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepSpec {
+    pub alias: String,
+    pub version: String,
 }
 
-pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform : String) -> Result<LockfilePackages> {
+pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform : String) -> Result<LockfilePackages> {
     let mut resolved: ResolvedVersions = HashMap::new();
 
-    // Make queue with digest_package_name
-
+    // Make queue with digest_package_name using normalized specs
     let mut queue: VecDeque<(PackageName, String, u8)> = root_deps.clone().into_iter()
-        .map(|(name, range)| (digest_package_name(&name), range, 1))
+        .map(|(name, spec)| (digest_package_name(&name), spec.version, 1))
         .collect();
 
     // 1) Resolve dependency graph into buckets & versions
+
     while let Some((name, version_range, depth)) = queue.pop_front() {
         let pkg_state = resolved.entry(name.full_name.clone())
             .or_insert_with(|| PackageState {
@@ -182,15 +164,36 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform 
             .and_then(|v| v.as_object())
             .ok_or_else(|| anyhow::anyhow!("Invalid dependencies data for {}@{}", name.full_name, agreed))?;
 
-        let deps_hm: HashMap<String, String> = deps.clone().into_iter()
-            .map(|(k, v)| {
-                let s = v.as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Dependency version for {}@{} is not a string", name.full_name, agreed))
-                    .unwrap()
-                    .to_string();
-                (k, s)
+        // Support both legacy string dependencies and new object form { alias, version }
+        let deps_hm: HashMap<String, DepSpec> = deps.clone().into_iter()
+            .map(|(k, v)| -> anyhow::Result<(String, DepSpec)> {
+                if let Some(s) = v.as_str() {
+                    // Legacy: value is a version string; alias defaults to the dep key
+                    let spec = DepSpec { alias: k.clone(), version: s.to_string() };
+                    //TODO : Drop this because backend will never return just the string.
+                    Ok((k, spec))
+                } else if let Some(obj) = v.as_object() {
+                    let version = obj.get("version")
+                        .and_then(|x| x.as_str())
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "Dependency version for {}@{} must be a string",
+                            name.full_name, agreed
+                        ))?
+                        .to_string();
+                    let alias = obj.get("alias")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| k.clone());
+                    Ok((k, DepSpec { alias, version }))
+                } else {
+                    // Unexpected shape
+                    Err(anyhow::anyhow!(
+                        "Invalid dependency spec for {}@{}: expected string or object",
+                        name.full_name, agreed
+                    ))
+                }
             })
-            .collect();
+            .collect::<anyhow::Result<_>>()?;
 
         vs.dependencies = deps_hm.clone();
         vs.integrity = package_info.get("integrity")
@@ -209,8 +212,8 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform 
             .unwrap_or("".to_string());
 
 
-        for (dep_name, dep_range) in deps_hm {
-            queue.push_front((digest_package_name(&dep_name), dep_range, depth + 1));
+        for (dep_name, dep_spec) in deps_hm {
+            queue.push_front((digest_package_name(&dep_name), dep_spec.version, depth + 1));
         }
     }
 
@@ -224,17 +227,20 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform 
             for (dn, dr) in &vs.dependencies {
                 let dep_state = &resolved[dn];
                 let v = dep_state.buckets.keys()
-                    .find(|v| VersionReq::parse(dr).unwrap().matches(&Version::parse(v).unwrap()))
+                    .find(|v| VersionReq::parse(&dr.version).unwrap().matches(&Version::parse(v).unwrap()))
                     .cloned().unwrap();
-                deps.insert(dn.clone(), v);
+                deps.insert(dn.clone(), DepSpec{
+                    version : v,
+                    alias : dr.alias.clone()
+                });
             }
             entries.push(LockfileEntry {
                 version: bucket_ver.clone(),
                 resolved: vs.access_url.clone(),//"https://registry.forestpm.dev/".into(),
                 integrity: vs.integrity.clone(),
+                root: vs.archive_root.clone(),
                 location: String::new(),
                 dependencies: deps,
-                root: vs.archive_root.clone(),
             });
         }
         lockfile.insert(pkg.clone(), entries);
@@ -245,6 +251,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform 
 
     fn build_tree(
         name: &str,
+        alias : &str,
         version: &str,
         loc: &str,
         lockfile: &mut LockfilePackages,
@@ -256,28 +263,30 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform 
                 }
 
                 entry.location = loc.to_string();
+
                 // Collect dependencies to avoid holding a mutable borrow during recursion
-                let deps: Vec<(String, String)> = entry.dependencies.iter()
+                let deps: Vec<(String, DepSpec)> = entry.dependencies.iter()
                     .map(|(dn, dv)| (dn.clone(), dv.clone()))
                     .collect();
 
                 // Also collect dependency keys for each dependency
 
                 for (dn, dv) in deps.clone().into_iter() {
-                    let dep_names: Vec<String> = deps.iter().map(|(dn, _)| dn.clone()).collect();
-                    let name_for_next = get_dupe_name(dn.clone(), dep_names);
-                    let next_loc = format!("{}/{}", loc, name);
-                    build_tree(&name_for_next, &dv, &next_loc, lockfile);
+                    //let dep_names: Vec<String> = deps.iter().map(|(dn, _)| dn.clone()).collect();
+                    let next_loc = format!("{}/{}", loc, alias);
+
+                    
+                    build_tree(&dn, &dv.alias, &dv.version, &next_loc, lockfile);
                 }
             }
         }
     }
 
-    for (name, ver_range) in &root_deps {
+    for (name, dep_spec) in &root_deps {
         if let Some(state) = resolved.get(name) {
             // Only get keys that satisfy the version range
-            let req = VersionReq::parse(ver_range)
-                .with_context(|| format!("Invalid range {} for {}", ver_range, name))?;
+            let req = VersionReq::parse(&dep_spec.version)
+                .with_context(|| format!("Invalid range {} for {}", dep_spec.version, name))?;
 
             let mut versions: Vec<String> = state.versions.keys()
                 .filter(|v| req.matches(&Version::parse(v).unwrap()))
@@ -285,20 +294,21 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform 
                 .collect();
 
             if versions.is_empty() {
-                return Err(anyhow::anyhow!("No versions found for {} matching {}", name, ver_range));
+                return Err(anyhow::anyhow!("No versions found for {} matching {}", name, dep_spec.version));
             }
 
             versions.sort_by(|a,b| Version::parse(b).unwrap().cmp(&Version::parse(a).unwrap()));
 
             if let Some(first) = versions.first() {
                 // Collect dependencies to avoid holding a mutable borrow during recursion
-                let deps: Vec<(String, String)> = root_deps.clone().iter()
-                    .map(|(dn, dv)| (dn.clone(), dv.clone()))
+                /*let deps: Vec<(String, String)> = normalized_root_deps.clone().iter()
+                    .map(|(dn, dv)| (dn.clone(), dv.version.clone()))
                     .collect();
 
-                let dep_names: Vec<String> = deps.iter().map(|(dn, _)| dn.clone()).collect();
-                let name_for_next =  get_dupe_name(name.clone(), dep_names);
-                build_tree(&name_for_next, first, "~", &mut lockfile);
+                */
+                //let dep_names: Vec<String> = deps.iter().map(|(dn, _)| dn.clone()).collect();
+                //let _name_for_next =  get_dupe_name(name.clone(), dep_names);
+                build_tree(name, &dep_spec.alias, first, "~", &mut lockfile);
             }
         }
     }
@@ -308,10 +318,6 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, String>, platform 
 
 
 pub async fn _test() -> Result<()> {
-    let mut roots = HashMap::new();
-    roots.insert("test-2a".into(), "^0.1.0".into());
-    roots.insert("test-3a".into(), "^0.1.0".into());
-    roots.insert("test-b".into(), "^0.1.0".into());
-    get_lockfile_packages(roots, "roblox".to_string()).await?;
+   
     Ok(())
 }

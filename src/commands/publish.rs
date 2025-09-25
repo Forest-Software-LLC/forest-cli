@@ -183,8 +183,37 @@ pub async fn publish_command() -> Result<()> {
         forest_json["root"] = Value::String(init_lua_path.strip_prefix(&cwd).unwrap().to_string_lossy().to_string());
     }
 
-    
 
+    // Get readme if exists
+    let readme_path = cwd.join("README.md");
+    if readme_path.exists() {
+        let readme_contents = fs::read_to_string(&readme_path)
+            .context("Failed to read README.md")?;
+        metadata["readme"] = Value::String(readme_contents);
+    } else {
+        if metadata["public"] == Value::Bool(true) {
+            warn("No README.md found. It's required to include a README for public packages.");
+            let create_readme = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Would you like Forest to insert an empty README.md?")
+                .default(0)
+                .items(&["Yes", "No, I'll add my own."])
+                .interact()?;
+
+            if create_readme == 0 {
+                fs::write(cwd.join("README.md"), "# Package README\n\nThis is the README for the package.".to_string())
+                    .context("Failed to write README.md")?;
+                info("Created empty README.md. Please edit it to include information about how to use your package.");
+                
+                return Ok(());
+            } else {
+                fail("Publishing cancelled. Please add a README.md and try again.");
+                return Ok(());
+            }
+        } else {
+            info("No README.md found. It's recommended to include a README for private packages, but not required.");
+            metadata["readme"] = Value::String(String::new());
+        }
+    }
     
 
     // Fetch user info from API to see what orgs they are allowed to publish to.
@@ -355,36 +384,7 @@ pub async fn publish_command() -> Result<()> {
     }
 
 
-    // Get readme if exists
-    let readme_path = cwd.join("README.md");
-    if readme_path.exists() {
-        let readme_contents = fs::read_to_string(&readme_path)
-            .context("Failed to read README.md")?;
-        metadata["readme"] = Value::String(readme_contents);
-    } else {
-        if metadata["public"] == Value::Bool(true) {
-            warn("No README.md found. It's required to include a README for public packages.");
-            let create_readme = Select::with_theme(&ColorfulTheme::default())
-                .with_prompt("Would you like Forest to insert an empty README.md?")
-                .default(0)
-                .items(&["Yes", "No, I'll add my own."])
-                .interact()?;
-
-            if create_readme == 0 {
-                fs::write(cwd.join("README.md"), "# Package README\n\nThis is the README for the package.".to_string())
-                    .context("Failed to write README.md")?;
-                info("Created empty README.md. Please edit it to include information about how to use your package.");
-                
-                return Ok(());
-            } else {
-                fail("Publishing cancelled. Please add a README.md and try again.");
-                return Ok(());
-            }
-        } else {
-            info("No README.md found. It's recommended to include a README for private packages, but not required.");
-            metadata["readme"] = Value::String(String::new());
-        }
-    }
+    
 
 
 

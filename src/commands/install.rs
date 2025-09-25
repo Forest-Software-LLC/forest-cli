@@ -4,14 +4,18 @@ use serde_json::{Value, Map};
 use urlencoding::encode;
 use reqwest::Method;
 
+use std::collections::{HashMap};
 use crate::http::api_request;
+use crate::lockfile_solver::DepSpec;
 use crate::message::{Message, MessageType};
 use crate::lockfile_gen::{lockfile_gen, make_directories};
+use crate::utils::normalize_forest_deps;
 
 /// Install dependencies for a forest package.
 pub async fn install_command(
     target_package: Option<String>,
     version: Option<String>,
+    alias: Option<String>,
 ) -> Result<()> {
     let mut msg = Message::new("Installing...");
 
@@ -40,6 +44,7 @@ pub async fn install_command(
     let deps = info.get_mut("dependencies").unwrap().as_object_mut().unwrap();
 
     if let Some(pkg) = target_package {
+        
 
         let mut package_identifiers : Vec<&str> = pkg.split("/").collect();
 
@@ -55,6 +60,9 @@ pub async fn install_command(
         if package_identifiers[0].starts_with('@') {
             package_identifiers[0] = &package_identifiers[0][1..];
         }
+
+        let resolved_alias = alias.clone().unwrap_or_else(|| package_identifiers[1].to_string());
+
         // Fetch package info
         let ver: String = version.unwrap_or_else(|| "latest".to_string());
         let endpoint = format!(
@@ -95,13 +103,51 @@ pub async fn install_command(
             return Ok(());
         }
 
+        // Check for alias conflicts
+        let normalized_root_deps: HashMap<String, DepSpec> = deps.iter()
+            .map(|(name, val)| {
+                let default_alias = name.split('/').last().unwrap_or(name).to_string();
+                let spec = if let Some(vstr) = val.as_str() {
+                    DepSpec { alias: default_alias.clone(), version: vstr.to_string() }
+                } else if let Some(obj) = val.as_object() {
+                    let version = obj.get("version").and_then(Value::as_str).unwrap_or("").to_string();
+                    let alias = obj.get("alias").and_then(Value::as_str).map(|s| s.to_string()).unwrap_or(default_alias.clone());
+                    DepSpec { alias, version }
+                } else {
+                    DepSpec { alias: default_alias.clone(), version: String::new() }
+                };
+                (name.clone(), spec)
+            })
+            .collect();
+
+
+        if normalized_root_deps.values().any(|spec| &spec.alias == &resolved_alias) {
+            //TODO: Prompt for a new alias.
+            msg.emit(
+                MessageType::Fail,
+                &format!("Alias {} is already in use by another package.", resolved_alias),
+            );
+            return Ok(());
+        }
+
         // Add dependency
         let pkg_version = package_info
             .get("version")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        deps.insert(pkg.clone(), Value::String(format!("^{}", pkg_version)));
+
+
+        if alias.is_some() {
+            deps.insert(pkg.clone(), Value::Object({
+                let mut map = Map::new();
+                map.insert("version".to_string(), Value::String(format!("^{}", pkg_version)));
+                map.insert("alias".to_string(), Value::String(resolved_alias));
+                map
+            }));
+        } else {
+            deps.insert(pkg.clone(), Value::String(format!("^{}", pkg_version)));
+        }
         fs::write("forest.json", serde_json::to_string_pretty(&info)?)?;
 
         // Generate and write lockfile using blocking context
@@ -144,7 +190,7 @@ pub async fn install_command(
                 return Ok(());
             }
             msg.destroy();
-            make_directories(&serde_json::from_value(lock_content.clone()).unwrap()).await?;
+            make_directories(&serde_json::from_value(lock_content.clone()).unwrap(), normalize_forest_deps(&info.clone())).await?;
 
             msg = Message::new("");
 

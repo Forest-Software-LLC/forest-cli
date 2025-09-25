@@ -41,6 +41,10 @@ enum Commands {
         /// Specify a version to install
         #[arg(short = 'v', long = "version")]
         version: Option<String>,
+
+        /// Specify an alias for the package
+        #[arg(short = 'a', long = "alias")]
+        alias: Option<String>,
     },
 
     /// Remove a package from the project
@@ -74,8 +78,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init => {
             init_command().await?;
         }
-        Commands::Install { package, version } => {
-            install_command(package, version).await?;
+        Commands::Install { package, version, alias } => {
+            install_command(package, version, alias).await?;
         }
         Commands::Remove { package } => {
             remove_command(package).await?;

@@ -5,7 +5,8 @@ use serde_json::Value;
 use urlencoding::encode;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::lockfile_solver::{get_lockfile_packages, LockfileEntry, get_dupe_name};
+use crate::utils::normalize_forest_deps;
+use crate::lockfile_solver::{get_lockfile_packages, DepSpec, LockfileEntry};
 use crate::message::Message;
 use crate::fetch_and_extract::fetch_and_extract;
 //use crate::utils::digest_package_name;
@@ -18,7 +19,7 @@ pub struct LockFile {
     pub packages: HashMap<String, Vec<LockfileEntry>>,
 }
 
-pub async fn make_directories(lockfile: &LockFile) -> Result<()> {
+pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, DepSpec>) -> Result<()> {
     // Make directories for all packages
     if !Path::new("packages").exists() {
         fs::create_dir_all("packages")?;
@@ -46,7 +47,7 @@ pub async fn make_directories(lockfile: &LockFile) -> Result<()> {
             let mut path_parts: Vec<&str> = version_data.location.split('/').collect();
             path_parts.remove(0);
 
-            // get all packages with the same number of path parts
+            /*// get all packages with the same number of path parts
             let same_level_packages: Vec<String> = lockfile.packages.keys()
                 .filter(|k| {
                     let path = lockfile.packages.get(*k)
@@ -59,17 +60,106 @@ pub async fn make_directories(lockfile: &LockFile) -> Result<()> {
                 .collect();
 
             let dir_pkg_name = &get_dupe_name(pkg_name.clone(), same_level_packages);
+            */
+
+            let mut dir_pkg_name = root_deps.get(pkg_name)
+                .and_then(|d| Some(d.alias.clone()))
+                .unwrap_or_else(|| String::new());
+            /*
+                to find the real dir_pkg_name, backtrack from path_parts, starting from the top. 
+
+                ex: pkg loc /a/n/c/d
+
+                look for package from root_deps alias with alias "a"
+                look for package "n" in found rootpackage deps
+                repeat:
+                look for packages in lockfile with location "a/n"
+                look for package with alias "c" in found package deps
+
+             */
+
+            // Resolve alias path for the package 
+            fn backtrack_name(
+                lockfile: &LockFile,
+                dep_name: &str,
+                dep_version: &str,
+                end_goal: &str,
+                remaining_segments: &[&str]
+            ) -> Result<String> {
+
+                let deps = lockfile.packages
+                    .get(dep_name)
+                    .ok_or_else(|| anyhow!("Dependency {} not found", dep_name))?;
+
+                // Find the exact version entry
+                let ver = deps
+                    .iter()
+                    .find(|v| v.version == dep_version)
+                    .ok_or_else(|| anyhow!("Version {} for {} not found", dep_version, dep_name))?;
+
+                // Recurse through dependencies to match alias path
+                let is_empty = remaining_segments.is_empty();
+                for (sub_dep_name, sub_dep_spec) in &ver.dependencies {
+                    if is_empty {
+                        if sub_dep_name == end_goal {
+                            return Ok(sub_dep_spec.alias.clone());
+                        }
+                    } else if sub_dep_spec.alias == remaining_segments[0] {
+                        println!("Trying next");
+                        return backtrack_name(
+                            lockfile,
+                            sub_dep_name,
+                            &sub_dep_spec.version,
+                            end_goal,
+                            &remaining_segments[1..],
+                        );
+                    }
+                }
+
+                Err(anyhow!("Failed to backtrack package name"))
+            }
+
+            if !path_parts.is_empty() {
+                let target_root_dep_alias = path_parts[0];
+                let mut root_dep_name = String::new();
+
+                for (dep_name, dep_info) in &root_deps {
+                    if dep_info.alias == target_root_dep_alias {
+                        root_dep_name = dep_name.clone();
+
+                        break;
+                    }
+                }
+
+                let root_dep_ver = &lockfile.packages
+                    .get(&root_dep_name)
+                    .ok_or_else(|| anyhow!("Root dependency {} not found", root_dep_name))?
+                    .iter()
+                    .find(|v| v.location == "~")
+                    .ok_or_else(|| anyhow!("Root Version not found for {}", root_dep_name))?;
+
+                dir_pkg_name = backtrack_name(
+                    &lockfile, 
+                    &root_dep_name, 
+                    &root_dep_ver.version, 
+                    &pkg_name, 
+                    &path_parts.clone()[1..]
+                )?;
+            } else if dir_pkg_name.is_empty() {
+                return Err(anyhow!("Failed to determine directory package name for {}", pkg_name));
+            }
+
+            // Path stuff
 
             let mut path: String = format!("./packages/{}/packages", path_parts.join("/packages/"));
             if path_parts.is_empty() {
                 path = "./packages".to_string();
             }
 
-            let dir_path = Path::new(&path).join(dir_pkg_name);
+            let dir_path = Path::new(&path).join(&dir_pkg_name);
             if !dir_path.exists() {
                 fs::create_dir_all(&dir_path)?;
             }
-            //TODO: Download and extract the package here
 
             let bar = mp.add(ProgressBar::new(100));
             bar.set_style(style.clone());
@@ -117,8 +207,8 @@ pub async fn make_directories(lockfile: &LockFile) -> Result<()> {
                 
                 let dep_true_path = path_cache
                     .get(dep_name)
-                    .and_then(|v| v.get(dep_version))
-                    .ok_or_else(|| anyhow!("Path for dependency {} @ {} not found in cache.", dep_name, dep_version))?;
+                    .and_then(|v| v.get(&dep_version.version))
+                    .ok_or_else(|| anyhow!("Path for dependency {} @ {} not found in cache.", dep_name, &dep_version.version))?;
 
                 // Count shared ancestors on dep_true_path and true_path
                 let mut shared_ancestors : u16 = 0;
@@ -182,23 +272,15 @@ pub async fn make_directories(lockfile: &LockFile) -> Result<()> {
 
 /// Generate a lockfile JSON string given the forest manifest & message spinner.
 pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message) -> Result<LockFile> {
-    let roots : HashMap<String, String> = forest_json
-        .get("dependencies")
-        .and_then(|deps| deps.as_object())
-        .map_or_else(HashMap::new, |deps| {
-            deps.iter()
-                .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
-                .collect()
-        }); 
-
+    let roots = normalize_forest_deps(forest_json);
     let platform: String = forest_json
         .get("platform")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing platform in forest.json"))?
         .to_string(); // clone the value so we don't hold a borrow
 
-    msg.finish(crate::message::MessageType::Success, "Generating lockfile...");
-    let lockfile_packages = get_lockfile_packages(roots, platform).await
+    msg.update("Resolving dependencies...");
+    let lockfile_packages = get_lockfile_packages(roots.clone(), platform).await
         .context("Failed to resolve lockfile packages")?;
 
     let lockfile : LockFile = LockFile {
@@ -206,9 +288,8 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message) -> Result<Lock
         packages: lockfile_packages
     };
 
-    make_directories(&lockfile).await
+    make_directories(&lockfile, roots).await
         .context("Failed to create directories for lockfile packages")?;
     
-
     Ok(lockfile)
 }
