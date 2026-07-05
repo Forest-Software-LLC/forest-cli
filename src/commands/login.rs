@@ -4,7 +4,7 @@ use dialoguer::{Input, Password, Select};
 use std::env;
 use std::result::Result::Ok;
 
-use crate::http::api_request;
+use crate::http::{api_request, api_request_public};
 use crate::http::RequestBody;
 use crate::tokens::store_tokens;
 use crate::message::{Message, MessageType};
@@ -38,15 +38,15 @@ pub async fn login_command() -> Result<()> {
                 .interact()?;
 
             let message = Message::new("Logging in...");
-            // Send login request
-            let (data, status_code) = api_request(
+            // Send login request (public: a 401 here means bad credentials,
+            // it must not trigger the token-refresh path)
+            let (data, status_code) = api_request_public(
                     "v1/auth/login",
                     reqwest::Method::POST,
                     Some(RequestBody::Json(serde_json::json!({
                         "username": username,
                         "password": password
                     }))),
-                    None,
                 )
                 .await
                 .context("Failed to send login request")?;
@@ -55,7 +55,64 @@ pub async fn login_command() -> Result<()> {
 
             // Check for success
             if status_code.is_success() {
-                let tokens = data.get("tokens")
+                // All accounts have mandatory 2FA: a successful password check
+                // returns a short-lived challenge (mfaId) instead of tokens.
+                // Exchange it for a session via /v1/auth/otp/verify.
+                let session_data = if data.get("multifactorRequired").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let mfa_id = data.get("mfaId")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("Missing mfaId in response"))?
+                        .to_string();
+
+                    message.finish(MessageType::Info, "Two-factor authentication required");
+
+                    let mut verified: Option<serde_json::Value> = None;
+                    loop {
+                        let code: String = Input::new()
+                            .with_prompt("Authenticator code (or backup code)")
+                            .interact_text()?;
+
+                        let verify_message = Message::new("Verifying code...");
+                        // Public request: 401 = wrong/expired code, not a stale token
+                        let (verify_data, verify_status) = api_request_public(
+                                "v1/auth/otp/verify",
+                                reqwest::Method::POST,
+                                Some(RequestBody::Json(serde_json::json!({
+                                    "mfaId": mfa_id,
+                                    "token": code.trim()
+                                }))),
+                            )
+                            .await
+                            .context("Failed to send 2FA verification request")?;
+
+                        if verify_status.is_success() {
+                            verify_message.destroy();
+                            verified = Some(verify_data);
+                            break;
+                        }
+
+                        let error_text = verify_data.get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Invalid code")
+                            .to_string();
+                        verify_message.finish(MessageType::Fail, &error_text);
+
+                        // Lockout or expired challenge: the mfaId is dead,
+                        // go back to username/password.
+                        if error_text.contains("log in again") {
+                            break;
+                        }
+                    }
+
+                    match verified {
+                        Some(session) => session,
+                        None => continue, // restart the credential loop
+                    }
+                } else {
+                    data
+                };
+
+                let tokens = session_data.get("tokens")
                     .and_then(|v| v.as_object())
                     .ok_or_else(|| anyhow::anyhow!("Missing tokens in response"))?;
 
@@ -71,7 +128,7 @@ pub async fn login_command() -> Result<()> {
                 store_tokens(&access_token, &refresh_token)
                     .context("Failed to store tokens")?;
 
-                let username = data.get("user")
+                let username = session_data.get("user")
                     .and_then(|v| v.get("username"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("Missing username in response"))?;

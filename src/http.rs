@@ -12,6 +12,38 @@ pub enum RequestBody {
     Multipart(Arc<dyn Fn() -> Form + Send + Sync>),
 }
 
+/// Request WITHOUT auth or refresh handling — for pre-auth endpoints (login,
+/// 2FA verify) where a 401 is a real answer (wrong password / wrong code),
+/// not a stale-token signal to retry on.
+pub async fn api_request_public(
+    endpoint: &str,
+    method: Method,
+    body: Option<RequestBody>,
+) -> Result<(Value, StatusCode)> {
+    let api_url = env::var("FOREST_API_URL").context("FOREST_API_URL must be set")?;
+    let client = Client::new();
+
+    let mut req = client.request(method, format!("{}{}", api_url, endpoint))
+        .header("Accept", "application/json");
+
+    if let Some(b) = body {
+        match b {
+            RequestBody::Json(json) => {
+                req = req.json(&json);
+            }
+            RequestBody::Multipart(builder) => {
+                req = req.multipart((builder)());
+            }
+        }
+    }
+
+    let resp = req.send().await.context("Network error")?;
+    let status = resp.status();
+    let body_json: Value = resp.json().await.context("Failed to parse JSON response")?;
+
+    Ok((body_json, status))
+}
+
 /// Generic API request helper. Supports JSON or multipart bodies with auth + auto-refresh.
 ///
 /// - `endpoint`: API path, appended to FOREST_API_URL
