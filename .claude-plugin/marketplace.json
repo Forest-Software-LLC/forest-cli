@@ -1,0 +1,21 @@
+{
+  "name": "forest",
+  "owner": {
+    "name": "Forest Software LLC",
+    "url": "https://forest.dev"
+  },
+  "metadata": {
+    "description": "Official Claude Code plugins for the forestpm ecosystem."
+  },
+  "plugins": [
+    {
+      "name": "forestpm",
+      "source": "./plugins/forestpm",
+      "description": "Manage forestpm packages in a Roblox or UEFN game project (scaffold, install, remove, require).",
+      "version": "0.1.0",
+      "author": { "name": "Forest Software LLC" },
+      "license": "MIT",
+      "keywords": ["forest", "forestpm", "roblox", "uefn", "luau", "package-manager"]
+    }
+  ]
+}

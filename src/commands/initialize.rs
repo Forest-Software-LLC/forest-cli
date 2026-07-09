@@ -6,7 +6,11 @@ use std::{env, fs, path::PathBuf};
 use crate::message::{success, info, warn};
 
 /// Initialize a new Forest package in a subdirectory.
-pub async fn init_command() -> Result<()> {
+///
+/// `platform` lets callers skip the interactive picker (e.g. `forest init
+/// --platform roblox`). When `None`, we prompt as before. This keeps `init`
+/// scriptable/agent-friendly without an interactive terminal.
+pub async fn init_command(platform: Option<String>) -> Result<()> {
     // Prompt for project name with validation
     /*let name: String = Input::new()
         .with_prompt("Project name")
@@ -34,14 +38,29 @@ pub async fn init_command() -> Result<()> {
         return Ok(());
     }
 
-    // Prompt for platform select
+    // Resolve the platform: use the flag if given (validated), otherwise prompt.
     let platforms = &["Roblox", "UEFN"];
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Platform (Use arrow keys to navigate)")
-        .items(platforms)
-        .default(0)
-        .interact()?;
-    let platform = platforms[selection].to_lowercase();
+    let platform = match platform {
+        Some(p) => {
+            let normalized = p.trim().to_lowercase();
+            if !platforms.iter().any(|valid| valid.to_lowercase() == normalized) {
+                warn(&format!(
+                    "Invalid platform '{}'. Supported platforms: roblox, uefn.",
+                    p
+                ));
+                return Ok(());
+            }
+            normalized
+        }
+        None => {
+            let selection = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Platform (Use arrow keys to navigate)")
+                .items(platforms)
+                .default(0)
+                .interact()?;
+            platforms[selection].to_lowercase()
+        }
+    };
 
     // Build the manifest object
     let manifest = json!({

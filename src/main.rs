@@ -36,7 +36,12 @@ enum Commands {
     Publish,
 
     /// Initialize a new package
-    Init,
+    Init {
+        /// Platform for the package (roblox or uefn). Skips the interactive
+        /// picker when provided, making `init` scriptable.
+        #[arg(short = 'p', long = "platform")]
+        platform: Option<String>,
+    },
 
     /// Install dependencies for the package
     #[command(alias = "i", alias = "grow")]
@@ -87,8 +92,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Publish => {
             publish_command().await?;
         }
-        Commands::Init => {
-            init_command().await?;
+        Commands::Init { platform } => {
+            init_command(platform).await?;
         }
         Commands::Install { package, version, alias } => {
             install_command(package, version, alias).await?;
