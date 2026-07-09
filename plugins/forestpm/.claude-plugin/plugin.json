@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "forestpm",
+  "displayName": "forestpm",
+  "version": "0.1.0",
+  "description": "Use the forest CLI to manage forestpm packages in a Roblox or UEFN game project — scaffold forest.json, install/remove dependencies non-interactively, and require packages from Luau.",
+  "author": {
+    "name": "Forest Software LLC",
+    "url": "https://forest.dev"
+  },
+  "homepage": "https://docs.forest.dev/forest-cli/commands",
+  "repository": "https://github.com/Forest-Software-LLC/forest-cli",
+  "license": "MIT",
+  "keywords": ["forest", "forestpm", "roblox", "uefn", "luau", "package-manager"]
+}
