@@ -9,7 +9,7 @@ mod fetch_and_extract;
 mod commands;
 mod licensce_helper;
 mod utils;
-use commands::{login_command, install_command, init_command, publish_command, remove_command};
+use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command};
 
 use std::env;
 
@@ -25,6 +25,12 @@ struct Cli {
 enum Commands {
     /// Log in to your Forest account
     Login,
+
+    /// Log out and clear your stored credentials
+    Logout,
+
+    /// Show the currently logged-in user
+    Whoami,
 
     /// Publish a package
     Publish,
@@ -71,6 +77,12 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Login => {
             login_command().await?;
+        }
+        Commands::Logout => {
+            logout_command().await?;
+        }
+        Commands::Whoami => {
+            whoami_command().await?;
         }
         Commands::Publish => {
             publish_command().await?;

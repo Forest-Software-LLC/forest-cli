@@ -42,3 +42,12 @@ pub fn store_tokens(access: &str, refresh: &str) -> Result<()> {
     fs::write(tokens_file(), json)?;
     Ok(())
 }
+
+/// Delete the stored tokens file (used by `forest logout`).
+pub fn clear_tokens() -> Result<()> {
+    let path = tokens_file();
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
