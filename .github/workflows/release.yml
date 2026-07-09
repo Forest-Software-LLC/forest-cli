@@ -26,8 +26,8 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin   # cross-compiled on Apple Silicon: GitHub retired the Intel macos-13 runner
 
     steps:
       - uses: actions/checkout@v4
