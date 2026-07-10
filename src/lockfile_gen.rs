@@ -20,13 +20,30 @@ pub struct LockFile {
 }
 
 pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, DepSpec>) -> Result<()> {
+    // `_`/`.`-prefixed folders in packages/ are exempt from install cleanup
+    // (e.g. Wally's `_Index`), so aliases must not claim those names.
+    for (pkg_name, spec) in &root_deps {
+        if spec.alias.starts_with('_') || spec.alias.starts_with('.') {
+            return Err(anyhow!(
+                "Alias '{}' for {} cannot start with '_' or '.' — rename it in forest.json",
+                spec.alias, pkg_name
+            ));
+        }
+    }
+
     // Make directories for all packages
     if !Path::new("packages").exists() {
         fs::create_dir_all("packages")?;
     } else {
-        // Clear existing packages directory
+        // Clear existing packages directory, skipping `_` and dot-prefixed
+        // entries: on case-insensitive filesystems `packages` is the same
+        // directory as Wally's `Packages`, whose `_Index` must survive.
         for entry in fs::read_dir("packages")? {
             let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('_') || name.starts_with('.') {
+                continue;
+            }
             if entry.file_type()?.is_dir() {
                 fs::remove_dir_all(entry.path())?;
             }
