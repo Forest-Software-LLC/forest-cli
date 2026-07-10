@@ -1,6 +1,6 @@
 [package]
 name = "forest"
-version = "0.1.0"
+version = "0.0.4"
 edition = "2021"
 authors = ["Forest Software LLC"]
 description = "Forest CLI – Package manager"
@@ -28,3 +28,5 @@ walkdir = "2.5.0"
 ignore = "0.4.23"
 version-ranges = "0.1"
 chrono = "0.4.42"
+self-replace = "1"    # atomic self-replacement for `forest update` (handles Windows)
+sha2 = "0.10"         # verify downloaded binaries against the release manifest
