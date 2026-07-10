@@ -9,13 +9,13 @@ mod fetch_and_extract;
 mod commands;
 mod licensce_helper;
 mod utils;
-use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command};
+use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, maybe_notify_update};
 
 use std::env;
 
 /// Forest CLI - Package manager
 #[derive(Parser)]
-#[command(name = "forest", version = "0.1.0", about = "Forest CLI - Package manager")]
+#[command(name = "forest", version = env!("CARGO_PKG_VERSION"), about = "Forest CLI - Package manager")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -64,6 +64,14 @@ enum Commands {
         /// Package name
         package: String,
     },
+
+    /// Update forest to the latest release
+    #[command(alias = "upgrade")]
+    Update {
+        /// Only report whether an update is available; don't install it
+        #[arg(long = "check")]
+        check: bool,
+    },
 }
 
 #[tokio::main]
@@ -78,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
     //}
 
     let cli = Cli::parse();
+    let is_update = matches!(cli.command, Commands::Update { .. });
 
     match cli.command {
         Commands::Login => {
@@ -101,6 +110,15 @@ async fn main() -> anyhow::Result<()> {
         Commands::Remove { package } => {
             remove_command(package).await?;
         }
+        Commands::Update { check } => {
+            update_command(check).await?;
+        }
+    }
+
+    // Best-effort, throttled nudge if a newer forest exists (skipped during an
+    // explicit update, in CI, and in non-interactive shells).
+    if !is_update {
+        maybe_notify_update().await;
     }
 
     Ok(())
