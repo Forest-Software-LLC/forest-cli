@@ -77,13 +77,13 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env based on NODE_ENV or fallback to ".env"
-    //if env::var("ENV") == Ok("dev".to_string()) {
+    if env::var("ENV") == Ok("dev".to_string()) {
         env::set_var("FOREST_API_URL", "http://localhost:3001/");
         env::set_var("FRONTEND_URL", "http://localhost:3000/");
-    //} else {
-    //    env::set_var("FOREST_API_URL", "https://api.forestpm.dev/");
-   //     env::set_var("FRONTEND_URL", "https://forestpm.dev/");
-    //}
+    } else {
+        env::set_var("FOREST_API_URL", "https://api.forest.dev/");
+        env::set_var("FRONTEND_URL", "https://forest.dev/");
+    }
 
     let cli = Cli::parse();
     let is_update = matches!(cli.command, Commands::Update { .. });
