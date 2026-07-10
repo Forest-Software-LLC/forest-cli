@@ -60,22 +60,27 @@ fn version_builder(current_version: &str) -> String {
 
 }
 
-/// Load .forestignore patterns (or empty matcher if none).
+/// Load ignore patterns from `.gitignore` and `.forestignore` (either may be
+/// absent). `.forestignore` is applied last so its patterns override `.gitignore`.
 fn load_forest_ignore(directory: &Path) -> Gitignore {
     let mut builder = GitignoreBuilder::new(directory);
 
-    let ignore_file = directory.join(".forestignore");
-    if ignore_file.exists() {
-        // builder.add_line takes a source name & one pattern per-line,
-        // but builder.add(ignore_file) will parse the file for you.
-        builder.add(ignore_file);
+    for ignore_name in [".gitignore", ".forestignore"] {
+        let ignore_file = directory.join(ignore_name);
+        if ignore_file.exists() {
+            // builder.add parses the whole file and returns Some(err) on failure.
+            if let Some(err) = builder.add(&ignore_file) {
+                warn(&format!("Failed to parse {}: {}", ignore_name, err));
+            }
+        }
     }
 
     // allow unparseable patterns to just be warnings, not panics
-    builder.build().expect("Parsing .forestignore failed")
+    builder.build().expect("Parsing ignore files failed")
 }
 
-/// Create a gzipped tarball in-memory of the directory, honoring .forestignore.
+/// Create a gzipped tarball in-memory of the directory, honoring .gitignore /
+/// .forestignore and skipping dotfiles/dot-directories by default.
 fn create_tarball_buffer(dir: &Path, matcher: &Gitignore) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
@@ -86,6 +91,15 @@ fn create_tarball_buffer(dir: &Path, matcher: &Gitignore) -> Result<Vec<u8>> {
         let walker = WalkDir::new(dir).into_iter().filter_entry(|e| {
             // compute the path *inside* the package
             let rel = e.path().strip_prefix(dir).unwrap();
+            // never prune the root of the walk itself
+            if rel.as_os_str().is_empty() {
+                return true;
+            }
+            // ignore dotfiles/dot-directories by default (.git, .gitignore,
+            // .forestignore, .DS_Store, ...) so they never reach the tarball
+            if e.file_name().to_str().map_or(false, |n| n.starts_with('.')) {
+                return false;
+            }
             // if the matcher says “ignore this dir”, return false to prune
             !matcher.matched(rel, e.file_type().is_dir()).is_ignore()
         });
