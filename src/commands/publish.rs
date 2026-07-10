@@ -500,6 +500,16 @@ pub async fn publish_command() -> Result<()> {
         .await
         .context("Failed to upload package")?;
     
+    if upload_status == StatusCode::TOO_MANY_REQUESTS {
+        // The API's 429 message says why and how long until the next publish is allowed.
+        let error_msg = upload_response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("You're publishing too frequently. Please try again later.");
+        msg.finish(MessageType::Fail, error_msg);
+        return Ok(());
+    }
+
     if !upload_status.is_success() {
         let error_msg = upload_response
             .get("error")
