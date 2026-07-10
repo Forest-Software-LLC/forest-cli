@@ -9,7 +9,7 @@ mod fetch_and_extract;
 mod commands;
 mod licensce_helper;
 mod utils;
-use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, maybe_notify_update};
+use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, audit_command, maybe_notify_update};
 
 use std::env;
 
@@ -72,6 +72,14 @@ enum Commands {
         #[arg(long = "check")]
         check: bool,
     },
+
+    /// Check dependencies for available updates
+    #[command(alias = "outdated")]
+    Audit {
+        /// Update forest.json to the latest versions and reinstall
+        #[arg(short = 'u', long = "update")]
+        update: bool,
+    },
 }
 
 #[tokio::main]
@@ -112,6 +120,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Update { check } => {
             update_command(check).await?;
+        }
+        Commands::Audit { update } => {
+            audit_command(update).await?;
         }
     }
 

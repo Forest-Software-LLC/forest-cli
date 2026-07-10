@@ -63,6 +63,16 @@ pub async fn install_command(
 
         let resolved_alias = alias.clone().unwrap_or_else(|| package_identifiers[1].to_string());
 
+        // `_`/`.`-prefixed folders in packages/ are exempt from install cleanup
+        // (e.g. Wally's `_Index`), so aliases must not claim those names.
+        if resolved_alias.starts_with('_') || resolved_alias.starts_with('.') {
+            msg.finish(
+                MessageType::Fail,
+                &format!("Alias {} cannot start with '_' or '.'", resolved_alias),
+            );
+            return Ok(());
+        }
+
         // Fetch package info
         let ver: String = version.unwrap_or_else(|| "latest".to_string());
         let endpoint = format!(
