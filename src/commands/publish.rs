@@ -1,5 +1,5 @@
 use anyhow::{Context, Ok, Result};
-use std::{env, fs, path::{Path}, sync::Arc};
+use std::{env, fs, path::{Path, PathBuf}, sync::Arc};
 use serde_json::Value;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use walkdir::WalkDir;
@@ -60,22 +60,27 @@ fn version_builder(current_version: &str) -> String {
 
 }
 
-/// Load .forestignore patterns (or empty matcher if none).
+/// Load ignore patterns from `.gitignore` and `.forestignore` (either may be
+/// absent). `.forestignore` is applied last so its patterns override `.gitignore`.
 fn load_forest_ignore(directory: &Path) -> Gitignore {
     let mut builder = GitignoreBuilder::new(directory);
 
-    let ignore_file = directory.join(".forestignore");
-    if ignore_file.exists() {
-        // builder.add_line takes a source name & one pattern per-line,
-        // but builder.add(ignore_file) will parse the file for you.
-        builder.add(ignore_file);
+    for ignore_name in [".gitignore", ".forestignore"] {
+        let ignore_file = directory.join(ignore_name);
+        if ignore_file.exists() {
+            // builder.add parses the whole file and returns Some(err) on failure.
+            if let Some(err) = builder.add(&ignore_file) {
+                warn(&format!("Failed to parse {}: {}", ignore_name, err));
+            }
+        }
     }
 
     // allow unparseable patterns to just be warnings, not panics
-    builder.build().expect("Parsing .forestignore failed")
+    builder.build().expect("Parsing ignore files failed")
 }
 
-/// Create a gzipped tarball in-memory of the directory, honoring .forestignore.
+/// Create a gzipped tarball in-memory of the directory, honoring .gitignore /
+/// .forestignore and skipping dotfiles/dot-directories by default.
 fn create_tarball_buffer(dir: &Path, matcher: &Gitignore) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
@@ -86,6 +91,15 @@ fn create_tarball_buffer(dir: &Path, matcher: &Gitignore) -> Result<Vec<u8>> {
         let walker = WalkDir::new(dir).into_iter().filter_entry(|e| {
             // compute the path *inside* the package
             let rel = e.path().strip_prefix(dir).unwrap();
+            // never prune the root of the walk itself
+            if rel.as_os_str().is_empty() {
+                return true;
+            }
+            // ignore dotfiles/dot-directories by default (.git, .gitignore,
+            // .forestignore, .DS_Store, ...) so they never reach the tarball
+            if e.file_name().to_str().map_or(false, |n| n.starts_with('.')) {
+                return false;
+            }
             // if the matcher says “ignore this dir”, return false to prune
             !matcher.matched(rel, e.file_type().is_dir()).is_ignore()
         });
@@ -145,28 +159,53 @@ pub async fn publish_command() -> Result<()> {
     });
 
 
-    // Find init.lua file in the first or second level of the directory
-    let mut init_lua_path = cwd.join(forest_json["root"].as_str().unwrap_or("init.luau"));
+    // Find the package's init file at the first or second level of the directory.
+    // Roblox uses `.luau`, but `.lua` is still valid, so accept either.
+    const INIT_FILES: [&str; 2] = ["init.luau", "init.lua"];
+
+    // Honor an explicit `root` from forest.json; otherwise auto-detect the init file.
+    let mut init_lua_path = match forest_json["root"].as_str() {
+        Some(root) => cwd.join(root),
+        None => cwd.join(INIT_FILES[0]),
+    };
     if !init_lua_path.exists() {
-        // Search in second level directories
-        for entry in fs::read_dir(&cwd)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                let nested_init = path.join("init.luau");
-                if nested_init.exists() {
-                    init_lua_path = nested_init;
-                    break;
+        let mut found: Option<PathBuf> = None;
+
+        // Top level first.
+        for candidate in INIT_FILES {
+            let top = cwd.join(candidate);
+            if top.exists() {
+                found = Some(top);
+                break;
+            }
+        }
+
+        // Then one directory deep.
+        if found.is_none() {
+            'search: for entry in fs::read_dir(&cwd)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    for candidate in INIT_FILES {
+                        let nested_init = path.join(candidate);
+                        if nested_init.exists() {
+                            found = Some(nested_init);
+                            break 'search;
+                        }
+                    }
                 }
             }
         }
-        
+
+        if let Some(p) = found {
+            init_lua_path = p;
+        }
     }
 
     if !init_lua_path.exists() {
-        warn("Failed to resolve root for init.luau");
+        warn("Failed to resolve root for init.luau/init.lua");
         let target_root: String = Input::with_theme(&ColorfulTheme::default())
-            .with_prompt("Root file (init.luau) not found. Please provide the relative path to your root file. (e.g. src/init.luau)")
+            .with_prompt("Root file (init.luau or init.lua) not found. Please provide the relative path to your root file. (e.g. src/init.luau)")
             .validate_with(|input: &String| {
                 if input.is_empty() {
                     Err(anyhow::anyhow!("Path cannot be empty"))

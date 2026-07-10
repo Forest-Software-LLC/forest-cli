@@ -65,6 +65,15 @@ pub fn fetch_and_extract(url: &str, out_dir: &Path, archive_root: &str, bar: Pro
     // Extract tar archive
     let root_path = Path::new(archive_root).to_path_buf();
 
+    // `archive_root` is the package's init file (e.g. `src/init.luau`). In Roblox a
+    // folder module is `init.luau` plus its sibling files/subfolders, so the real
+    // source root is the DIRECTORY that contains the init file — we must extract
+    // everything in it, not just the init file itself. A bare, top-level init file
+    // (no parent directory) is a single-file package and is extracted on its own.
+    let root_dir = root_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty());
+
     let mut archive = Archive::new(decompressor);
     let entries = archive.entries().context("Failed to read archive entries")?;
 
@@ -86,32 +95,33 @@ pub fn fetch_and_extract(url: &str, out_dir: &Path, archive_root: &str, bar: Pro
                 .map(|s| s == "LICENSE")
                 .unwrap_or(false);
 
-        // Match either exact-file or under-directory semantics
-        let matches_file = entry_path == root_path;
-        let under_root_dir = entry_path.starts_with(&root_path) && entry_path != root_path;
-
         // Decide output destination or skip
         let dest: Option<std::path::PathBuf> = if is_license {
             Some(out_dir.join("LICENSE"))
-        } else if matches_file {
-            // Single-file case → place directly under out_dir with its basename
+        } else if let Some(dir) = root_dir {
+            // Folder-module case → extract the whole source directory (init file plus
+            // all sibling .lua/.luau files and nested folders), stripping its prefix.
+            if entry_path.starts_with(dir) && entry_path.as_path() != dir {
+                let rel = entry_path
+                    .strip_prefix(dir)
+                    .expect("strip_prefix must succeed");
+                // prevent traversal in the relative path
+                let has_traversal = rel.components().any(|c| matches!(c,
+                    std::path::Component::ParentDir | std::path::Component::RootDir
+                ));
+                if has_traversal {
+                    None
+                } else {
+                    Some(out_dir.join(rel))
+                }
+            } else {
+                None
+            }
+        } else if entry_path == root_path {
+            // Single-file package → place the root file directly under out_dir.
             entry_path
                 .file_name()
                 .map(|name| out_dir.join(name))
-        } else if under_root_dir {
-            // Directory subtree case → strip the prefix
-            let rel = entry_path
-                .strip_prefix(&root_path)
-                .expect("strip_prefix must succeed");
-            // prevent traversal in the relative path
-            let has_traversal = rel.components().any(|c| matches!(c,
-                std::path::Component::ParentDir | std::path::Component::RootDir
-            ));
-            if has_traversal {
-                None
-            } else {
-                Some(out_dir.join(rel))
-            }
         } else {
             None
         };
