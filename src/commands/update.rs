@@ -40,24 +40,42 @@ struct ReleaseManifest {
     files: Vec<ReleaseFile>,
 }
 
+/// Fetch the release manifest and its detached SSH signature, and verify the
+/// signature over the manifest's EXACT bytes before parsing anything. The
+/// release host is untrusted: without a valid signature from a pinned offline
+/// key (see release_verify.rs), the manifest is not a release.
 async fn fetch_manifest(timeout: Option<Duration>) -> Result<ReleaseManifest> {
-    let url = format!("{}/cli/latest/latest.json", release_base());
+    let base = release_base();
     let mut builder = reqwest::Client::builder();
     if let Some(t) = timeout {
         builder = builder.timeout(t);
     }
     let client = builder.build().context("failed to build HTTP client")?;
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/json")
-        .send()
+
+    let get = |url: String| {
+        let client = client.clone();
+        async move {
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .context("failed to reach the release server")?;
+            if !resp.status().is_success() {
+                anyhow::bail!("{} returned HTTP {}", url, resp.status());
+            }
+            resp.bytes().await.context("failed to read response body")
+        }
+    };
+
+    let manifest_bytes = get(format!("{base}/cli/latest/latest.json")).await?;
+    let sig_bytes = get(format!("{base}/cli/latest/latest.json.sig"))
         .await
-        .context("failed to reach the release server")?;
-    if !resp.status().is_success() {
-        anyhow::bail!("release manifest returned HTTP {}", resp.status());
-    }
-    resp.json::<ReleaseManifest>()
-        .await
+        .context("release signature is missing — refusing to trust an unsigned manifest")?;
+    let sig_pem = std::str::from_utf8(&sig_bytes).context("release signature is not valid UTF-8")?;
+
+    crate::release_verify::verify_manifest_signature(&manifest_bytes, sig_pem)?;
+
+    serde_json::from_slice::<ReleaseManifest>(&manifest_bytes)
         .context("failed to parse the release manifest")
 }
 

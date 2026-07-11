@@ -8,6 +8,7 @@ mod lockfile_solver;
 mod fetch_and_extract;
 mod commands;
 mod licensce_helper;
+mod release_verify;
 mod utils;
 use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, audit_command, maybe_notify_update};
 

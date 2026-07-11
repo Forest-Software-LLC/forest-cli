@@ -1,2 +1,10 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts must stay LF — CRLF breaks them under Git Bash
+*.sh text eol=lf
+
+# Signature test fixtures are verified byte-for-byte — line-ending
+# normalization would invalidate the signature.
+tests/fixtures-manifest.json -text
+tests/fixtures-manifest.json.sig -text
