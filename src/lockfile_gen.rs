@@ -7,7 +7,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::utils::normalize_forest_deps;
 use crate::lockfile_solver::{get_lockfile_packages, DepSpec, LockfileEntry};
-use crate::message::Message;
+use crate::message::{Message, MessageType};
 use crate::fetch_and_extract::fetch_and_extract;
 //use crate::utils::digest_package_name;
 
@@ -297,8 +297,14 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message) -> Result<Lock
         .to_string(); // clone the value so we don't hold a borrow
 
     msg.update("Resolving dependencies...");
-    let lockfile_packages = get_lockfile_packages(roots.clone(), platform).await
+    let (lockfile_packages, license_warnings) = get_lockfile_packages(roots.clone(), platform).await
         .context("Failed to resolve lockfile packages")?;
+
+    // Surface registry license-safety ratings for anything caution/unsafe in
+    // the resolved tree (direct and transitive) before files land on disk.
+    for warning in &license_warnings {
+        msg.emit(MessageType::Warn, warning);
+    }
 
     let lockfile : LockFile = LockFile {
         file_version: 1,
