@@ -28,7 +28,7 @@ struct VersionState {
     resolved: bool,
     dependencies: HashMap<String, DepSpec>,
     integrity: String,
-    access_url : String,
+    public: bool,
     archive_root: String
 }
 
@@ -41,12 +41,17 @@ struct PackageState {
 
 type ResolvedVersions = HashMap<String, PackageState>;
 
-/// Lockfile entry for a package version
+/// Lockfile entry for a package version.
+///
+/// Deliberately stores no download URL: tarballs are content-addressed
+/// (`{integrity}.tgz` on the CDN), so the URL is derived from `integrity` at
+/// install time. A URL field would be an attacker-editable pointer in PRs
+/// (lockfile injection); the hash both names and verifies the content.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LockfileEntry {
     pub version: String,
-    pub resolved: String,
-    integrity: String,
+    pub integrity: String,
+    pub public: bool,
     pub root : String,
     pub location: String,
     pub dependencies: HashMap<String, DepSpec>,
@@ -107,7 +112,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
                 //println!("Found version {} for package {}", ver, name.full_name);
                 pkg_state.versions.insert(
                     ver,
-                    VersionState { resolved: false, dependencies: HashMap::new(), integrity: String::new(), access_url: String::new(), archive_root: String::new() }
+                    VersionState { resolved: false, dependencies: HashMap::new(), integrity: String::new(), public: false, archive_root: String::new() }
                 );
             }
         }
@@ -209,10 +214,18 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        vs.access_url = package_info.get("accessUrl")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        if vs.integrity.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Registry returned no integrity hash for {}@{} — cannot lock this version",
+                name.full_name, agreed
+            ));
+        }
+
+        // Private tarballs need a fresh signed URL at install time; default to
+        // private when the field is missing so we fall back to asking the API.
+        vs.public = package_info.get("public")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         vs.archive_root = package_info.get("archiveRoot")
             .and_then(|v| v.as_str())
@@ -244,8 +257,8 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
             }
             entries.push(LockfileEntry {
                 version: bucket_ver.clone(),
-                resolved: vs.access_url.clone(),//"https://registry.forestpm.dev/".into(),
                 integrity: vs.integrity.clone(),
+                public: vs.public,
                 root: vs.archive_root.clone(),
                 location: String::new(),
                 dependencies: deps,

@@ -173,37 +173,41 @@ pub async fn install_command(
         );
     } else {
         // No specific package: install all via lockfile
-        if !Path::new("forest-lock.json").exists() {
+        let lock_content: Option<Value> = if Path::new("forest-lock.json").exists() {
+            Some(serde_json::from_str(&fs::read_to_string("forest-lock.json")?)?)
+        } else {
             msg.emit(
                 MessageType::Warn,
                 "No lockfile found. Commit forest-lock.json to avoid inconsistencies.",
             );
+            None
+        };
+
+        // Only the current format installs straight from the lockfile; anything
+        // else (older format, unknown version) is re-resolved like a missing one.
+        let usable = lock_content.as_ref()
+            .and_then(|c| c.get("file_version"))
+            .and_then(Value::as_u64)
+            == Some(2);
+
+        if usable {
+            msg.destroy();
+            make_directories(&serde_json::from_value(lock_content.unwrap()).unwrap(), normalize_forest_deps(&info.clone()), &platform).await?;
+
+            msg = Message::new("");
+        } else {
+            if lock_content.is_some() {
+                msg.emit(
+                    MessageType::Warn,
+                    "Lockfile format is out of date — regenerating forest-lock.json.",
+                );
+            }
             let info_clone = info.clone();
             let lockfile_content = lockfile_gen(&info_clone, &mut msg).await?;
             // Convert content to string
             let lockfile_content = serde_json::to_string_pretty(&lockfile_content)?;
 
             fs::write("forest-lock.json", lockfile_content)?;
-        } else {
-            let lock_content: Value = serde_json::from_str(
-                &fs::read_to_string("forest-lock.json")?
-            )?;
-            let file_version = lock_content
-                .get("file_version")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if file_version != 1 {
-                msg.finish(
-                    MessageType::Fail,
-                    "Unsupported lockfile version. Delete forest-lock.json and run `forest i` again.",
-                );
-                return Ok(());
-            }
-            msg.destroy();
-            make_directories(&serde_json::from_value(lock_content.clone()).unwrap(), normalize_forest_deps(&info.clone())).await?;
-
-            msg = Message::new("");
-
         }
 
         msg.finish(MessageType::Success, "Installed all dependencies!");

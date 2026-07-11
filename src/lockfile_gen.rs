@@ -5,11 +5,12 @@ use serde_json::Value;
 use urlencoding::encode;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::utils::normalize_forest_deps;
+use reqwest::Method;
+use crate::http::api_request;
+use crate::utils::{digest_package_name, normalize_forest_deps};
 use crate::lockfile_solver::{get_lockfile_packages, DepSpec, LockfileEntry};
 use crate::message::{Message, MessageType};
 use crate::fetch_and_extract::fetch_and_extract;
-//use crate::utils::digest_package_name;
 
 
 /// The overall lockfile structure.
@@ -19,7 +20,17 @@ pub struct LockFile {
     pub packages: HashMap<String, Vec<LockfileEntry>>,
 }
 
-pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, DepSpec>) -> Result<()> {
+/// Tarballs are content-addressed on the CDN (`/{public|private}/{sha256}.tgz`),
+/// so public download URLs are derived from the lockfile's integrity hash rather
+/// than stored in the lockfile. Overridable for local stacks, following
+/// update.rs's FOREST_INSTALL_BASE convention.
+const DEFAULT_CDN_BASE: &str = "https://registry.forest.dev";
+
+fn cdn_base() -> String {
+    std::env::var("FOREST_CDN_BASE").unwrap_or_else(|_| DEFAULT_CDN_BASE.to_string())
+}
+
+pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, DepSpec>, platform: &str) -> Result<()> {
     // `_`/`.`-prefixed folders in packages/ are exempt from install cleanup
     // (e.g. Wally's `_Index`), so aliases must not claim those names.
     for (pkg_name, spec) in &root_deps {
@@ -47,6 +58,52 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
             if entry.file_type()?.is_dir() {
                 fs::remove_dir_all(entry.path())?;
             }
+        }
+    }
+
+    // Private tarballs sit behind the CDN worker's HMAC gate and their signed
+    // URLs expire in minutes, so they are never stored in the lockfile. Fetch a
+    // fresh signed URL per private entry now, cross-checking the registry's
+    // integrity hash against the lockfile's before anything is downloaded.
+    let mut private_urls: HashMap<(String, String), String> = HashMap::new();
+    for (pkg_name, versions) in &lockfile.packages {
+        for version_data in versions {
+            if version_data.public {
+                continue;
+            }
+            let name = digest_package_name(pkg_name);
+            let path = format!(
+                "v1/package/{}/{}/{}/{}",
+                encode(&name.scope),
+                encode(platform),
+                encode(&name.name),
+                encode(&version_data.version)
+            );
+            let (info, status) = api_request(&path, Method::GET, None, None).await
+                .with_context(|| format!("Failed to fetch access URL for {}@{}", pkg_name, version_data.version))?;
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "Failed to fetch access URL for {}@{}: HTTP {}",
+                    pkg_name, version_data.version, status
+                ));
+            }
+            let registry_integrity = info.get("integrity")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !registry_integrity.eq_ignore_ascii_case(version_data.integrity.trim()) {
+                return Err(anyhow!(
+                    "Integrity mismatch for {}@{}: lockfile has {} but the registry reports {}. \
+                     Refusing to install — if this version was republished, delete forest-lock.json and re-run `forest install`.",
+                    pkg_name, version_data.version, version_data.integrity, registry_integrity
+                ));
+            }
+            let url = info.get("accessUrl")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("Registry returned no access URL for {}@{}", pkg_name, version_data.version))?;
+            private_urls.insert(
+                (pkg_name.clone(), version_data.version.clone()),
+                url.to_string()
+            );
         }
     }
 
@@ -182,13 +239,23 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
             bar.set_style(style.clone());
             bar.set_message(format!("{} @ {}", pkg_name, version_data.version));
             
-            let url = version_data.resolved.clone();
+            // Public tarballs are content-addressed: the integrity hash IS the
+            // path, so a lockfile can't point the CLI anywhere else.
+            let url = if version_data.public {
+                format!("{}/public/{}.tgz", cdn_base(), version_data.integrity.trim())
+            } else {
+                private_urls
+                    .get(&(pkg_name.clone(), version_data.version.clone()))
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Missing signed URL for {}@{}", pkg_name, version_data.version))?
+            };
+            let integrity_clone = version_data.integrity.clone();
             let dir_clone = dir_path.clone();
             let bar_clone = bar.clone();
-            let root_clone = version_data.root.clone(); 
+            let root_clone = version_data.root.clone();
 
             let handle = std::thread::spawn(move || -> Result<()> {
-                fetch_and_extract(&url, &dir_clone, &root_clone, bar_clone)?;
+                fetch_and_extract(&url, &integrity_clone, &dir_clone, &root_clone, bar_clone)?;
                 bar.finish_and_clear();
                 Ok(())
             });
@@ -297,7 +364,7 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message) -> Result<Lock
         .to_string(); // clone the value so we don't hold a borrow
 
     msg.update("Resolving dependencies...");
-    let (lockfile_packages, license_warnings) = get_lockfile_packages(roots.clone(), platform).await
+    let (lockfile_packages, license_warnings) = get_lockfile_packages(roots.clone(), platform.clone()).await
         .context("Failed to resolve lockfile packages")?;
 
     // Surface registry license-safety ratings for anything caution/unsafe in
@@ -307,11 +374,11 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message) -> Result<Lock
     }
 
     let lockfile : LockFile = LockFile {
-        file_version: 1,
+        file_version: 2,
         packages: lockfile_packages
     };
 
-    make_directories(&lockfile, roots).await
+    make_directories(&lockfile, roots, &platform).await
         .context("Failed to create directories for lockfile packages")?;
     
     Ok(lockfile)
