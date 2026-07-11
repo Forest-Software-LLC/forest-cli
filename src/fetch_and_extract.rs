@@ -109,6 +109,22 @@ pub fn fetch_and_extract(url: &str, expected_sha256: &str, out_dir: &Path, archi
         .parent()
         .filter(|p| !p.as_os_str().is_empty());
 
+    // Roblox can only `require` the package folder if its module file is named
+    // `init.<ext>`, but packages may declare any file as their root (e.g.
+    // `ProfileStore.luau`). Rename the root file on extraction so the installed
+    // folder is always requirable.
+    let renamed_init: Option<String> = root_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|stem| *stem != "init")
+        .map(|_| {
+            let ext = root_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("luau");
+            format!("init.{ext}")
+        });
+
     let mut archive = Archive::new(decompressor);
     let entries = archive.entries().context("Failed to read archive entries")?;
 
@@ -146,6 +162,11 @@ pub fn fetch_and_extract(url: &str, expected_sha256: &str, out_dir: &Path, archi
                 ));
                 if has_traversal {
                     None
+                } else if entry_path == root_path {
+                    match &renamed_init {
+                        Some(name) => Some(out_dir.join(name)),
+                        None => Some(out_dir.join(rel)),
+                    }
                 } else {
                     Some(out_dir.join(rel))
                 }
@@ -154,9 +175,10 @@ pub fn fetch_and_extract(url: &str, expected_sha256: &str, out_dir: &Path, archi
             }
         } else if entry_path == root_path {
             // Single-file package → place the root file directly under out_dir.
-            entry_path
-                .file_name()
-                .map(|name| out_dir.join(name))
+            match &renamed_init {
+                Some(name) => Some(out_dir.join(name)),
+                None => entry_path.file_name().map(|name| out_dir.join(name)),
+            }
         } else {
             None
         };
@@ -194,22 +216,29 @@ mod tests {
     use std::io::Write;
     use std::net::TcpListener;
 
-    /// Build a minimal valid package tgz: src/init.luau with the given content.
-    fn make_tgz(content: &str) -> Vec<u8> {
+    /// Build a package tgz containing the given (path, content) entries.
+    fn make_tgz_with(entries: &[(&str, &str)]) -> Vec<u8> {
         let mut tar_bytes = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_bytes);
-            let data = content.as_bytes();
-            let mut header = tar::Header::new_gnu();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, "src/init.luau", data).unwrap();
+            for (path, content) in entries {
+                let data = content.as_bytes();
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, *path, data).unwrap();
+            }
             builder.finish().unwrap();
         }
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&tar_bytes).unwrap();
         gz.finish().unwrap()
+    }
+
+    /// Build a minimal valid package tgz: src/init.luau with the given content.
+    fn make_tgz(content: &str) -> Vec<u8> {
+        make_tgz_with(&[("src/init.luau", content)])
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
@@ -254,6 +283,41 @@ mod tests {
 
         let extracted = fs::read_to_string(out.join("init.luau")).unwrap();
         assert_eq!(extracted, "return {}");
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn renames_top_level_root_file_to_init() {
+        // Single-file package whose root isn't named init (e.g. ProfileStore).
+        let tgz = make_tgz_with(&[("ProfileStore.luau", "return {} -- ps")]);
+        let hash = sha256_hex(&tgz);
+        let url = serve_once(tgz);
+        let out = temp_out_dir("rename-top");
+
+        fetch_and_extract(&url, &hash, &out, "ProfileStore.luau", ProgressBar::hidden()).unwrap();
+
+        let extracted = fs::read_to_string(out.join("init.luau")).unwrap();
+        assert_eq!(extracted, "return {} -- ps");
+        assert!(!out.join("ProfileStore.luau").exists(), "root file must be renamed, not duplicated");
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn renames_nested_root_file_to_init_keeping_siblings() {
+        let tgz = make_tgz_with(&[
+            ("src/Module.lua", "return {} -- root"),
+            ("src/Helper.lua", "return {} -- helper"),
+        ]);
+        let hash = sha256_hex(&tgz);
+        let url = serve_once(tgz);
+        let out = temp_out_dir("rename-nested");
+
+        fetch_and_extract(&url, &hash, &out, "src/Module.lua", ProgressBar::hidden()).unwrap();
+
+        // Root renamed with its extension preserved; siblings keep their names.
+        assert_eq!(fs::read_to_string(out.join("init.lua")).unwrap(), "return {} -- root");
+        assert_eq!(fs::read_to_string(out.join("Helper.lua")).unwrap(), "return {} -- helper");
+        assert!(!out.join("Module.lua").exists(), "root file must be renamed, not duplicated");
         let _ = fs::remove_dir_all(&out);
     }
 
