@@ -105,6 +105,30 @@ pub fn detect_license(cwd: &std::path::Path) -> Option<(String, bool)> {
     None
 }
 
+/// Build a license-safety warning from a registry package-info response.
+/// The registry rates every version at publish time (static classification for
+/// standard SPDX ids, AI-assisted review for custom license files).
+/// Returns None when the license is safe or the rating is unavailable.
+pub fn license_warning_for(package_info: &serde_json::Value, pkg_label: &str) -> Option<String> {
+    let rating = package_info.get("licenseRating").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+    let license = package_info.get("license").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+
+    let mut out = match rating {
+        "unsafe" => format!("{} — license '{}' is a LEGAL RISK for closed-source games", pkg_label, license),
+        "caution" => format!("{} — license '{}' is usable with conditions", pkg_label, license),
+        _ => return None,
+    };
+
+    if let Some(caveats) = package_info.get("licenseCaveats").and_then(serde_json::Value::as_array) {
+        for caveat in caveats.iter().filter_map(serde_json::Value::as_str) {
+            out.push_str(&format!("\n   • {}", caveat));
+        }
+    }
+    out.push_str("\n   (Automated license review — not legal advice)");
+
+    Some(out)
+}
+
 pub fn sanitize_spdx(license: &str) -> &str {
     // Fix common mistakes such as lowercase, missing dashes, etc.
     let l = license.trim().to_uppercase();

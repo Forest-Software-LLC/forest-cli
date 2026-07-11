@@ -60,8 +60,12 @@ pub struct DepSpec {
     pub version: String,
 }
 
-pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform : String) -> Result<LockfilePackages> {
+/// Resolves the dependency graph. Also returns license-safety warnings for any
+/// resolved version the registry rated caution/unsafe — each version is fetched
+/// exactly once, so warnings are naturally deduplicated.
+pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform : String) -> Result<(LockfilePackages, Vec<String>)> {
     let mut resolved: ResolvedVersions = HashMap::new();
+    let mut license_warnings: Vec<String> = Vec::new();
 
     // Make queue with digest_package_name using normalized specs
     let mut queue: VecDeque<(PackageName, String, u8)> = root_deps.clone().into_iter()
@@ -159,6 +163,10 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         }
 
         vs.resolved = true;
+
+        if let Some(warning) = crate::licensce_helper::license_warning_for(&package_info, &format!("{}@{}", name.full_name, agreed)) {
+            license_warnings.push(warning);
+        }
 
         let deps = package_info.get("dependencies")
             .and_then(|v| v.as_object())
@@ -313,7 +321,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         }
     }
 
-    Ok(lockfile)
+    Ok((lockfile, license_warnings))
 }
 
 
