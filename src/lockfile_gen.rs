@@ -6,7 +6,7 @@ use urlencoding::encode;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use reqwest::Method;
-use crate::http::api_request;
+use crate::http::packages_api_request;
 use crate::utils::{digest_package_name, normalize_forest_deps};
 use crate::lockfile_solver::{get_lockfile_packages, DepSpec, LockfileEntry};
 use crate::message::{Message, MessageType};
@@ -79,7 +79,7 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
                 encode(&name.name),
                 encode(&version_data.version)
             );
-            let (info, status) = api_request(&path, Method::GET, None, None).await
+            let (info, status) = packages_api_request(&path, Method::GET, None, None).await
                 .with_context(|| format!("Failed to fetch access URL for {}@{}", pkg_name, version_data.version))?;
             if !status.is_success() {
                 return Err(anyhow!(

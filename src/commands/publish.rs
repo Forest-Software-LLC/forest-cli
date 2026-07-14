@@ -9,7 +9,7 @@ use tar::Builder;
 use reqwest::{multipart::{Form, Part}, StatusCode};
 
 use crate::licensce_helper::{get_mit_license_text, detect_license, sanitize_spdx};
-use crate::{http::{self, api_request}, message::{fail, warn, info}};
+use crate::{http::{self, api_request, packages_api_request}, message::{fail, warn, info}};
 use crate::message::{Message, MessageType};
 
 fn open_url(url: &str) -> anyhow::Result<()> {
@@ -348,7 +348,7 @@ pub async fn publish_command() -> Result<()> {
                 .collect::<Vec<String>>();
         }
 
-        let (latest_package_data, status_code) = api_request(&format!("v1/package/{}/{}/{}/latest", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None)
+        let (latest_package_data, status_code) = packages_api_request(&format!("v1/package/{}/{}/{}/latest", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None)
             .await
             .context("Failed to fetch latest package data")?;
 
@@ -535,7 +535,7 @@ pub async fn publish_command() -> Result<()> {
     let mut hdrs = reqwest::header::HeaderMap::new();
     hdrs.insert("x-file-size", file_size_bytes.to_string().parse().unwrap());
 
-    let (upload_response, upload_status) = api_request("v1/package/upload", reqwest::Method::POST, Some(http::RequestBody::Multipart(form_builder)), Some(hdrs))
+    let (upload_response, upload_status) = packages_api_request("v1/package/upload", reqwest::Method::POST, Some(http::RequestBody::Multipart(form_builder)), Some(hdrs))
         .await
         .context("Failed to upload package")?;
     

@@ -88,9 +88,14 @@ async fn main() -> anyhow::Result<()> {
     // Load .env based on NODE_ENV or fallback to ".env"
     if env::var("ENV") == Ok("dev".to_string()) {
         env::set_var("FOREST_API_URL", "http://localhost:3001/");
+        // Local forest-trust-gateway (its dev server defaults to port 8081)
+        env::set_var("FOREST_PACKAGES_URL", "http://localhost:8081/");
         env::set_var("FRONTEND_URL", "http://localhost:3000/");
     } else {
         env::set_var("FOREST_API_URL", "https://api.forest.dev/");
+        // Package upload/download go to the public trust gateway, deployed
+        // from the open forest-trust-gateway repo to its own hostname.
+        env::set_var("FOREST_PACKAGES_URL", "https://packages.forest.dev/");
         env::set_var("FRONTEND_URL", "https://forest.dev/");
     }
 

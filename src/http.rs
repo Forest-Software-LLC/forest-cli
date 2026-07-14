@@ -44,20 +44,46 @@ pub async fn api_request_public(
     Ok((body_json, status))
 }
 
-/// Generic API request helper. Supports JSON or multipart bodies with auth + auto-refresh.
-///
-/// - `endpoint`: API path, appended to FOREST_API_URL
-/// - `method`: HTTP method
-/// - `body`: optional `RequestBody`, determines whether to send JSON or multipart.
-///
-/// Returns the parsed JSON response on success or an error.
+/// Generic API request against the main API (FOREST_API_URL): auth, account,
+/// package listings — everything except upload/download.
 pub async fn api_request(
     endpoint: &str,
     method: Method,
     body: Option<RequestBody>,
     headers: Option<header::HeaderMap>,
 ) -> Result<(Value, StatusCode)> {
-    let api_url = env::var("FOREST_API_URL").context("FOREST_API_URL must be set")?;
+    api_request_with_base("FOREST_API_URL", endpoint, method, body, headers).await
+}
+
+/// Request against the package gateway (FOREST_PACKAGES_URL) — the public,
+/// independently auditable service that owns package upload and download.
+/// Same auth/refresh behavior; the session refresh itself always goes to the
+/// main API, which is the only service that handles credentials.
+pub async fn packages_api_request(
+    endpoint: &str,
+    method: Method,
+    body: Option<RequestBody>,
+    headers: Option<header::HeaderMap>,
+) -> Result<(Value, StatusCode)> {
+    api_request_with_base("FOREST_PACKAGES_URL", endpoint, method, body, headers).await
+}
+
+/// Shared implementation. Supports JSON or multipart bodies with auth + auto-refresh.
+///
+/// - `base_env`: env var holding the base URL for this request
+/// - `endpoint`: API path, appended to the base URL
+/// - `method`: HTTP method
+/// - `body`: optional `RequestBody`, determines whether to send JSON or multipart.
+///
+/// Returns the parsed JSON response on success or an error.
+async fn api_request_with_base(
+    base_env: &str,
+    endpoint: &str,
+    method: Method,
+    body: Option<RequestBody>,
+    headers: Option<header::HeaderMap>,
+) -> Result<(Value, StatusCode)> {
+    let api_url = env::var(base_env).with_context(|| format!("{} must be set", base_env))?;
     let mut tokens = get_stored_tokens()?;
     let client = Client::new();
 
@@ -97,11 +123,13 @@ pub async fn api_request(
         .await
         .context("Network error on first attempt")?;
 
-    // On 401, refresh token and retry once
+    // On 401, refresh token and retry once. The refresh always goes to the
+    // main API regardless of which base this request used — auth is
+    // centralized there and nowhere else.
     if resp.status() == StatusCode::UNAUTHORIZED {
-        // Refresh
+        let auth_url = env::var("FOREST_API_URL").context("FOREST_API_URL must be set")?;
         let refresh_resp = client
-            .post(format!("{}v1/auth/refresh", api_url))
+            .post(format!("{}v1/auth/refresh", auth_url))
             .json(&serde_json::json!({ "refreshToken": get_stored_tokens()?.refresh_token }))
             .send()
             .await

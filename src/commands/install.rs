@@ -5,7 +5,7 @@ use urlencoding::encode;
 use reqwest::Method;
 
 use std::collections::{HashMap};
-use crate::http::api_request;
+use crate::http::packages_api_request;
 use crate::lockfile_solver::DepSpec;
 use crate::message::{Message, MessageType};
 use crate::lockfile_gen::{lockfile_gen, make_directories};
@@ -82,7 +82,7 @@ pub async fn install_command(
             encode(package_identifiers[1]), // name 
             encode(&ver) // version
         );
-        let (package_info, status_code) = match api_request(&endpoint, Method::GET, None, None).await {
+        let (package_info, status_code) = match packages_api_request(&endpoint, Method::GET, None, None).await {
             Ok(data) => data,
             Err(e) => {
                 msg.emit(

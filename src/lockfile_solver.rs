@@ -19,7 +19,7 @@ use anyhow::{Result, Context};
 use reqwest::{Method};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
-use crate::http::api_request;
+use crate::http::{api_request, packages_api_request};
 use crate::utils::{digest_package_name, PackageName };
 
 /// Tracks per-version resolution state
@@ -157,7 +157,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         if vs.resolved { continue; }
         let path = format!("v1/package/{}/{}/{}/{}", name.scope, platform, name.name, agreed);
 
-        let (package_info, status) = api_request(&path, Method::GET, None, None).await
+        let (package_info, status) = packages_api_request(&path, Method::GET, None, None).await
             .with_context(|| format!("Failed to fetch package info for {}@{}", name.full_name, agreed))?;
 
         if !status.is_success() {
