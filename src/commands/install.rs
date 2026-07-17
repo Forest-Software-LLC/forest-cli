@@ -61,16 +61,28 @@ pub async fn install_command(
             package_identifiers[0] = &package_identifiers[0][1..];
         }
 
-        let resolved_alias = alias.clone().unwrap_or_else(|| package_identifiers[1].to_string());
+        // Validate alias
+        if let Some(a) = &alias {
+            // `_`/`.`-prefixed folders in packages/ are exempt from install
+            // cleanup (e.g. Wally's `_Index`), so aliases must not claim
+            // those names.
+            if a.starts_with('_') || a.starts_with('.') {
+                msg.finish(
+                    MessageType::Fail,
+                    &format!("Alias {} cannot start with '_' or '.'", a),
+                );
+                return Ok(());
+            }
 
-        // `_`/`.`-prefixed folders in packages/ are exempt from install cleanup
-        // (e.g. Wally's `_Index`), so aliases must not claim those names.
-        if resolved_alias.starts_with('_') || resolved_alias.starts_with('.') {
-            msg.finish(
-                MessageType::Fail,
-                &format!("Alias {} cannot start with '_' or '.'", resolved_alias),
-            );
-            return Ok(());
+            // Aliases become folder names (and `require` identifiers) — path
+            // separators would nest directories and break pointer files.
+            if a.contains('/') || a.contains('\\') {
+                msg.finish(
+                    MessageType::Fail,
+                    &format!("Alias {} cannot contain '/' or '\\'", a),
+                );
+                return Ok(());
+            }
         }
 
         // Fetch package info
@@ -104,11 +116,38 @@ pub async fn install_command(
             return Ok(());
         }
 
-        // Check existing install
-        if deps.contains_key(&pkg) {
+        // fall back to what was typed if fields are missing in the response
+        let canonical_scope = package_info
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or(package_identifiers[0])
+            .to_string();
+        let canonical_name = package_info
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(package_identifiers[1])
+            .to_string();
+        let canonical_full = format!("{}/{}", canonical_scope, canonical_name);
+
+        // Target name for the installed package.
+        let resolved_name = alias.clone().unwrap_or_else(|| canonical_name.clone());
+
+        if canonical_full != pkg {
             msg.emit(
                 MessageType::Info,
-                &format!("Package {} is already installed.", pkg),
+                &format!(
+                    "note: {} resolved to {} — require(\"{}\")",
+                    pkg, canonical_full, resolved_name
+                ),
+            );
+        }
+
+        // Check existing install (case-insensitive: a hand-edited manifest
+        // key that differs only by case is still the same package)
+        if let Some(existing_key) = deps.keys().find(|k| k.eq_ignore_ascii_case(&canonical_full)) {
+            msg.emit(
+                MessageType::Info,
+                &format!("Package {} is already installed.", existing_key),
             );
             return Ok(());
         }
@@ -131,11 +170,14 @@ pub async fn install_command(
             .collect();
 
 
-        if normalized_root_deps.values().any(|spec| &spec.alias == &resolved_alias) {
+        // Case-insensitive: aliases become folder names under packages/, and
+        // Windows/macOS filesystems case-fold — `DataStream` and `datastream`
+        // would silently merge into one directory.
+        if normalized_root_deps.values().any(|spec| spec.alias.eq_ignore_ascii_case(&resolved_name)) {
             //TODO: Prompt for a new alias.
             msg.emit(
                 MessageType::Fail,
-                &format!("Alias {} is already in use by another package.", resolved_alias),
+                &format!("Alias {} is already in use by another package.", resolved_name),
             );
             return Ok(());
         }
@@ -149,14 +191,14 @@ pub async fn install_command(
 
 
         if alias.is_some() {
-            deps.insert(pkg.clone(), Value::Object({
+            deps.insert(canonical_full.clone(), Value::Object({
                 let mut map = Map::new();
                 map.insert("version".to_string(), Value::String(format!("^{}", pkg_version)));
-                map.insert("alias".to_string(), Value::String(resolved_alias));
+                map.insert("alias".to_string(), Value::String(resolved_name));
                 map
             }));
         } else {
-            deps.insert(pkg.clone(), Value::String(format!("^{}", pkg_version)));
+            deps.insert(canonical_full.clone(), Value::String(format!("^{}", pkg_version)));
         }
         fs::write("forest.json", serde_json::to_string_pretty(&info)?)?;
 
@@ -169,7 +211,7 @@ pub async fn install_command(
 
         msg.finish(
             MessageType::Success,
-            &format!("Package {} added!", pkg),
+            &format!("Package {} added!", canonical_full),
         );
     } else {
         // No specific package: install all via lockfile

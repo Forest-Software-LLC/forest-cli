@@ -9,7 +9,7 @@ use urlencoding::encode;
 use crate::http::api_request;
 use crate::lockfile_gen::lockfile_gen;
 use crate::message::{self, Message, MessageType};
-use crate::utils::{digest_package_name, normalize_forest_deps};
+use crate::utils::{digest_package_name, get_ci, normalize_forest_deps};
 
 struct AuditRow {
     name: String,
@@ -143,7 +143,8 @@ pub async fn audit_command(update: bool) -> Result<()> {
 
         rows.push(AuditRow {
             name: name.clone(),
-            current: locked.get(name).cloned(),
+            // Lockfile keys are canonical; the manifest key may differ by case
+            current: get_ci(&locked, name).cloned(),
             wanted,
             latest,
         });

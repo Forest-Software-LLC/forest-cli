@@ -28,14 +28,21 @@ pub async fn remove_command(
     }
 
     let deps = info.get_mut("dependencies").unwrap().as_object_mut().unwrap();
-    if deps.contains_key(&target_package) == false {
-        msg.finish(
-            MessageType::Info,
-            &format!("Package {} is not installed.", target_package),
-        );
-        return Ok(());
-    } else {
-        deps.remove(&target_package);
+    // Case-insensitive removal
+    let existing_key = deps.keys()
+        .find(|k| k.eq_ignore_ascii_case(&target_package))
+        .cloned();
+    match existing_key {
+        None => {
+            msg.finish(
+                MessageType::Info,
+                &format!("Package {} is not installed.", target_package),
+            );
+            return Ok(());
+        }
+        Some(key) => {
+            deps.remove(&key);
+        }
     }
 
     info["dependencies"] = Value::Object(deps.clone());

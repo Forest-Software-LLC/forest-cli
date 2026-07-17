@@ -7,7 +7,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use reqwest::Method;
 use crate::http::packages_api_request;
-use crate::utils::{digest_package_name, normalize_forest_deps};
+use crate::utils::{digest_package_name, get_ci, normalize_forest_deps};
 use crate::lockfile_solver::{get_lockfile_packages, DepSpec, LockfileEntry};
 use crate::message::{Message, MessageType};
 use crate::fetch_and_extract::fetch_and_extract;
@@ -136,7 +136,8 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
             let dir_pkg_name = &get_dupe_name(pkg_name.clone(), same_level_packages);
             */
 
-            let mut dir_pkg_name = root_deps.get(pkg_name)
+            //A hand-edited manifest key may differ in casing only.
+            let mut dir_pkg_name = get_ci(&root_deps, pkg_name)
                 .and_then(|d| Some(d.alias.clone()))
                 .unwrap_or_else(|| String::new());
             /*
@@ -161,8 +162,8 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
                 remaining_segments: &[&str]
             ) -> Result<String> {
 
-                let deps = lockfile.packages
-                    .get(dep_name)
+                // First call passes a manifest key; lockfile keys are canonical
+                let deps = get_ci(&lockfile.packages, dep_name)
                     .ok_or_else(|| anyhow!("Dependency {} not found", dep_name))?;
 
                 // Find the exact version entry
@@ -178,7 +179,7 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
                         if sub_dep_name == end_goal {
                             return Ok(sub_dep_spec.alias.clone());
                         }
-                    } else if sub_dep_spec.alias == remaining_segments[0] {
+                    } else if sub_dep_spec.alias.eq_ignore_ascii_case(remaining_segments[0]) {
                         println!("Trying next");
                         return backtrack_name(
                             lockfile,
@@ -198,15 +199,15 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
                 let mut root_dep_name = String::new();
 
                 for (dep_name, dep_info) in &root_deps {
-                    if dep_info.alias == target_root_dep_alias {
+                    // Aliased folder names case-fold on Windows/macOS so match them case-insensitively
+                    if dep_info.alias.eq_ignore_ascii_case(target_root_dep_alias) {
                         root_dep_name = dep_name.clone();
 
                         break;
                     }
                 }
 
-                let root_dep_ver = &lockfile.packages
-                    .get(&root_dep_name)
+                let root_dep_ver = &get_ci(&lockfile.packages, &root_dep_name)
                     .ok_or_else(|| anyhow!("Root dependency {} not found", root_dep_name))?
                     .iter()
                     .find(|v| v.location == "~")

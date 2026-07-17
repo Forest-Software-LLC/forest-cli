@@ -35,10 +35,12 @@ struct VersionState {
 /// Holds buckets (grouped ranges) and per-version state
 #[derive(Debug)]
 struct PackageState {
+    canonical: String,
     buckets: HashMap<String, Vec<String>>,
     versions: HashMap<String, VersionState>,
 }
 
+/// Keyed by the LOWERCASED full name
 type ResolvedVersions = HashMap<String, PackageState>;
 
 /// Lockfile entry for a package version.
@@ -80,14 +82,11 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
     // 1) Resolve dependency graph into buckets & versions
 
     while let Some((name, version_range, depth)) = queue.pop_front() {
-        let pkg_state = resolved.entry(name.full_name.clone())
-            .or_insert_with(|| PackageState {
-                buckets: HashMap::new(),
-                versions: HashMap::new(),
-            });
+        // Case variants of one package all land on the same lowercased key
+        let key = name.full_name.to_lowercase();
 
-        // fetch available versions
-        if pkg_state.versions.is_empty() {
+        // fetch available versions (first encounter under any casing)
+        if !resolved.contains_key(&key) {
             let path = format!("v1/package/{}/{}/{}", name.scope, platform, name.name);
             let (version_data, versions_status) = api_request(&path, Method::GET, None, None).await
                 .with_context(|| format!("Failed to fetch package info for {}", name.full_name))?;
@@ -98,16 +97,35 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
                     name.full_name, versions_status
                 ))?;
             }
+
+            // The response carries the canonical (stored) casing — what the
+            // lockfile keys are written as. Fall back to the casing we
+            // queried with if a response ever lacks the fields.
+            let canonical = match (
+                version_data.get("scope").and_then(|v| v.as_str()),
+                version_data.get("name").and_then(|v| v.as_str()),
+            ) {
+                (Some(scope), Some(pkg_name)) => format!("{}/{}", scope, pkg_name),
+                _ => name.full_name.clone(),
+            };
+
             let versions = version_data.get("versions")
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| anyhow::anyhow!("Invalid versions data for {}", name.full_name))?;
+
+            let pkg_state = resolved.entry(key.clone())
+                .or_insert_with(|| PackageState {
+                    canonical,
+                    buckets: HashMap::new(),
+                    versions: HashMap::new(),
+                });
 
             for ver_info in versions {
                 let ver = ver_info.get("version")
                     .ok_or_else(|| anyhow::anyhow!("Missing version field for {}", name.full_name))?
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("Invalid version field for {}", name.full_name))?.to_string();
-                
+
 
                 //println!("Found version {} for package {}", ver, name.full_name);
                 pkg_state.versions.insert(
@@ -116,6 +134,9 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
                 );
             }
         }
+
+        let pkg_state = resolved.get_mut(&key)
+            .expect("package state exists after first-encounter fetch");
 
         // filter by range
         let req = VersionReq::parse(&version_range)
@@ -181,8 +202,8 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         let deps_hm: HashMap<String, DepSpec> = deps.clone().into_iter()
             .map(|(k, v)| -> anyhow::Result<(String, DepSpec)> {
                 if let Some(s) = v.as_str() {
-                    // Legacy: value is a version string; alias defaults to the dep key
-                    let spec = DepSpec { alias: k.clone(), version: s.to_string() };
+                    // Legacy: value is a version string; alias derives from the key
+                    let spec = DepSpec { alias: digest_package_name(&k).name, version: s.to_string() };
                     //TODO : Drop this because backend will never return just the string.
                     Ok((k, spec))
                 } else if let Some(obj) = v.as_object() {
@@ -193,10 +214,15 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
                             name.full_name, agreed
                         ))?
                         .to_string();
+                    // An alias is present only when the publisher declared one.
+                    // Aliases containing '/' are full-key fabrications from
+                    // older publishes (`alias: "<scope>/<name>"`) — never a
+                    // real folder name; treat them as unset.
                     let alias = obj.get("alias")
                         .and_then(|x| x.as_str())
+                        .filter(|s| !s.contains('/'))
                         .map(|s| s.to_string())
-                        .unwrap_or_else(|| k.clone());
+                        .unwrap_or_else(|| digest_package_name(&k).name);
                     Ok((k, DepSpec { alias, version }))
                 } else {
                     // Unexpected shape
@@ -238,19 +264,22 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         }
     }
 
-    // 2) Build lockfile entries
+    // 2) Build lockfile entries — keyed by the canonical casing, while dep
+    // keys (verbatim from publishers' recorded manifests) are looked up
+    // through their lowercased form. Every dep was queued and fetched, so
+    // every lookup hits.
     let mut lockfile: LockfilePackages = HashMap::new();
-    for (pkg, state) in &resolved {
+    for state in resolved.values() {
         let mut entries = Vec::new();
         for bucket_ver in state.buckets.keys() {
             let vs = &state.versions[bucket_ver];
             let mut deps = HashMap::new();
             for (dn, dr) in &vs.dependencies {
-                let dep_state = &resolved[dn];
+                let dep_state = &resolved[&dn.to_lowercase()];
                 let v = dep_state.buckets.keys()
                     .find(|v| VersionReq::parse(&dr.version).unwrap().matches(&Version::parse(v).unwrap()))
                     .cloned().unwrap();
-                deps.insert(dn.clone(), DepSpec{
+                deps.insert(dep_state.canonical.clone(), DepSpec{
                     version : v,
                     alias : dr.alias.clone()
                 });
@@ -264,7 +293,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
                 dependencies: deps,
             });
         }
-        lockfile.insert(pkg.clone(), entries);
+        lockfile.insert(state.canonical.clone(), entries);
     }
 
     // 3) Annotate locations with tree positions
@@ -304,7 +333,9 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
     }
 
     for (name, dep_spec) in &root_deps {
-        if let Some(state) = resolved.get(name) {
+        // Manifest keys may carry non-canonical casing (hand-edited or
+        // pre-canonicalization installs) — the lowercased key still hits.
+        if let Some(state) = resolved.get(&name.to_lowercase()) {
             // Only get keys that satisfy the version range
             let req = VersionReq::parse(&dep_spec.version)
                 .with_context(|| format!("Invalid range {} for {}", dep_spec.version, name))?;
@@ -329,7 +360,8 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
                 */
                 //let dep_names: Vec<String> = deps.iter().map(|(dn, _)| dn.clone()).collect();
                 //let _name_for_next =  get_dupe_name(name.clone(), dep_names);
-                build_tree(name, &dep_spec.alias, first, "~", &mut lockfile);
+                // Lockfile keys are canonical — never the manifest's casing
+                build_tree(&state.canonical, &dep_spec.alias, first, "~", &mut lockfile);
             }
         }
     }

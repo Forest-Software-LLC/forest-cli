@@ -24,6 +24,15 @@ pub fn digest_package_name(name : &str) -> PackageName {
     PackageName { name: parts[1].to_string(), scope: parts[0].to_string(), full_name: name.to_string() }
 }
 
+/// Case-insensitive HashMap lookup for package-name keys: Exact match wins; otherwise the first case-insensitive hit.
+pub fn get_ci<'a, V>(map: &'a HashMap<String, V>, key: &str) -> Option<&'a V> {
+    map.get(key).or_else(|| {
+        map.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v)
+    })
+}
+
 pub fn normalize_forest_deps(forest_json : &Value) -> HashMap<String, DepSpec> {
      let roots : HashMap<String, DepSpec> = forest_json
         .get("dependencies")
@@ -40,8 +49,8 @@ pub fn normalize_forest_deps(forest_json : &Value) -> HashMap<String, DepSpec> {
                             .to_string();
                         let alias = obj.get("alias")
                             .and_then(|x| x.as_str())
-                            .unwrap_or(k)
-                            .to_string();
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| digest_package_name(k).name);
                         Some((k.clone(), DepSpec{ alias, version }))
                     } else {
                         None

@@ -280,22 +280,42 @@ pub async fn publish_command() -> Result<()> {
 
     let mut did_set_name_or_author = false;
     if !forest_json["name"].is_string() {
-        // Prompt for project name with validation
+        // Validate name
         let name: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("Project name")
             .validate_with(|input: &String| {
-                if input.is_empty() {
-                    Err(anyhow::anyhow!("Package name cannot be empty"))
-                } else if input.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+                let mut chars = input.chars();
+                let starts_with_letter = chars.next().map_or(false, |c| c.is_ascii_alphabetic());
+                if !starts_with_letter {
+                    Err(anyhow::anyhow!("Invalid package name. Names must start with a letter."))
+                } else if chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
                     Ok(())
                 } else {
-                    Err(anyhow::anyhow!("Invalid package name. Only lowercase letters, numbers, and hyphens are allowed."))
+                    Err(anyhow::anyhow!("Invalid package name. Only letters, numbers, underscores, and hyphens are allowed."))
                 }
             })
             .interact_text()?;
 
         forest_json["name"] = Value::String(name);
         did_set_name_or_author = true;
+    }
+
+    // hyphenated names can't be dot-indexed in Luau, so discourage without rejecting.
+    if let Some(name) = forest_json["name"].as_str() {
+        if name.contains('-') {
+            println!(
+                "warning: hyphenated package names can't be dot-indexed in Luau requires; consider PascalCase (e.g. \"{}\")",
+                name.split('-')
+                    .map(|part| {
+                        let mut c = part.chars();
+                        match c.next() {
+                            Some(first) => first.to_ascii_uppercase().to_string() + c.as_str(),
+                            None => String::new(),
+                        }
+                    })
+                    .collect::<String>()
+            );
+        }
     }
     
     if !forest_json["author"].is_string() {
@@ -329,7 +349,7 @@ pub async fn publish_command() -> Result<()> {
     let mut versions = vec![];
     if forest_json["name"].is_string() && forest_json["platform"].is_string() {
         let platform = forest_json["platform"].as_str().unwrap().to_lowercase();
-        let name = forest_json["name"].as_str().unwrap().to_lowercase();
+        let name = forest_json["name"].as_str().unwrap().to_string();
         let (versions_resp, status_code) = api_request(&format!("v1/package/{}/{}/{}", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None)
             .await
             .context("Failed to fetch package versions")?;
@@ -421,10 +441,6 @@ pub async fn publish_command() -> Result<()> {
 
         metadata["public"] = Value::Bool(public == 0);
     }
-
-
-    
-
 
 
     // Find license file and infer license type
