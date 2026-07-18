@@ -26,6 +26,8 @@ pub struct LockFile {
 /// update.rs's FOREST_INSTALL_BASE convention.
 const DEFAULT_CDN_BASE: &str = "https://registry.forest.dev";
 
+pub const PACKAGES_DIR: &str = "Packages";
+
 fn cdn_base() -> String {
     std::env::var("FOREST_CDN_BASE").unwrap_or_else(|_| DEFAULT_CDN_BASE.to_string())
 }
@@ -43,13 +45,14 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
     }
 
     // Make directories for all packages
-    if !Path::new("packages").exists() {
-        fs::create_dir_all("packages")?;
+    if !Path::new(PACKAGES_DIR).exists() {
+        fs::create_dir_all(PACKAGES_DIR)?;
     } else {
-        // Clear existing packages directory, skipping `_` and dot-prefixed
-        // entries: on case-insensitive filesystems `packages` is the same
-        // directory as Wally's `Packages`, whose `_Index` must survive.
-        for entry in fs::read_dir("packages")? {
+        // Clear the existing container, skipping `_` and dot-prefixed
+        // entries: a project mid-migration may share this directory with
+        // Wally's own `Packages`, whose `_Index` must survive (only DIRS are
+        // removed, so wally's root link scripts survive too).
+        for entry in fs::read_dir(PACKAGES_DIR)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with('_') || name.starts_with('.') {
@@ -226,9 +229,10 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
 
             // Path stuff
 
-            let mut path: String = format!("./packages/{}/packages", path_parts.join("/packages/"));
+            let nested_sep = format!("/{}/", PACKAGES_DIR);
+            let mut path: String = format!("./{}/{}/{}", PACKAGES_DIR, path_parts.join(&nested_sep), PACKAGES_DIR);
             if path_parts.is_empty() {
-                path = "./packages".to_string();
+                path = format!("./{}", PACKAGES_DIR);
             }
 
             let dir_path = Path::new(&path).join(&dir_pkg_name);
@@ -285,74 +289,123 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
                 .ok_or_else(|| anyhow!("Path for {} @ {} not found in cache.", pkg_name, version_data.version))?;
 
             let mut true_path = cache_result.clone();
-            true_path.push_str("/packages");
-            
+            true_path.push_str(&format!("/{}", PACKAGES_DIR));
+
 
             for (dep_name, dep_version) in &version_data.dependencies {
-                
+
                 let dep_true_path = path_cache
                     .get(dep_name)
                     .and_then(|v| v.get(&dep_version.version))
                     .ok_or_else(|| anyhow!("Path for dependency {} @ {} not found in cache.", dep_name, &dep_version.version))?;
 
-                // Count shared ancestors on dep_true_path and true_path
-                let mut shared_ancestors : u16 = 0;
-                let dep_parts: Vec<&str> = dep_true_path.split('/').collect();
-                let true_parts: Vec<&str> = true_path.split('/').collect();
-                for (d, t) in dep_parts.iter().zip(true_parts.iter()) {
-                    if d == t {
-                        shared_ancestors += 1;
-                    } else {
-                        break;
+                if let Some((pointer_dir, init_lua)) = plan_pointer(&true_path, &dep_version.alias, dep_true_path) {
+                    let target_dir = Path::new(&true_path).join(pointer_dir);
+                    if !target_dir.exists() {
+                        fs::create_dir_all(&target_dir)?;
                     }
+                    fs::write(target_dir.join("init.lua"), init_lua)?;
                 }
-
-                if dep_parts.len() - 1 == true_parts.len() {
-                    //println!("Skipping pointer creation for {}: {} (same level)", pkg_name, dep_name);
-                    // If the dependency is at the same level as the package, skip pointer creation
-                    continue;
-                }
-
-
-                // ./a/b/c/d/e
-
-                // ./a/b/c/d1/e2 
-
-                // -- 3 shared ancestors
-                // (script.Parent).Parent.Parent['d']['e']
-                let parent_count = true_parts.len() - shared_ancestors as usize;
-                let lua_path = format!("script.Parent{}", (".Parent").repeat(parent_count + 1));
-                // Create the relative path for the dependency
-                
-                let mut relative_path = dep_parts
-                    .iter()
-                    .skip(shared_ancestors as usize)
-                    .map(|s| encode(s).into_owned())
-                    .collect::<Vec<String>>()
-                    .join("']['");
-
-
-                relative_path = format!("{}['{}']", lua_path, relative_path);
-
-                let mut init_lua = String::new();
-                init_lua.push_str("--Pointer file generated by Forest Package Manager.\n");
-                init_lua.push_str(&format!(
-                    "return require({})",
-                    relative_path
-                ));
-
-                //println!("Creating pointer file for {}: {}/{}", pkg_name, true_path, dep_name);
-
-                let target_dir = Path::new(&true_path).join(dep_name);
-                if !target_dir.exists() {
-                    fs::create_dir_all(&target_dir)?;
-                }
-                fs::write(target_dir.join("init.lua"), init_lua)?;
             }
         }
     }
 
     Ok(())
+}
+
+/// Plan the pointer module bridging a package's nested Packages/ entry to
+/// wherever the dependency physically lives after dedupe/hoisting. Returns
+/// the directory name to create under `true_path` and the init.lua source,
+/// or None when the dependency is already physically at that level.
+///
+/// The directory is named by the dependency's ALIAS: package code requires
+/// `script…Packages[alias]`, and physically-placed siblings are already
+/// alias-named — pointers must match.
+pub(crate) fn plan_pointer(true_path: &str, dep_alias: &str, dep_true_path: &str) -> Option<(String, String)> {
+    let dep_parts: Vec<&str> = dep_true_path.split('/').collect();
+    let true_parts: Vec<&str> = true_path.split('/').collect();
+
+    if dep_parts.len() - 1 == true_parts.len() {
+        // Physically installed at this level (alias-named dir) — no pointer.
+        return None;
+    }
+
+    // Count shared ancestors on dep_true_path and true_path
+    let mut shared_ancestors: u16 = 0;
+    for (d, t) in dep_parts.iter().zip(true_parts.iter()) {
+        if d == t {
+            shared_ancestors += 1;
+        } else {
+            break;
+        }
+    }
+
+    // From the pointer module (script = its own folder), climb one Parent per
+    // unshared segment of true_path to reach the deepest shared container,
+    // then bracket-index down the dep's unshared segments.
+    let parent_count = true_parts.len() - shared_ancestors as usize;
+    let lua_path = format!("script.Parent{}", (".Parent").repeat(parent_count));
+    let relative_path = dep_parts
+        .iter()
+        .skip(shared_ancestors as usize)
+        .map(|s| encode(s).into_owned())
+        .collect::<Vec<String>>()
+        .join("']['");
+
+    let mut init_lua = String::new();
+    init_lua.push_str("--Pointer file generated by Forest Package Manager.\n");
+    init_lua.push_str(&format!("return require({}['{}'])", lua_path, relative_path));
+
+    Some((dep_alias.to_string(), init_lua))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_level_dependency_needs_no_pointer() {
+        // Dep physically inside this package's own Packages dir.
+        let plan = plan_pointer(
+            "./Packages/Knit/Packages",
+            "Comm",
+            "./Packages/Knit/Packages/Comm",
+        );
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn hoisted_dependency_gets_an_alias_named_pointer() {
+        // Dep hoisted to the root container: the pointer dir must be the
+        // alias, never the canonical "Scope/Name" key — a slash would nest
+        // a bogus Scope/ directory the require chain doesn't expect.
+        let (dir, init_lua) = plan_pointer(
+            "./Packages/Knit/Packages",
+            "Promise",
+            "./Packages/Promise",
+        )
+        .expect("hoisted dep needs a pointer");
+        assert_eq!(dir, "Promise");
+        assert!(!dir.contains('/'));
+        // From ./Packages/Knit/Packages/Promise/init.lua: climb to the root
+        // container (3 Parents), then index the physical dir.
+        assert_eq!(
+            init_lua,
+            "--Pointer file generated by Forest Package Manager.\nreturn require(script.Parent.Parent.Parent['Promise'])"
+        );
+    }
+
+    #[test]
+    fn two_level_hoist_builds_the_full_bracket_chain() {
+        let (dir, init_lua) = plan_pointer(
+            "./Packages/A/Packages/B/Packages",
+            "Deep",
+            "./Packages/Deep",
+        )
+        .expect("pointer expected");
+        assert_eq!(dir, "Deep");
+        assert!(init_lua.ends_with("return require(script.Parent.Parent.Parent.Parent.Parent['Deep'])"));
+    }
 }
 
 /// Generate a lockfile JSON string given the forest manifest & message spinner.

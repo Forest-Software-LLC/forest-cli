@@ -75,7 +75,7 @@ pub async fn init_command(platform: Option<String>) -> Result<()> {
 
     // Determine target directory
     let dir = env::current_dir()?;
-    let packages_dir = dir.clone().join("packages");
+    let packages_dir = dir.clone().join(crate::lockfile_gen::PACKAGES_DIR);
 
     if !packages_dir.exists() {
         fs::create_dir_all(&packages_dir)?;
