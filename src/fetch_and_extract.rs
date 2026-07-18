@@ -103,8 +103,10 @@ pub fn fetch_and_extract(url: &str, expected_sha256: &str, out_dir: &Path, archi
     // `archive_root` is the package's init file (e.g. `src/init.luau`). In Roblox a
     // folder module is `init.luau` plus its sibling files/subfolders, so the real
     // source root is the DIRECTORY that contains the init file — we must extract
-    // everything in it, not just the init file itself. A bare, top-level init file
-    // (no parent directory) is a single-file package and is extracted on its own.
+    // everything in it, not just the init file itself. A top-level root file (no
+    // parent directory) means the archive root IS the source root (e.g. Wally
+    // packages like ambergracesoftware/remote ship `init.luau` plus sibling
+    // modules at top level), so the whole archive is extracted.
     let root_dir = root_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty());
@@ -173,14 +175,22 @@ pub fn fetch_and_extract(url: &str, expected_sha256: &str, out_dir: &Path, archi
             } else {
                 None
             }
-        } else if entry_path == root_path {
-            // Single-file package → place the root file directly under out_dir.
-            match &renamed_init {
-                Some(name) => Some(out_dir.join(name)),
-                None => entry_path.file_name().map(|name| out_dir.join(name)),
-            }
         } else {
-            None
+            // Top-level root file → the archive root is the source root: extract
+            // every entry (root plus sibling files/subfolders) under out_dir.
+            let has_traversal = entry_path.components().any(|c| matches!(c,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            ));
+            if has_traversal {
+                None
+            } else if entry_path == root_path {
+                match &renamed_init {
+                    Some(name) => Some(out_dir.join(name)),
+                    None => Some(out_dir.join(&entry_path)),
+                }
+            } else {
+                Some(out_dir.join(&entry_path))
+            }
         };
 
         if let Some(dest_path) = dest {
@@ -318,6 +328,31 @@ mod tests {
         assert_eq!(fs::read_to_string(out.join("init.lua")).unwrap(), "return {} -- root");
         assert_eq!(fs::read_to_string(out.join("Helper.lua")).unwrap(), "return {} -- helper");
         assert!(!out.join("Module.lua").exists(), "root file must be renamed, not duplicated");
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn extracts_siblings_of_top_level_init() {
+        // Wally-style layout: init.luau plus sibling modules at the archive root
+        // (e.g. ambergracesoftware/remote).
+        let tgz = make_tgz_with(&[
+            ("init.luau", "return {} -- root"),
+            ("Event.luau", "return {} -- event"),
+            ("Nested/Deep.luau", "return {} -- deep"),
+            ("LICENSE", "MIT"),
+            ("wally.toml", "[package]"),
+        ]);
+        let hash = sha256_hex(&tgz);
+        let url = serve_once(tgz);
+        let out = temp_out_dir("top-level-siblings");
+
+        fetch_and_extract(&url, &hash, &out, "init.luau", ProgressBar::hidden()).unwrap();
+
+        assert_eq!(fs::read_to_string(out.join("init.luau")).unwrap(), "return {} -- root");
+        assert_eq!(fs::read_to_string(out.join("Event.luau")).unwrap(), "return {} -- event");
+        assert_eq!(fs::read_to_string(out.join("Nested").join("Deep.luau")).unwrap(), "return {} -- deep");
+        assert_eq!(fs::read_to_string(out.join("LICENSE")).unwrap(), "MIT");
+        assert!(out.join("wally.toml").exists());
         let _ = fs::remove_dir_all(&out);
     }
 
