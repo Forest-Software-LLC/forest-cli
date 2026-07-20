@@ -1,6 +1,6 @@
 [package]
 name = "forest"
-version = "1.4.3"
+version = "1.4.4"
 edition = "2021"
 authors = ["Forest Software LLC"]
 description = "Forest CLI – Package manager"

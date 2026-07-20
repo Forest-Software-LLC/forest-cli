@@ -42,7 +42,7 @@ cargo build --release      # target/release/forest(.exe)
 **Release pipeline lives in this repo:** [.github/workflows/release.yml](.github/workflows/release.yml) (on `v*.*.*` tags) builds four targets — win x64, linux x64, mac arm64 + x64 — then [scripts/release.ts](scripts/release.ts) publishes to R2 under `cli/<tag>/` + `cli/latest/` (binaries named `forest-<tag>-<target>[.exe]`, plus `.sha256` sidecars, `SHA256SUMS`, and a `latest.json` manifest). Public CDN: `https://releases.forest.dev`.
 
 **Distribution channels** (consumers of those artifacts):
-- **cli-script-installer** repo (primary): `curl -fsSL https://releases.forest.dev/install.sh | sh` / `irm https://releases.forest.dev/install.ps1 | iex`
+- **cli-script-installer** repo (primary): `curl -fsSL https://releases.forest.dev/install.sh | sh` / `irm https://releases.forest.dev/install.ps1 | iex`. Both scripts verify the manifest's offline release signature with the same keys [src/release_verify.rs](src/release_verify.rs) pins — a key rotation must update both repos.
 - **cli-installer** repo: Slint GUI wizard
 - The old Inno Setup installer (`forest_installer.iss`) was removed in July 2026 — the script + GUI installers replaced it.
 

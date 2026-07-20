@@ -148,7 +148,7 @@ jobs:
             echo "## ⚠️ Release is NOT installable yet"
             echo ""
             echo "Binaries and manifest are uploaded, but the manifest is unsigned."
-            echo "New CLIs refuse unsigned manifests. Sign it locally:"
+            echo "New CLIs and the install scripts refuse unsigned manifests. Sign it locally:"
             echo ""
             echo '```'
             echo "FOREST_RELEASE_BUCKET=<bucket> scripts/sign-release.sh ${{ github.ref_name }}"

@@ -96,8 +96,14 @@ fn create_tarball_buffer(dir: &Path, matcher: &Gitignore) -> Result<Vec<u8>> {
                 return true;
             }
             // ignore dotfiles/dot-directories by default (.git, .gitignore,
-            // .forestignore, .DS_Store, ...) so they never reach the tarball
-            if e.file_name().to_str().map_or(false, |n| n.starts_with('.')) {
+            // .forestignore, .DS_Store, ...) so they never reach the tarball.
+            // `.gitkeep` is an exception: it's how empty directories are
+            // preserved, and tar only stores files, so dropping it would lose
+            // the directory entirely.
+            if e.file_name()
+                .to_str()
+                .map_or(false, |n| n.starts_with('.') && n != ".gitkeep")
+            {
                 return false;
             }
             // if the matcher says “ignore this dir”, return false to prune
