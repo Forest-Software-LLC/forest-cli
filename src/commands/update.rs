@@ -107,7 +107,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 pub async fn update_command(check_only: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
 
-    let msg = Message::new("Checking for updates...");
+    let mut msg = Message::new("Checking for updates...");
     let manifest = match fetch_manifest(None).await {
         Ok(m) => m,
         Err(e) => {

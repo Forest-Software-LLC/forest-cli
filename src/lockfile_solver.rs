@@ -20,6 +20,7 @@ use reqwest::{Method};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use crate::http::{api_request, packages_api_request};
+use crate::licensce_helper::LicenseInfo;
 use crate::utils::{digest_package_name, PackageName };
 
 /// Tracks per-version resolution state
@@ -67,12 +68,12 @@ pub struct DepSpec {
     pub version: String,
 }
 
-/// Resolves the dependency graph. Also returns license-safety warnings for any
+/// Resolves the dependency graph. Also returns license-safety issues for any
 /// resolved version the registry rated caution/unsafe — each version is fetched
-/// exactly once, so warnings are naturally deduplicated.
-pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform : String) -> Result<(LockfilePackages, Vec<String>)> {
+/// exactly once, so issues are naturally deduplicated.
+pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform : String) -> Result<(LockfilePackages, Vec<LicenseInfo>)> {
     let mut resolved: ResolvedVersions = HashMap::new();
-    let mut license_warnings: Vec<String> = Vec::new();
+    let mut license_warnings: Vec<LicenseInfo> = Vec::new();
 
     // Make queue with digest_package_name using normalized specs
     let mut queue: VecDeque<(PackageName, String, u8)> = root_deps.clone().into_iter()
@@ -190,8 +191,12 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
 
         vs.resolved = true;
 
-        if let Some(warning) = crate::licensce_helper::license_warning_for(&package_info, &format!("{}@{}", name.full_name, agreed)) {
-            license_warnings.push(warning);
+        let license_info = crate::licensce_helper::extract_license_info(
+            &package_info,
+            &format!("{}@{}", name.full_name, agreed),
+        );
+        if license_info.is_flagged() {
+            license_warnings.push(license_info);
         }
 
         let deps = package_info.get("dependencies")

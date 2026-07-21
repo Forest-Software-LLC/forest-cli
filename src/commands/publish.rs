@@ -519,7 +519,7 @@ pub async fn publish_command() -> Result<()> {
 
     
 
-    let msg = Message::new("Got manifest, preparing tarball...");
+    let mut msg = Message::new("Got manifest, preparing tarball...");
 
     // Prepare tarball
     let matcher = load_forest_ignore(&cwd);

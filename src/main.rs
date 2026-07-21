@@ -74,9 +74,12 @@ enum Commands {
         check: bool,
     },
 
-    /// Check dependencies for available updates
+    /// Check dependencies for available updates and license considerations
     #[command(alias = "outdated")]
     Audit {
+        /// Only audit this package (e.g. scope/name)
+        package: Option<String>,
+
         /// Update forest.json to the latest versions and reinstall
         #[arg(short = 'u', long = "update")]
         update: bool,
@@ -127,8 +130,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Update { check } => {
             update_command(check).await?;
         }
-        Commands::Audit { update } => {
-            audit_command(update).await?;
+        Commands::Audit { package, update } => {
+            audit_command(package, update).await?;
         }
     }
 

@@ -1,5 +1,5 @@
 use std::{collections::HashMap, fs, path::Path};
-use anyhow::{anyhow, Context, Ok, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use urlencoding::encode;
@@ -183,7 +183,6 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
                             return Ok(sub_dep_spec.alias.clone());
                         }
                     } else if sub_dep_spec.alias.eq_ignore_ascii_case(remaining_segments[0]) {
-                        println!("Trying next");
                         return backtrack_name(
                             lockfile,
                             sub_dep_name,
@@ -260,9 +259,11 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
             let root_clone = version_data.root.clone();
 
             let handle = std::thread::spawn(move || -> Result<()> {
-                fetch_and_extract(&url, &integrity_clone, &dir_clone, &root_clone, bar_clone)?;
+                // Clear the bar even on failure, or its line sticks around
+                // garbling everything printed after it.
+                let result = fetch_and_extract(&url, &integrity_clone, &dir_clone, &root_clone, bar_clone);
                 bar.finish_and_clear();
-                Ok(())
+                result
             });
             workers.push(handle);
     
@@ -273,11 +274,22 @@ pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, De
         }
     }
 
-    // Wait for all download threads to finish
+    // Wait for ALL download threads before reporting the first failure, so
+    // every bar is cleared and no thread is left drawing while we bail out.
+    let mut first_err: Option<anyhow::Error> = None;
     for handle in workers {
-        if let Err(e) = handle.join() {
-            return Err(anyhow!("Fetch thread panicked: {:?}", e));
+        match handle.join() {
+            Err(e) => {
+                first_err.get_or_insert(anyhow!("Fetch thread panicked: {:?}", e));
+            }
+            Ok(Err(e)) => {
+                first_err.get_or_insert(e);
+            }
+            Ok(Ok(())) => {}
         }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
     }
  
     // Make pointer files
@@ -423,8 +435,15 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message) -> Result<Lock
 
     // Surface registry license-safety ratings for anything caution/unsafe in
     // the resolved tree (direct and transitive) before files land on disk.
+    // One line per package — the full caveats live in `forest audit`.
     for warning in &license_warnings {
-        msg.emit(MessageType::Warn, warning);
+        msg.emit(MessageType::Warn, &warning.headline());
+    }
+    if !license_warnings.is_empty() {
+        msg.emit(
+            MessageType::Info,
+            "Run `forest audit` for license details (automated review — not legal advice).",
+        );
     }
 
     let lockfile : LockFile = LockFile {
@@ -432,8 +451,12 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message) -> Result<Lock
         packages: lockfile_packages
     };
 
+    // make_directories draws its own download bars — hide the spinner while
+    // they own the terminal, or the two draw systems leave stuck lines.
+    msg.pause();
     make_directories(&lockfile, roots, &platform).await
         .context("Failed to create directories for lockfile packages")?;
-    
+    msg.resume();
+
     Ok(lockfile)
 }

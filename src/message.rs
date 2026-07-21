@@ -28,7 +28,9 @@ pub fn warn(text: &str) {
 }
 
 pub fn info(text: &str) {
-    println!("{} {}", "ℹ️".cyan(), text.cyan());
+    // Trailing space matches warn(): ℹ️/⚠️ are text symbols + VS16 that many
+    // terminals draw two cells wide while only advancing the cursor one.
+    println!("{} {}", "ℹ️ ".cyan(), text.cyan());
 }
 
 impl Message {
@@ -53,14 +55,21 @@ impl Message {
     }
 
     /// Update the spinner's message text.
-    pub fn update(&self, message: &str) {
+    pub fn update(&mut self, message: &str) {
+        self.message = message.to_string();
         self.spinner.set_message(message.to_string());
     }
 
-    /// Stop and clear the spinner.
-    #[allow(dead_code)]
-    pub fn stop(&self) {
+    /// Hide the spinner while something else (e.g. download progress bars)
+    /// owns the terminal — two live draw systems fight over the cursor and
+    /// leave orphaned spinner lines behind. Pair with `resume`.
+    pub fn pause(&self) {
         self.spinner.finish_and_clear();
+    }
+
+    /// Restart the spinner after `pause`, keeping the latest message.
+    pub fn resume(&mut self) {
+        *self = Message::new(&self.message);
     }
 
     /// Emit a styled final message, then restart the spinner.

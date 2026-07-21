@@ -105,28 +105,119 @@ pub fn detect_license(cwd: &std::path::Path) -> Option<(String, bool)> {
     None
 }
 
-/// Build a license-safety warning from a registry package-info response.
-/// The registry rates every version at publish time (static classification for
-/// standard SPDX ids, AI-assisted review for custom license files).
-/// Returns None when the license is safe or the rating is unavailable.
-pub fn license_warning_for(package_info: &serde_json::Value, pkg_label: &str) -> Option<String> {
-    let rating = package_info.get("licenseRating").and_then(serde_json::Value::as_str).unwrap_or("unknown");
-    let license = package_info.get("license").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+/// License data the registry attached to a package version. The registry
+/// rates every version at publish time (static classification for standard
+/// SPDX ids, AI-assisted review for custom license files).
+#[derive(Debug, Clone)]
+pub struct LicenseInfo {
+    /// "scope/name@version"
+    pub label: String,
+    pub license: String,
+    /// safe | caution | unsafe | pending | unknown
+    pub rating: String,
+    pub caveats: Vec<String>,
+}
 
-    let mut out = match rating {
-        "unsafe" => format!("{} — license '{}' is a LEGAL RISK for closed-source games", pkg_label, license),
-        "caution" => format!("{} — license '{}' is usable with conditions", pkg_label, license),
-        _ => return None,
-    };
+impl LicenseInfo {
+    /// Ratings that warrant surfacing to the user.
+    pub fn is_flagged(&self) -> bool {
+        matches!(self.rating.as_str(), "unsafe" | "caution")
+    }
 
-    if let Some(caveats) = package_info.get("licenseCaveats").and_then(serde_json::Value::as_array) {
-        for caveat in caveats.iter().filter_map(serde_json::Value::as_str) {
-            out.push_str(&format!("\n   • {}", caveat));
+    /// One-line summary, suitable for install-time warnings.
+    pub fn headline(&self) -> String {
+        match self.rating.as_str() {
+            "unsafe" => format!(
+                "{} — license '{}' is a LEGAL RISK for closed-source games",
+                self.label, self.license
+            ),
+            "caution" => format!(
+                "{} — license '{}' is usable with conditions",
+                self.label, self.license
+            ),
+            _ => format!("{} — license '{}'", self.label, self.license),
         }
     }
-    out.push_str("\n   (Automated license review — not legal advice)");
+}
 
-    Some(out)
+/// Extract the license rating from a registry version-info response.
+pub fn extract_license_info(package_info: &serde_json::Value, pkg_label: &str) -> LicenseInfo {
+    let rating = package_info
+        .get("licenseRating")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let license = package_info
+        .get("license")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let caveats = package_info
+        .get("licenseCaveats")
+        .and_then(serde_json::Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    LicenseInfo {
+        label: pkg_label.to_string(),
+        license: license.to_string(),
+        rating: rating.to_string(),
+        caveats,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn extracts_rating_and_caveats_from_version_response() {
+        let info = extract_license_info(
+            &json!({
+                "license": "GPL-3.0",
+                "licenseRating": "unsafe",
+                "licenseCaveats": ["Derivatives must be open-sourced.", "Patent clause applies."]
+            }),
+            "scope/pkg@1.2.3",
+        );
+        assert_eq!(info.license, "GPL-3.0");
+        assert_eq!(info.rating, "unsafe");
+        assert_eq!(info.caveats.len(), 2);
+        assert!(info.is_flagged());
+        assert_eq!(
+            info.headline(),
+            "scope/pkg@1.2.3 — license 'GPL-3.0' is a LEGAL RISK for closed-source games"
+        );
+    }
+
+    #[test]
+    fn caution_is_flagged_with_softer_headline() {
+        let info = extract_license_info(
+            &json!({ "license": "Apache-2.0", "licenseRating": "caution" }),
+            "scope/pkg@2.0.0",
+        );
+        assert!(info.is_flagged());
+        assert!(info.caveats.is_empty());
+        assert_eq!(
+            info.headline(),
+            "scope/pkg@2.0.0 — license 'Apache-2.0' is usable with conditions"
+        );
+    }
+
+    #[test]
+    fn safe_pending_and_missing_ratings_are_not_flagged() {
+        for rating in [json!("safe"), json!("pending"), json!("unknown"), Value::Null] {
+            let info = extract_license_info(
+                &json!({ "license": "MIT", "licenseRating": rating }),
+                "scope/pkg@1.0.0",
+            );
+            assert!(!info.is_flagged(), "rating {:?} must not be flagged", info.rating);
+        }
+    }
 }
 
 pub fn sanitize_spdx(license: &str) -> &str {
