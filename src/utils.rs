@@ -24,6 +24,18 @@ pub fn digest_package_name(name : &str) -> PackageName {
     PackageName { name: parts[1].to_string(), scope: parts[0].to_string(), full_name: name.to_string() }
 }
 
+/// Lowercase hex SHA-256 — the format lockfile integrity hashes use.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Case-insensitive HashMap lookup for package-name keys: Exact match wins; otherwise the first case-insensitive hit.
 pub fn get_ci<'a, V>(map: &'a HashMap<String, V>, key: &str) -> Option<&'a V> {
     map.get(key).or_else(|| {

@@ -2,7 +2,46 @@ use crate::tokens::{get_stored_tokens, store_tokens};
 use anyhow::{Context, Result};
 use reqwest::{header, multipart::Form, Client, Method, StatusCode};
 use serde_json::Value;
-use std::{env, sync::Arc};
+use std::{env, sync::Arc, sync::OnceLock, time::Duration};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Publish uploads can legitimately take minutes on a slow uplink, so
+/// multipart requests override the total timeout with this instead.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Shared async client: an install makes ~2 small registry requests per
+/// package, so connection keep-alive across them (instead of a fresh
+/// TCP+TLS handshake each time) dominates resolution latency.
+fn async_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("failed to build HTTP client")
+    })
+}
+
+/// Shared blocking client for tarball downloads. Only call this from the
+/// download worker threads — reqwest's blocking client must not be created
+/// on an async runtime thread.
+///
+/// gzip is explicitly OFF: tarball bytes are hashed against the lockfile
+/// integrity, and transparent decompression would change the hashed bytes
+/// if the CDN ever added Content-Encoding.
+pub fn blocking_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(Duration::from_secs(120))
+            .gzip(false)
+            .build()
+            .expect("failed to build download client")
+    })
+}
 
 /// Body for API requests: either JSON or a builder for multipart form.
 #[derive(Clone)]
@@ -21,7 +60,7 @@ pub async fn api_request_public(
     body: Option<RequestBody>,
 ) -> Result<(Value, StatusCode)> {
     let api_url = env::var("FOREST_API_URL").context("FOREST_API_URL must be set")?;
-    let client = Client::new();
+    let client = async_client();
 
     let mut req = client.request(method, format!("{}{}", api_url, endpoint))
         .header("Accept", "application/json");
@@ -85,7 +124,7 @@ async fn api_request_with_base(
 ) -> Result<(Value, StatusCode)> {
     let api_url = env::var(base_env).with_context(|| format!("{} must be set", base_env))?;
     let mut tokens = get_stored_tokens()?;
-    let client = Client::new();
+    let client = async_client();
 
     // Builder function for a new request with the given token
     let build_req = |token: &str| {
@@ -110,7 +149,8 @@ async fn api_request_with_base(
                 }
                 RequestBody::Multipart(builder) => {
                     let form = (builder)();
-                    req = req.multipart(form);
+                    // Uploads get a longer leash than the client-wide timeout.
+                    req = req.multipart(form).timeout(UPLOAD_TIMEOUT);
                 }
             }
         }

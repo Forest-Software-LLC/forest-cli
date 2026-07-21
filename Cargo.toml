@@ -1,6 +1,6 @@
 [package]
 name = "forest"
-version = "1.4.4"
+version = "1.5.0"
 edition = "2021"
 authors = ["Forest Software LLC"]
 description = "Forest CLI – Package manager"
@@ -9,7 +9,7 @@ license = "LICENSE"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", default-features = false, features = ["json", "multipart", "blocking", "rustls-tls", "rustls-tls-webpki-roots"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "multipart", "blocking", "rustls-tls", "rustls-tls-webpki-roots", "gzip"] }
 tar = "0.4"
 flate2 = { version = "1.0", features = ["miniz_oxide"] }
 anyhow = "1.0"
@@ -34,3 +34,9 @@ ssh-key = { version = "0.6", default-features = false, features = ["std", "alloc
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["std"] }  # throwaway keys for signature tests
+
+[profile.release]
+lto = "thin"          # fat LTO would blow up the 4-target release build time
+codegen-units = 1
+strip = true
+# no `panic = "abort"`: the download join loop catches worker panics

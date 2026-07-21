@@ -2,11 +2,12 @@ use std::fs;
 use std::io::{self, Cursor, Read};
 use std::path::Path;
 use anyhow::{bail, Context, Result};
-use reqwest::blocking::Client;
 use flate2::read::GzDecoder;
-use sha2::{Digest, Sha256};
 use tar::Archive;
 use indicatif::ProgressBar;
+
+use crate::cache::TarballCache;
+use crate::utils::sha256_hex;
 
 /// Reader wrapper that tracks progress and updates an indicatif ProgressBar.
 struct ProgressReader<R> {
@@ -39,13 +40,22 @@ impl<R: Read> Read for ProgressReader<R> {
     }
 }
 
-/// Download a .tgz from the given URL, verify its SHA-256 against the lockfile's
-/// integrity hash, and extract it into `out_dir`, updating `bar`.
+/// Install a package tarball into `out_dir`: serve it from the
+/// content-addressed cache when possible, otherwise download from `url` and
+/// warm the cache. Either way the SHA-256 is checked against the lockfile's
+/// integrity hash BEFORE extraction.
 ///
 /// The archive is buffered in full (packages are capped at 10 MB by the registry)
 /// so the hash is checked BEFORE any file is written — a tampered tarball must
 /// never be partially extracted.
-pub fn fetch_and_extract(url: &str, expected_sha256: &str, out_dir: &Path, archive_root: &str, bar: ProgressBar) -> Result<()> {
+pub fn fetch_and_extract(
+    url: &str,
+    expected_sha256: &str,
+    out_dir: &Path,
+    archive_root: &str,
+    bar: ProgressBar,
+    cache: Option<&TarballCache>,
+) -> Result<()> {
     if expected_sha256.trim().is_empty() {
         // An unaddressable entry, not a weaker check: without the hash there is
         // no trusted way to fetch this package.
@@ -56,8 +66,33 @@ pub fn fetch_and_extract(url: &str, expected_sha256: &str, out_dir: &Path, archi
     fs::create_dir_all(out_dir)
         .with_context(|| format!("Failed to create directory {}", out_dir.display()))?;
 
-    // Perform HTTP GET
-    let client = Client::new();
+    // `lookup` re-hashes cached bytes against the expected hash, so a hit is
+    // already integrity-checked; only network bytes need verifying here.
+    let bytes = match cache.and_then(|c| c.lookup(expected_sha256)) {
+        Some(bytes) => bytes,
+        None => {
+            let bytes = download_bytes(url, &bar)?;
+            verify_integrity(&bytes, expected_sha256)?;
+            if let Some(c) = cache {
+                c.store(expected_sha256, &bytes);
+            }
+            bytes
+        }
+    };
+
+    extract_tgz(bytes, out_dir, archive_root)?;
+
+    // Ensure bar is complete
+    bar.set_position(100);
+    bar.finish();
+
+    Ok(())
+}
+
+/// HTTP GET the tarball, updating `bar` as bytes arrive.
+fn download_bytes(url: &str, bar: &ProgressBar) -> Result<Vec<u8>> {
+    // Shared client: connection reuse across the download workers.
+    let client = crate::http::blocking_client();
     let resp = client
         .get(url)
         .send()
@@ -77,16 +112,13 @@ pub fn fetch_and_extract(url: &str, expected_sha256: &str, out_dir: &Path, archi
     reader
         .read_to_end(&mut bytes)
         .context("Failed to download archive")?;
+    Ok(bytes)
+}
 
-    let actual = {
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    };
+/// The security gate: bytes may not reach the extractor unless they hash to
+/// the lockfile's integrity value.
+fn verify_integrity(bytes: &[u8], expected_sha256: &str) -> Result<()> {
+    let actual = sha256_hex(bytes);
     if !actual.eq_ignore_ascii_case(expected_sha256.trim()) {
         bail!(
             "Integrity check failed: expected sha256 {} but downloaded content hashes to {}. \
@@ -94,7 +126,11 @@ pub fn fetch_and_extract(url: &str, expected_sha256: &str, out_dir: &Path, archi
             expected_sha256, actual
         );
     }
+    Ok(())
+}
 
+/// Unpack already-verified tgz bytes into `out_dir`, honoring `archive_root`.
+fn extract_tgz(bytes: Vec<u8>, out_dir: &Path, archive_root: &str) -> Result<()> {
     let decompressor = GzDecoder::new(Cursor::new(bytes));
 
     // Extract tar archive
@@ -213,10 +249,6 @@ pub fn fetch_and_extract(url: &str, expected_sha256: &str, out_dir: &Path, archi
         }
     }
 
-    // Ensure bar is complete
-    bar.set_position(100);
-    bar.finish();
-
     Ok(())
 }
 
@@ -251,12 +283,6 @@ mod tests {
         make_tgz_with(&[("src/init.luau", content)])
     }
 
-    fn sha256_hex(bytes: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
-    }
-
     /// Serve `body` once over HTTP on an ephemeral port; returns the URL.
     fn serve_once(body: Vec<u8>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -289,7 +315,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("ok");
 
-        fetch_and_extract(&url, &hash, &out, "src/init.luau", ProgressBar::hidden()).unwrap();
+        fetch_and_extract(&url, &hash, &out, "src/init.luau", ProgressBar::hidden(), None).unwrap();
 
         let extracted = fs::read_to_string(out.join("init.luau")).unwrap();
         assert_eq!(extracted, "return {}");
@@ -304,7 +330,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("rename-top");
 
-        fetch_and_extract(&url, &hash, &out, "ProfileStore.luau", ProgressBar::hidden()).unwrap();
+        fetch_and_extract(&url, &hash, &out, "ProfileStore.luau", ProgressBar::hidden(), None).unwrap();
 
         let extracted = fs::read_to_string(out.join("init.luau")).unwrap();
         assert_eq!(extracted, "return {} -- ps");
@@ -322,7 +348,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("rename-nested");
 
-        fetch_and_extract(&url, &hash, &out, "src/Module.lua", ProgressBar::hidden()).unwrap();
+        fetch_and_extract(&url, &hash, &out, "src/Module.lua", ProgressBar::hidden(), None).unwrap();
 
         // Root renamed with its extension preserved; siblings keep their names.
         assert_eq!(fs::read_to_string(out.join("init.lua")).unwrap(), "return {} -- root");
@@ -346,7 +372,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("top-level-siblings");
 
-        fetch_and_extract(&url, &hash, &out, "init.luau", ProgressBar::hidden()).unwrap();
+        fetch_and_extract(&url, &hash, &out, "init.luau", ProgressBar::hidden(), None).unwrap();
 
         assert_eq!(fs::read_to_string(out.join("init.luau")).unwrap(), "return {} -- root");
         assert_eq!(fs::read_to_string(out.join("Event.luau")).unwrap(), "return {} -- event");
@@ -363,7 +389,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("tampered");
 
-        let err = fetch_and_extract(&url, &wrong_hash, &out, "src/init.luau", ProgressBar::hidden())
+        let err = fetch_and_extract(&url, &wrong_hash, &out, "src/init.luau", ProgressBar::hidden(), None)
             .unwrap_err();
 
         assert!(err.to_string().contains("Integrity check failed"), "unexpected error: {err}");
@@ -375,8 +401,65 @@ mod tests {
     fn rejects_empty_integrity_before_downloading() {
         let out = temp_out_dir("empty");
         // URL is never contacted — an unaddressable entry must fail fast.
-        let err = fetch_and_extract("http://127.0.0.1:1/never.tgz", "  ", &out, "src/init.luau", ProgressBar::hidden())
+        let err = fetch_and_extract("http://127.0.0.1:1/never.tgz", "  ", &out, "src/init.luau", ProgressBar::hidden(), None)
             .unwrap_err();
         assert!(err.to_string().contains("no integrity hash"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn cache_hit_extracts_without_network() {
+        let tgz = make_tgz("return {} -- from cache");
+        let hash = sha256_hex(&tgz);
+        let cache = TarballCache::open_at(temp_out_dir("cache-hit-store")).unwrap();
+        cache.store(&hash, &tgz);
+        let out = temp_out_dir("cache-hit-out");
+
+        // Port 1 is never listening: success proves the bytes came from the
+        // cache, not the network.
+        fetch_and_extract(
+            "http://127.0.0.1:1/never.tgz",
+            &hash,
+            &out,
+            "src/init.luau",
+            ProgressBar::hidden(),
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(out.join("init.luau")).unwrap(), "return {} -- from cache");
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn download_populates_cache_for_next_time() {
+        let tgz = make_tgz("return {} -- warm me");
+        let hash = sha256_hex(&tgz);
+        let url = serve_once(tgz.clone());
+        let cache = TarballCache::open_at(temp_out_dir("cache-warm")).unwrap();
+        let out = temp_out_dir("cache-warm-out");
+
+        fetch_and_extract(&url, &hash, &out, "src/init.luau", ProgressBar::hidden(), Some(&cache)).unwrap();
+
+        assert_eq!(cache.lookup(&hash).as_deref(), Some(tgz.as_slice()));
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn corrupt_cache_entry_falls_back_to_network_and_heals() {
+        let tgz = make_tgz("return {} -- fresh");
+        let hash = sha256_hex(&tgz);
+        let url = serve_once(tgz.clone());
+        let cache_dir = temp_out_dir("cache-heal");
+        let cache = TarballCache::open_at(cache_dir.clone()).unwrap();
+        // Plant garbage under the right entry name, as if the file rotted.
+        fs::write(cache_dir.join(format!("{hash}.tgz")), b"garbage").unwrap();
+        let out = temp_out_dir("cache-heal-out");
+
+        fetch_and_extract(&url, &hash, &out, "src/init.luau", ProgressBar::hidden(), Some(&cache)).unwrap();
+
+        assert_eq!(fs::read_to_string(out.join("init.luau")).unwrap(), "return {} -- fresh");
+        // The rotten entry was replaced by the verified download.
+        assert_eq!(cache.lookup(&hash).as_deref(), Some(tgz.as_slice()));
+        let _ = fs::remove_dir_all(&out);
     }
 }

@@ -2,9 +2,12 @@ use clap::{Parser, Subcommand};
 
 mod tokens;
 mod http;
+mod cache;
 mod message;
 mod lockfile_gen;
 mod lockfile_solver;
+mod install_plan;
+mod receipts;
 mod fetch_and_extract;
 mod commands;
 mod licensce_helper;
@@ -57,6 +60,10 @@ enum Commands {
         /// Specify an alias for the package
         #[arg(short = 'a', long = "alias")]
         alias: Option<String>,
+
+        /// Reinstall everything from scratch, ignoring installed state
+        #[arg(short = 'f', long = "force")]
+        force: bool,
     },
 
     /// Remove a package from the project
@@ -121,8 +128,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init { platform } => {
             init_command(platform).await?;
         }
-        Commands::Install { package, version, alias } => {
-            install_command(package, version, alias).await?;
+        Commands::Install { package, version, alias, force } => {
+            install_command(package, version, alias, force).await?;
         }
         Commands::Remove { package } => {
             remove_command(package).await?;

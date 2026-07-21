@@ -16,6 +16,7 @@ pub async fn install_command(
     target_package: Option<String>,
     version: Option<String>,
     alias: Option<String>,
+    force: bool,
 ) -> Result<()> {
     let mut msg = Message::new("Installing...");
 
@@ -204,7 +205,7 @@ pub async fn install_command(
 
         // Generate and write lockfile using blocking context
         let info_clone = info.clone();
-        let lockfile_content = lockfile_gen(&info_clone, &mut msg).await?;
+        let lockfile_content = lockfile_gen(&info_clone, &mut msg, force).await?;
         // Convert content to string
         let lockfile_content = serde_json::to_string_pretty(&lockfile_content)?;
         fs::write("forest-lock.json", lockfile_content)?;
@@ -234,9 +235,13 @@ pub async fn install_command(
 
         if usable {
             msg.destroy();
-            make_directories(&serde_json::from_value(lock_content.unwrap()).unwrap(), normalize_forest_deps(&info.clone()), &platform).await?;
+            let summary = make_directories(&serde_json::from_value(lock_content.unwrap()).unwrap(), normalize_forest_deps(&info.clone()), &platform, force).await?;
 
             msg = Message::new("");
+            if summary.installed == 0 {
+                msg.finish(MessageType::Success, "Already up to date!");
+                return Ok(());
+            }
         } else {
             if lock_content.is_some() {
                 msg.emit(
@@ -245,7 +250,7 @@ pub async fn install_command(
                 );
             }
             let info_clone = info.clone();
-            let lockfile_content = lockfile_gen(&info_clone, &mut msg).await?;
+            let lockfile_content = lockfile_gen(&info_clone, &mut msg, force).await?;
             // Convert content to string
             let lockfile_content = serde_json::to_string_pretty(&lockfile_content)?;
 

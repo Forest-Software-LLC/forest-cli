@@ -470,7 +470,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
     // Re-resolve and reinstall with the new ranges
     let mut msg = Message::new("Updating packages...");
     let info_clone = info.clone();
-    let lockfile_content = lockfile_gen(&info_clone, &mut msg).await?;
+    let lockfile_content = lockfile_gen(&info_clone, &mut msg, false).await?;
     let lockfile_content = serde_json::to_string_pretty(&lockfile_content)?;
     fs::write("forest-lock.json", lockfile_content)?;
 

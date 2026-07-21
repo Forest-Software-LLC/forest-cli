@@ -15,6 +15,7 @@
 // src/main.rs
 // ---------------------
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use anyhow::{Result, Context};
 use reqwest::{Method};
 use semver::{Version, VersionReq};
@@ -22,6 +23,32 @@ use serde::{Deserialize, Serialize};
 use crate::http::{api_request, packages_api_request};
 use crate::licensce_helper::LicenseInfo;
 use crate::utils::{digest_package_name, PackageName };
+
+/// Concurrent version-list prefetches in flight at once.
+const PREFETCH_CONCURRENCY: usize = 8;
+
+type VersionListHandle = tokio::task::JoinHandle<Result<(serde_json::Value, reqwest::StatusCode)>>;
+
+/// Fire the version-list request for a package the moment its name is known,
+/// instead of when the BFS gets around to it. The BFS awaits the memoized
+/// handle at exactly the point it used to issue the request, so processing
+/// order — and therefore bucket merging and the resulting lockfile — is
+/// unchanged; only the network wait overlaps.
+fn spawn_version_list_fetch(
+    scope: String,
+    pkg_name: String,
+    full_name: String,
+    platform: String,
+    limiter: &Arc<tokio::sync::Semaphore>,
+) -> VersionListHandle {
+    let limiter = Arc::clone(limiter);
+    tokio::spawn(async move {
+        let _permit = limiter.acquire_owned().await.expect("semaphore closed");
+        let path = format!("v1/package/{}/{}/{}", scope, platform, pkg_name);
+        api_request(&path, Method::GET, None, None).await
+            .with_context(|| format!("Failed to fetch package info for {}", full_name))
+    })
+}
 
 /// Tracks per-version resolution state
 #[derive(Debug)]
@@ -80,6 +107,25 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         .map(|(name, spec)| (digest_package_name(&name), spec.version, 1))
         .collect();
 
+    // Version lists are fetched eagerly as names are discovered (roots now,
+    // deps as their parents resolve) and awaited at the same point the BFS
+    // always fetched them — see spawn_version_list_fetch.
+    let limiter = Arc::new(tokio::sync::Semaphore::new(PREFETCH_CONCURRENCY));
+    let mut list_prefetch: HashMap<String, VersionListHandle> = HashMap::new();
+    for (name, _, _) in &queue {
+        let key = name.full_name.to_lowercase();
+        if !list_prefetch.contains_key(&key) {
+            let handle = spawn_version_list_fetch(
+                name.scope.clone(),
+                name.name.clone(),
+                name.full_name.clone(),
+                platform.clone(),
+                &limiter,
+            );
+            list_prefetch.insert(key, handle);
+        }
+    }
+
     // 1) Resolve dependency graph into buckets & versions
 
     while let Some((name, version_range, depth)) = queue.pop_front() {
@@ -88,9 +134,15 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
 
         // fetch available versions (first encounter under any casing)
         if !resolved.contains_key(&key) {
-            let path = format!("v1/package/{}/{}/{}", name.scope, platform, name.name);
-            let (version_data, versions_status) = api_request(&path, Method::GET, None, None).await
-                .with_context(|| format!("Failed to fetch package info for {}", name.full_name))?;
+            let (version_data, versions_status) = match list_prefetch.remove(&key) {
+                Some(handle) => handle.await
+                    .map_err(|e| anyhow::anyhow!("Version-list task panicked: {e}"))??,
+                None => {
+                    let path = format!("v1/package/{}/{}/{}", name.scope, platform, name.name);
+                    api_request(&path, Method::GET, None, None).await
+                        .with_context(|| format!("Failed to fetch package info for {}", name.full_name))?
+                }
+            };
 
             if !versions_status.is_success() {
                 Err(anyhow::anyhow!(
@@ -265,7 +317,21 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
 
 
         for (dep_name, dep_spec) in deps_hm {
-            queue.push_front((digest_package_name(&dep_name), dep_spec.version, depth + 1));
+            let dep_pkg = digest_package_name(&dep_name);
+            let dep_key = dep_pkg.full_name.to_lowercase();
+            // First sighting of this package name → start its version-list
+            // request now so it's (likely) done by the time BFS reaches it.
+            if !resolved.contains_key(&dep_key) && !list_prefetch.contains_key(&dep_key) {
+                let handle = spawn_version_list_fetch(
+                    dep_pkg.scope.clone(),
+                    dep_pkg.name.clone(),
+                    dep_pkg.full_name.clone(),
+                    platform.clone(),
+                    &limiter,
+                );
+                list_prefetch.insert(dep_key, handle);
+            }
+            queue.push_front((dep_pkg, dep_spec.version, depth + 1));
         }
     }
 

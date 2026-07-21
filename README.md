@@ -25,6 +25,7 @@ forest init                    # scaffold forest.json in your project
 forest login                   # authenticate via the browser
 forest install scope/package   # add a dependency (alias: forest i, forest grow)
 forest install                 # install everything from the lockfile
+forest install --force         # reinstall from scratch, ignoring installed state
 forest remove scope/package    # remove a dependency (alias: forest chop)
 forest publish                 # publish the current package
 forest audit                   # check dependencies for updates and license issues
@@ -32,6 +33,8 @@ forest update                  # update the CLI itself
 ```
 
 Dependencies land in `packages/` with generated Luau pointer modules, so requiring them from your game code just works. `forest-lock.json` pins every transitive dependency to an exact version and content hash — commit it.
+
+Installs are incremental: packages already on disk that match the lockfile are skipped (each installed folder carries a tiny `.forest-receipt`, ignored by Rojo like LICENSE files), and downloaded archives are kept in a local content-addressed cache (`~/.forest/cache`, verified by SHA-256 on every read; set `FOREST_NO_CACHE=1` to disable). Forest writes nothing to your project root beyond `forest.json` and `forest-lock.json`.
 
 ## Security model
 
