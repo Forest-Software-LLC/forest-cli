@@ -3,23 +3,26 @@ use clap::{Parser, Subcommand};
 mod tokens;
 mod http;
 mod cache;
+mod contracts;
 mod message;
 mod lockfile_gen;
 mod lockfile_solver;
-mod install_plan;
+mod roblox;
 mod receipts;
 mod fetch_and_extract;
 mod commands;
-mod licensce_helper;
+mod license_helper;
+mod platform;
 mod release_verify;
+mod uefn;
 mod utils;
 use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, audit_command, maybe_notify_update};
 
 use std::env;
 
-/// Forest CLI - Package manager
+/// Forest CLI: the Forest package manager
 #[derive(Parser)]
-#[command(name = "forest", version = env!("CARGO_PKG_VERSION"), about = "Forest CLI - Package manager")]
+#[command(name = "forest", version = env!("CARGO_PKG_VERSION"), about = "Forest CLI: the Forest package manager")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -64,6 +67,13 @@ enum Commands {
         /// Reinstall everything from scratch, ignoring installed state
         #[arg(short = 'f', long = "force")]
         force: bool,
+
+        /// When no forest.json exists, create one for this platform
+        /// (roblox or uefn) and continue. The non-interactive twin of
+        /// answering "Yes" to the create prompt. Ignored if a manifest
+        /// already exists.
+        #[arg(long = "init", value_name = "PLATFORM")]
+        init: Option<String>,
     },
 
     /// Remove a package from the project
@@ -101,6 +111,13 @@ async fn main() -> anyhow::Result<()> {
         // Local forest-trust-gateway (its dev server defaults to port 8081)
         env::set_var("FOREST_PACKAGES_URL", "http://localhost:8081/");
         env::set_var("FRONTEND_URL", "http://localhost:3000/");
+        // Public tarballs are content-addressed and fetched straight from
+        // the CDN, not through the gateway - locally that's the compose
+        // stack's MinIO bucket (docker-compose.yml CDN_BASE_URL). Respect an
+        // explicit override, unlike the URLs above.
+        if env::var("FOREST_CDN_BASE").is_err() {
+            env::set_var("FOREST_CDN_BASE", "http://localhost:9000/forest-packages-dev");
+        }
     } else {
         env::set_var("FOREST_API_URL", "https://api.forest.dev/");
         // Package upload/download go to the public trust gateway, deployed
@@ -128,8 +145,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init { platform } => {
             init_command(platform).await?;
         }
-        Commands::Install { package, version, alias, force } => {
-            install_command(package, version, alias, force).await?;
+        Commands::Install { package, version, alias, force, init } => {
+            install_command(package, version, alias, force, init).await?;
         }
         Commands::Remove { package } => {
             remove_command(package).await?;

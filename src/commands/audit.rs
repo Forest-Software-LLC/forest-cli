@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use urlencoding::encode;
 
 use crate::http::api_request;
-use crate::licensce_helper::{extract_license_info, LicenseInfo};
+use crate::license_helper::{extract_license_info, LicenseInfo};
 use crate::lockfile_gen::lockfile_gen;
 use crate::lockfile_solver::DepSpec;
 use crate::message::{self, Message, MessageType};
@@ -66,7 +66,7 @@ fn render_license_block(info: &LicenseInfo) -> String {
     let mut out = format!(
         "  {} {} {} {} {}",
         info.label.cyan(),
-        "—".dimmed(),
+        "·".dimmed(),
         info.license.bold(),
         "·".dimmed(),
         severity
@@ -94,7 +94,7 @@ mod tests {
         colored::control::unset_override();
 
         let lines: Vec<&str> = block.lines().collect();
-        assert_eq!(lines[0], "  scope/pkg@1.2.3 — GPL-3.0 · legal risk for closed-source games");
+        assert_eq!(lines[0], "  scope/pkg@1.2.3 · GPL-3.0 · legal risk for closed-source games");
         assert_eq!(lines[1], "      • First caveat.");
         assert_eq!(lines[2], "      • Second caveat.");
     }
@@ -110,7 +110,7 @@ mod tests {
         });
         colored::control::unset_override();
 
-        assert_eq!(block, "  scope/pkg@2.0.0 — Apache-2.0 · usable with conditions");
+        assert_eq!(block, "  scope/pkg@2.0.0 · Apache-2.0 · usable with conditions");
     }
 }
 
@@ -272,7 +272,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
 
     if let AuditTarget::Transitive(key) = &target {
         message::info(&format!(
-            "{} is not a direct dependency — checking its installed license only.",
+            "{} is not a direct dependency; checking its installed license only.",
             key
         ));
     } else if outdated.is_empty() {
@@ -339,7 +339,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
         }
     } else {
         if matches!(target, AuditTarget::All) {
-            message::info("No lockfile found — the license check covers direct dependencies only.");
+            message::info("No lockfile found; the license check covers direct dependencies only.");
         }
         for row in &rows {
             let version = row
@@ -402,15 +402,15 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
         for info in license_infos.iter().filter(|i| !i.is_flagged()) {
             match info.rating.as_str() {
                 "safe" => message::success(&format!(
-                    "{} — license '{}' has no known considerations.",
+                    "{}: license '{}' has no known considerations.",
                     info.label, info.license
                 )),
                 "pending" => message::info(&format!(
-                    "{} — license review is still pending; check back shortly.",
+                    "{}: license review is still pending; check back shortly.",
                     info.label
                 )),
                 _ => message::info(&format!(
-                    "{} — license '{}' has no safety rating.",
+                    "{}: license '{}' has no safety rating.",
                     info.label, info.license
                 )),
             }
@@ -424,7 +424,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
             println!("{}", render_license_block(info));
             println!();
         }
-        println!("  {}", "Automated license review — not legal advice.".dimmed());
+        println!("  {}", "Automated license review, not legal advice.".dimmed());
         println!();
     }
 

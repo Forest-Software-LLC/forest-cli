@@ -21,7 +21,7 @@ use reqwest::{Method};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use crate::http::{api_request, packages_api_request};
-use crate::licensce_helper::LicenseInfo;
+use crate::license_helper::LicenseInfo;
 use crate::utils::{digest_package_name, PackageName };
 
 /// Concurrent version-list prefetches in flight at once.
@@ -243,7 +243,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
 
         vs.resolved = true;
 
-        let license_info = crate::licensce_helper::extract_license_info(
+        let license_info = crate::license_helper::extract_license_info(
             &package_info,
             &format!("{}@{}", name.full_name, agreed),
         );
@@ -299,7 +299,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
 
         if vs.integrity.trim().is_empty() {
             return Err(anyhow::anyhow!(
-                "Registry returned no integrity hash for {}@{} — cannot lock this version",
+                "Registry returned no integrity hash for {}@{}; cannot lock this version",
                 name.full_name, agreed
             ));
         }

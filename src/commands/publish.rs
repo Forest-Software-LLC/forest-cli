@@ -1,5 +1,5 @@
 use anyhow::{Context, Ok, Result};
-use std::{env, fs, path::{Path, PathBuf}, sync::Arc};
+use std::{env, fs, path::Path, sync::Arc};
 use serde_json::Value;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use walkdir::WalkDir;
@@ -8,7 +8,8 @@ use flate2::{write::GzEncoder, Compression};
 use tar::Builder;
 use reqwest::{multipart::{Form, Part}, StatusCode};
 
-use crate::licensce_helper::{get_mit_license_text, detect_license, sanitize_spdx};
+use crate::license_helper::{get_mit_license_text, detect_license, sanitize_spdx};
+use crate::platform::{Platform, Preflight};
 use crate::{http::{self, api_request, packages_api_request}, message::{fail, warn, info}};
 use crate::message::{Message, MessageType};
 
@@ -160,72 +161,22 @@ pub async fn publish_command() -> Result<()> {
     let mut forest_json: Value = serde_json::from_str(&fs::read_to_string(&manifest_path)?)
         .context("Failed to parse forest.json")?;
 
+    // The platform owns every divergent step below (entry-point resolution,
+    // naming rules, extra metadata, pre-pack lints) — commands stay
+    // platform-blind. A missing/unknown platform is a hard error here: the
+    // registry requires it and every later call embeds it.
+    let platform = Platform::from_manifest(&forest_json)?;
+
     let mut metadata: Value = serde_json::json!({
-        
+
     });
 
-
-    // Find the package's init file at the first or second level of the directory.
-    // Roblox uses `.luau`, but `.lua` is still valid, so accept either.
-    const INIT_FILES: [&str; 2] = ["init.luau", "init.lua"];
-
-    // Honor an explicit `root` from forest.json; otherwise auto-detect the init file.
-    let mut init_lua_path = match forest_json["root"].as_str() {
-        Some(root) => cwd.join(root),
-        None => cwd.join(INIT_FILES[0]),
-    };
-    if !init_lua_path.exists() {
-        let mut found: Option<PathBuf> = None;
-
-        // Top level first.
-        for candidate in INIT_FILES {
-            let top = cwd.join(candidate);
-            if top.exists() {
-                found = Some(top);
-                break;
-            }
+    match platform.publish_preflight(&cwd, &mut forest_json, &mut metadata)? {
+        Preflight::Continue => {}
+        Preflight::Abort(reason) => {
+            fail(&reason);
+            return Ok(());
         }
-
-        // Then one directory deep.
-        if found.is_none() {
-            'search: for entry in fs::read_dir(&cwd)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() {
-                    for candidate in INIT_FILES {
-                        let nested_init = path.join(candidate);
-                        if nested_init.exists() {
-                            found = Some(nested_init);
-                            break 'search;
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(p) = found {
-            init_lua_path = p;
-        }
-    }
-
-    if !init_lua_path.exists() {
-        warn("Failed to resolve root for init.luau/init.lua");
-        let target_root: String = Input::with_theme(&ColorfulTheme::default())
-            .with_prompt("Root file (init.luau or init.lua) not found. Please provide the relative path to your root file. (e.g. src/init.luau)")
-            .validate_with(|input: &String| {
-                if input.is_empty() {
-                    Err(anyhow::anyhow!("Path cannot be empty"))
-                } else if fs::metadata(cwd.join(input)).is_ok() {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!("File does not exist at the provided path"))
-                }
-            })
-            .interact_text()?;
-
-        forest_json["root"] = Value::String(target_root);
-    } else {
-        forest_json["root"] = Value::String(init_lua_path.strip_prefix(&cwd).unwrap().to_string_lossy().to_string());
     }
 
 
@@ -286,19 +237,14 @@ pub async fn publish_command() -> Result<()> {
 
     let mut did_set_name_or_author = false;
     if !forest_json["name"].is_string() {
-        // Validate name
+        // Naming rules are platform-owned (Verse identifiers on UEFN, the
+        // classic letter/alnum/_/- rule on Roblox).
         let name: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("Project name")
-            .validate_with(|input: &String| {
-                let mut chars = input.chars();
-                let starts_with_letter = chars.next().map_or(false, |c| c.is_ascii_alphabetic());
-                if !starts_with_letter {
-                    Err(anyhow::anyhow!("Invalid package name. Names must start with a letter."))
-                } else if chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!("Invalid package name. Only letters, numbers, underscores, and hyphens are allowed."))
-                }
+            .validate_with(move |input: &String| {
+                platform
+                    .validate_package_name(input)
+                    .map_err(|reason| anyhow::anyhow!(reason))
             })
             .interact_text()?;
 
@@ -306,22 +252,9 @@ pub async fn publish_command() -> Result<()> {
         did_set_name_or_author = true;
     }
 
-    // hyphenated names can't be dot-indexed in Luau, so discourage without rejecting.
-    if let Some(name) = forest_json["name"].as_str() {
-        if name.contains('-') {
-            println!(
-                "warning: hyphenated package names can't be dot-indexed in Luau requires; consider PascalCase (e.g. \"{}\")",
-                name.split('-')
-                    .map(|part| {
-                        let mut c = part.chars();
-                        match c.next() {
-                            Some(first) => first.to_ascii_uppercase().to_string() + c.as_str(),
-                            None => String::new(),
-                        }
-                    })
-                    .collect::<String>()
-            );
-        }
+    // Non-fatal naming advice (e.g. Roblox's hyphen/dot-indexing note).
+    if let Some(note) = forest_json["name"].as_str().and_then(|n| platform.name_advisory(n)) {
+        println!("{}", note);
     }
     
     if !forest_json["author"].is_string() {
@@ -342,6 +275,15 @@ pub async fn publish_command() -> Result<()> {
         did_set_name_or_author = true;
     }
 
+    // The author is settled now - make sure the package's physical location
+    // agrees with it (platform-owned; UEFN checks the parent scope folder).
+    if let Some(author) = forest_json["author"].as_str() {
+        if let Err(reason) = platform.validate_publish_author(&cwd, author) {
+            fail(&reason);
+            return Ok(());
+        }
+    }
+
     if !forest_json["description"].is_string() {
         // Prompt for description with default
         let description: String = Input::with_theme(&ColorfulTheme::default())
@@ -353,8 +295,8 @@ pub async fn publish_command() -> Result<()> {
     }
 
     let mut versions = vec![];
-    if forest_json["name"].is_string() && forest_json["platform"].is_string() {
-        let platform = forest_json["platform"].as_str().unwrap().to_lowercase();
+    if forest_json["name"].is_string() {
+        let platform = platform.as_str();
         let name = forest_json["name"].as_str().unwrap().to_string();
         let (versions_resp, status_code) = api_request(&format!("v1/package/{}/{}/{}", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None)
             .await
@@ -395,15 +337,17 @@ pub async fn publish_command() -> Result<()> {
                 }
             }
         } else {
-            println!("No existing package found, defaulting to public visibility.");
+            info("No existing package with this name. This publish will create it.");
         }
     }
-    
- 
-    let mut new_version = if forest_json["version"].is_string() {
-        version_builder(&forest_json["version"].as_str().unwrap())
-    } else {
-        "0.1.0".to_string()
+
+    // First publish of a new package: the manifest version (the scaffold's
+    // 0.1.0) IS the version - the bump questionnaire only makes sense when
+    // published versions exist to bump from.
+    let mut new_version = match forest_json["version"].as_str() {
+        Some(current) if !versions.is_empty() => version_builder(current),
+        Some(current) => current.to_string(),
+        None => "0.1.0".to_string(),
     };
 
     let version_confirm = Select::with_theme(&ColorfulTheme::default())
@@ -496,6 +440,9 @@ pub async fn publish_command() -> Result<()> {
                     .context("Failed to write LICENSE file")?;
 
                 info("Generated LICENSE file with MIT license.");
+                // The manifest must declare it too - the registry requires
+                // the field, and it must agree with the packaged text.
+                forest_json["license"] = Value::String("MIT".to_string());
             }
             1 => {
                 fail("Publishing cancelled. Please add a license file and try again.");
@@ -523,6 +470,13 @@ pub async fn publish_command() -> Result<()> {
 
     // Prepare tarball
     let matcher = load_forest_ignore(&cwd);
+
+    // Platform pre-pack lint: the gateway hard-rejects these files, but
+    // warning BEFORE the upload is the better error location.
+    for warning in platform.prepack_warnings(&cwd, &matcher) {
+        warn(&warning);
+    }
+
     let tar_buf = create_tarball_buffer(&cwd, &matcher)
         .context("Failed to create package tarball")?;
 
@@ -580,12 +534,22 @@ pub async fn publish_command() -> Result<()> {
         return Ok(());
     }
 
+    // Registry lint warnings (e.g. a uefn package exporting nothing) ride
+    // the success response - surface them for every platform (the field is
+    // simply absent for roblox today).
+    if let Some(warnings) = upload_response.get("warnings").and_then(Value::as_array) {
+        for warning in warnings.iter().filter_map(Value::as_str) {
+            msg.emit(MessageType::Warn, warning);
+        }
+    }
+
     msg.finish(MessageType::Success, "Package uploaded successfully!");
 
     // Write forest.json with new version
-    
+
     fs::write(&manifest_path, serde_json::to_string_pretty(&forest_json)?)
         .context("Failed to write updated forest.json")?;
 
     Ok(())
 }
+

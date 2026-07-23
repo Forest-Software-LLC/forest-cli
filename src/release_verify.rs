@@ -47,7 +47,7 @@ pub fn verify_manifest_signature(manifest_bytes: &[u8], sig_pem: &str) -> Result
 
 fn verify_with_keys(keys: &[PublicKey], manifest_bytes: &[u8], sig_pem: &str) -> Result<()> {
     let sig = SshSig::from_pem(sig_pem)
-        .context("release signature is malformed — not an SSH signature block")?;
+        .context("release signature is malformed (not an SSH signature block)")?;
 
     for key in keys {
         if key.verify(SIG_NAMESPACE, manifest_bytes, &sig).is_ok() {
@@ -55,7 +55,7 @@ fn verify_with_keys(keys: &[PublicKey], manifest_bytes: &[u8], sig_pem: &str) ->
         }
     }
     bail!(
-        "release manifest signature does not verify against any trusted Forest release key — \
+        "release manifest signature does not verify against any trusted Forest release key; \
          refusing to trust this release"
     )
 }

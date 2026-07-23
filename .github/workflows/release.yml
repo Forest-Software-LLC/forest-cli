@@ -36,6 +36,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # shared/ submodule = forest-shared-resources contracts, embedded
+          # via include_str! - the build fails without it.
+          submodules: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -78,7 +82,7 @@ jobs:
           echo "Built $OUT"
 
       # Cryptographic proof that each binary was built by this workflow from
-      # this commit — anyone can check with `gh attestation verify`.
+      # this commit - anyone can check with `gh attestation verify`.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
