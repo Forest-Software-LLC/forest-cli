@@ -25,5 +25,5 @@ pub async fn init_command(platform: Option<String>) -> Result<()> {
         None => Platform::detect_or_prompt(&env::current_dir()?)?,
     };
 
-    platform.init(&env::current_dir()?)
+    platform.init(&env::current_dir()?).await
 }

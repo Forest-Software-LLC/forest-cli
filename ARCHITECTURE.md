@@ -63,6 +63,7 @@ Luau is, the change is in the wrong place.
 | Method | What it owns |
 |---|---|
 | `install` | The entire layout/extraction/bookkeeping/post-install pipeline |
+| `resolution_roots` | What dependency resolution runs against. Roblox: the invoking manifest. UEFN: the WORKSPACE (project manifest + every authored package's manifest, constraints ANDed) — so installs land at the shared mount and one lockfile (Content/forest-lock.json) governs, no matter where install runs from |
 | `publish_preflight` | Entry-point resolution (Roblox) / name + compat checks (UEFN) |
 | `validate_package_name` | Naming rules for new packages |
 | `name_advisory` | Non-fatal naming advice |

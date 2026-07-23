@@ -299,7 +299,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
 
         if vs.integrity.trim().is_empty() {
             return Err(anyhow::anyhow!(
-                "Registry returned no integrity hash for {}@{} — cannot lock this version",
+                "Registry returned no integrity hash for {}@{}; cannot lock this version",
                 name.full_name, agreed
             ));
         }

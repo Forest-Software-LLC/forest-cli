@@ -20,9 +20,9 @@ use commands::{login_command, logout_command, whoami_command, install_command, i
 
 use std::env;
 
-/// Forest CLI - Package manager
+/// Forest CLI: the Forest package manager
 #[derive(Parser)]
-#[command(name = "forest", version = env!("CARGO_PKG_VERSION"), about = "Forest CLI - Package manager")]
+#[command(name = "forest", version = env!("CARGO_PKG_VERSION"), about = "Forest CLI: the Forest package manager")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -69,7 +69,7 @@ enum Commands {
         force: bool,
 
         /// When no forest.json exists, create one for this platform
-        /// (roblox or uefn) and continue - the non-interactive twin of
+        /// (roblox or uefn) and continue. The non-interactive twin of
         /// answering "Yes" to the create prompt. Ignored if a manifest
         /// already exists.
         #[arg(long = "init", value_name = "PLATFORM")]
@@ -111,6 +111,13 @@ async fn main() -> anyhow::Result<()> {
         // Local forest-trust-gateway (its dev server defaults to port 8081)
         env::set_var("FOREST_PACKAGES_URL", "http://localhost:8081/");
         env::set_var("FRONTEND_URL", "http://localhost:3000/");
+        // Public tarballs are content-addressed and fetched straight from
+        // the CDN, not through the gateway - locally that's the compose
+        // stack's MinIO bucket (docker-compose.yml CDN_BASE_URL). Respect an
+        // explicit override, unlike the URLs above.
+        if env::var("FOREST_CDN_BASE").is_err() {
+            env::set_var("FOREST_CDN_BASE", "http://localhost:9000/forest-packages-dev");
+        }
     } else {
         env::set_var("FOREST_API_URL", "https://api.forest.dev/");
         // Package upload/download go to the public trust gateway, deployed

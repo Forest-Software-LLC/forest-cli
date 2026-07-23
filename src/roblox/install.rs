@@ -42,7 +42,7 @@ pub async fn make_directories_roblox(
     for (pkg_name, spec) in &root_deps {
         if spec.alias.starts_with('_') || spec.alias.starts_with('.') {
             return Err(anyhow!(
-                "Alias '{}' for {} cannot start with '_' or '.' — rename it in forest.json",
+                "Alias '{}' for {} cannot start with '_' or '.'; rename it in forest.json",
                 spec.alias, pkg_name
             ));
         }

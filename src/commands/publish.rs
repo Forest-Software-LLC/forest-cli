@@ -275,6 +275,15 @@ pub async fn publish_command() -> Result<()> {
         did_set_name_or_author = true;
     }
 
+    // The author is settled now - make sure the package's physical location
+    // agrees with it (platform-owned; UEFN checks the parent scope folder).
+    if let Some(author) = forest_json["author"].as_str() {
+        if let Err(reason) = platform.validate_publish_author(&cwd, author) {
+            fail(&reason);
+            return Ok(());
+        }
+    }
+
     if !forest_json["description"].is_string() {
         // Prompt for description with default
         let description: String = Input::with_theme(&ColorfulTheme::default())
@@ -328,15 +337,17 @@ pub async fn publish_command() -> Result<()> {
                 }
             }
         } else {
-            println!("No existing package found, defaulting to public visibility.");
+            info("No existing package with this name. This publish will create it.");
         }
     }
-    
- 
-    let mut new_version = if forest_json["version"].is_string() {
-        version_builder(&forest_json["version"].as_str().unwrap())
-    } else {
-        "0.1.0".to_string()
+
+    // First publish of a new package: the manifest version (the scaffold's
+    // 0.1.0) IS the version - the bump questionnaire only makes sense when
+    // published versions exist to bump from.
+    let mut new_version = match forest_json["version"].as_str() {
+        Some(current) if !versions.is_empty() => version_builder(current),
+        Some(current) => current.to_string(),
+        None => "0.1.0".to_string(),
     };
 
     let version_confirm = Select::with_theme(&ColorfulTheme::default())
@@ -429,6 +440,9 @@ pub async fn publish_command() -> Result<()> {
                     .context("Failed to write LICENSE file")?;
 
                 info("Generated LICENSE file with MIT license.");
+                // The manifest must declare it too - the registry requires
+                // the field, and it must agree with the packaged text.
+                forest_json["license"] = Value::String("MIT".to_string());
             }
             1 => {
                 fail("Publishing cancelled. Please add a license file and try again.");

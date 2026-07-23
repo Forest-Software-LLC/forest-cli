@@ -70,7 +70,7 @@ async fn fetch_manifest(timeout: Option<Duration>) -> Result<ReleaseManifest> {
     let manifest_bytes = get(format!("{base}/cli/latest/latest.json")).await?;
     let sig_bytes = get(format!("{base}/cli/latest/latest.json.sig"))
         .await
-        .context("release signature is missing — refusing to trust an unsigned manifest")?;
+        .context("release signature is missing; refusing to trust an unsigned manifest")?;
     let sig_pem = std::str::from_utf8(&sig_bytes).context("release signature is not valid UTF-8")?;
 
     crate::release_verify::verify_manifest_signature(&manifest_bytes, sig_pem)?;
@@ -167,7 +167,7 @@ pub async fn update_command(check_only: bool) -> Result<()> {
         msg.finish(
             MessageType::Fail,
             &format!(
-                "Checksum mismatch — refusing to install (expected {}, got {actual}).",
+                "Checksum mismatch: refusing to install (expected {}, got {actual}).",
                 file.sha256
             ),
         );

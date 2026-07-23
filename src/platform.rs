@@ -125,6 +125,27 @@ impl Platform {
         }
     }
 
+    /// The roots dependency resolution runs against. Roblox resolves the
+    /// invoking manifest's deps; UEFN resolves the WORKSPACE (project
+    /// manifest + every authored package's manifest) so a package's declared
+    /// deps land at the shared mount no matter where install is run from.
+    pub fn resolution_roots(
+        &self,
+        manifest_roots: HashMap<String, DepSpec>,
+    ) -> Result<HashMap<String, DepSpec>> {
+        match self {
+            Platform::Roblox => Ok(manifest_roots),
+            Platform::Uefn => {
+                match std::env::current_dir().ok().and_then(|cwd| crate::uefn::find_project(&cwd)) {
+                    Some(project) => crate::uefn::gather_workspace_roots(&project),
+                    // Outside a project: the executor gives the real error;
+                    // fall back so resolution still reports something useful.
+                    None => Ok(manifest_roots),
+                }
+            }
+        }
+    }
+
     /// Execute an install plan: layout, extraction, bookkeeping, and
     /// post-install UX are wholly owned by the platform module.
     pub async fn install(
@@ -162,6 +183,16 @@ impl Platform {
         }
     }
 
+    /// Consistency check between the chosen publish author and where the
+    /// package physically sits (UEFN: the parent scope folder must be the
+    /// author's mapped scope). Runs after the author is known.
+    pub fn validate_publish_author(&self, cwd: &Path, author: &str) -> std::result::Result<(), String> {
+        match self {
+            Platform::Roblox => Ok(()),
+            Platform::Uefn => crate::uefn::publish::validate_author(cwd, author),
+        }
+    }
+
     /// Non-fatal naming advice (e.g. Roblox's hyphen/dot-indexing note).
     pub fn name_advisory(&self, name: &str) -> Option<String> {
         match self {
@@ -178,11 +209,13 @@ impl Platform {
         }
     }
 
-    /// The `forest init` scaffold for this platform.
-    pub fn init(&self, cwd: &Path) -> Result<()> {
+    /// The `forest init` scaffold for this platform. Async because some
+    /// scaffolds consult the registry (UEFN's scope picker offers the same
+    /// author list as publish).
+    pub async fn init(&self, cwd: &Path) -> Result<()> {
         match self {
             Platform::Roblox => crate::roblox::init::init(cwd),
-            Platform::Uefn => crate::uefn::init::init(cwd),
+            Platform::Uefn => crate::uefn::init::init(cwd).await,
         }
     }
 
@@ -199,7 +232,7 @@ impl Platform {
     pub fn resolved_note(&self, typed: &str, canonical: &str, resolved_name: &str) -> String {
         match self {
             Platform::Roblox => format!(
-                "{} resolved to {} — require(\"{}\")",
+                "{} resolved to {} (require(\"{}\"))",
                 typed, canonical, resolved_name
             ),
             Platform::Uefn => format!("{} resolved to {}", typed, canonical),
@@ -231,11 +264,13 @@ mod tests {
     fn detects_roblox_from_rojo_or_wally_files() {
         let base = fixture("roblox");
         fs::write(base.join("default.project.json"), "{}").unwrap();
-        // Detection also works from a subdirectory (ancestor walk).
+        // Roblox signals are cwd-ONLY: a subdirectory does not detect (an
+        // ancestor walk would let stray wally.toml/default.project.json
+        // files high up the tree poison every detection on the machine).
         let sub = base.join("src");
         fs::create_dir_all(&sub).unwrap();
         assert_eq!(Platform::detect(&base), Some(Platform::Roblox));
-        assert_eq!(Platform::detect(&sub), Some(Platform::Roblox));
+        assert_eq!(Platform::detect(&sub), None);
 
         let wally = fixture("wally");
         fs::write(wally.join("wally.toml"), "[package]").unwrap();
@@ -248,6 +283,21 @@ mod tests {
         for dir in [base, wally, named] {
             let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn stray_roblox_files_in_ancestors_cannot_shadow_a_uefn_project() {
+        // The ForestTest regression: a wally.toml somewhere up the tree must
+        // not make detection inconclusive inside a real UEFN project.
+        let base = fixture("uefn-with-stray");
+        fs::write(base.join("wally.toml"), "[package]").unwrap();
+        let project = base.join("MyIsland");
+        let pkg = project.join("Content").join("ForestPackages").join("myscope").join("MyPkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(project.join("MyIsland.uefnproject"), "{}").unwrap();
+
+        assert_eq!(Platform::detect(&pkg), Some(Platform::Uefn));
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

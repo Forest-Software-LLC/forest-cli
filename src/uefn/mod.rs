@@ -207,8 +207,8 @@ pub fn lint_root_function_defs(content_dir: &Path) -> Vec<String> {
         for line in text.lines() {
             if let Some(name) = detect_function_def(line) {
                 warnings.push(format!(
-                    "{}: root-level function \"{}\" - any installed package exporting the same \
-                     name and signature will fail the Verse build (definitions collide across \
+                    "{}: root-level function \"{}\" is risky. Any installed package exporting the \
+                     same name and signature will fail the Verse build (definitions collide across \
                      ancestor scopes). Move it into a folder module (e.g. Src/) instead.",
                     path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
                     name
@@ -261,6 +261,83 @@ pub fn discover_manifest_dir(start: &Path) -> Option<PathBuf> {
     }
 }
 
+pub(crate) fn dir_name(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// Is the ancestor `generations` levels above `cwd` the packages mount?
+/// (1 = parent is the mount: a scope dir; 2 = grandparent: a package dir.)
+pub(crate) fn ancestor_is_mount(cwd: &Path, generations: usize) -> bool {
+    let mount_name = &crate::contracts::verse_rules().packages_mount;
+    cwd.ancestors()
+        .nth(generations)
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy() == *mount_name)
+        .unwrap_or(false)
+}
+
+/// Workspace resolution roots (docs/uefn-adapter.md §7 authoring): the
+/// PROJECT owns dependency resolution. Roots = the Content manifest's deps
+/// merged with every AUTHORED package's declared deps, so a package's
+/// `using { ForestPackages.X.Y }` imports are installed at the shared mount
+/// no matter which manifest declared them, and the single-version rule
+/// spans the whole workspace. When one dependency is declared with
+/// different requirements, both must hold (Rust semver treats comma as AND)
+/// and an impossible combination fails at resolve time.
+pub fn gather_workspace_roots(
+    project: &UefnProject,
+) -> anyhow::Result<std::collections::HashMap<String, crate::lockfile_solver::DepSpec>> {
+    use crate::utils::normalize_forest_deps;
+
+    fn merge(
+        merged: &mut std::collections::HashMap<String, crate::lockfile_solver::DepSpec>,
+        roots: std::collections::HashMap<String, crate::lockfile_solver::DepSpec>,
+    ) {
+        for (name, spec) in roots {
+            let existing = merged
+                .iter_mut()
+                .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+                .map(|(_, value)| value);
+            match existing {
+                Some(existing) => {
+                    // AND the constraints, skipping ones already present
+                    // (the joined string is itself comma-separated).
+                    let already = existing.version.split(',').any(|part| part.trim() == spec.version.trim());
+                    if !already {
+                        existing.version = format!("{}, {}", existing.version, spec.version);
+                    }
+                }
+                None => {
+                    merged.insert(name, spec);
+                }
+            }
+        }
+    }
+
+    let mut merged = std::collections::HashMap::new();
+
+    let project_manifest = project.content_dir.join("forest.json");
+    if let Ok(text) = fs::read_to_string(&project_manifest) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            merge(&mut merged, normalize_forest_deps(&value));
+        }
+    }
+
+    let mount_name = &crate::contracts::verse_rules().packages_mount;
+    let mount = project.content_dir.join(mount_name);
+    let tree = crate::receipts::scan_flat(&mount, mount_name, MARKER_HEADER);
+    for authored in &tree.authored {
+        let manifest = mount.join(&authored.scope_dir).join(&authored.name_dir).join("forest.json");
+        if let Ok(text) = fs::read_to_string(&manifest) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                merge(&mut merged, normalize_forest_deps(&value));
+            }
+        }
+    }
+
+    Ok(merged)
+}
+
 /// The Verse import snippet printed after adding a package: the dotted
 /// relative form (prefix-free), plus the collision-proof qualified fallback.
 pub fn install_snippet(scope: &str, name: &str) -> String {
@@ -275,7 +352,7 @@ pub fn install_snippet(scope: &str, name: &str) -> String {
 /// shims Verse doesn't have.
 pub fn alias_error() -> String {
     format!(
-        "Aliases aren't supported on UEFN. Verse imports are already scope-namespaced - \
+        "Aliases aren't supported on UEFN. Verse imports are already scope-namespaced; \
          disambiguate call sites with qualified access instead: ({}.scope.name:)Fn(...)",
         crate::contracts::verse_rules().packages_mount
     )
@@ -381,6 +458,61 @@ mod tests {
         let user_file = base.join("User.verse");
         fs::write(&user_file, "# my comment\nAdd<public>(A:int, B:int):int = A + B\n").unwrap();
         assert!(!is_forest_marker(&user_file));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_roots_merge_project_and_authored_manifests() {
+        let base = std::env::temp_dir().join(format!("forest-ws-roots-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let content = base.join("Content");
+        let mount = content.join("ForestPackages");
+        fs::create_dir_all(&mount).unwrap();
+        fs::write(base.join("Island.uefnproject"), "{}").unwrap();
+        fs::write(base.join("Island.uplugin"), r#"{ "VersePath": "/x/Island" }"#).unwrap();
+
+        // Project manifest declares one dep.
+        fs::write(
+            content.join("forest.json"),
+            r#"{ "platform": "uefn", "dependencies": { "acme/shared": "^1.0.0" } }"#,
+        )
+        .unwrap();
+        // Authored package A declares its own dep + the shared one with a
+        // DIFFERENT requirement (both must hold: comma-joined = semver AND).
+        let pkg_a = mount.join("mine").join("PkgA");
+        fs::create_dir_all(&pkg_a).unwrap();
+        fs::write(
+            pkg_a.join("forest.json"),
+            r#"{ "platform": "uefn", "name": "PkgA", "dependencies": { "acme/shared": "^1.2.0", "other/util": "^3.0.0" } }"#,
+        )
+        .unwrap();
+        // Authored package B declares the shared dep with the SAME req (no join).
+        let pkg_b = mount.join("mine").join("PkgB");
+        fs::create_dir_all(&pkg_b).unwrap();
+        fs::write(
+            pkg_b.join("forest.json"),
+            r#"{ "platform": "uefn", "name": "PkgB", "dependencies": { "acme/shared": "^1.0.0" } }"#,
+        )
+        .unwrap();
+        // An INSTALLED (receipt-carrying) package's manifest must NOT count.
+        let installed = mount.join("vendor").join("Dep");
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join("forest.json"), r#"{ "dependencies": { "sneaky/extra": "^9.0.0" } }"#).unwrap();
+        fs::write(
+            installed.join(crate::receipts::RECEIPT_FILE),
+            r#"{ "name": "vendor/dep", "version": "1.0.0", "integrity": "aa", "root": "" }"#,
+        )
+        .unwrap();
+
+        let project = find_project(&content).unwrap();
+        let roots = gather_workspace_roots(&project).unwrap();
+
+        assert_eq!(roots.len(), 2, "shared dep dedupes; installed manifests ignored: {:?}", roots.keys().collect::<Vec<_>>());
+        let shared = &roots["acme/shared"];
+        assert_eq!(shared.version, "^1.0.0, ^1.2.0", "differing reqs are ANDed, identical req not re-joined");
+        assert_eq!(roots["other/util"].version, "^3.0.0");
+        assert!(!roots.contains_key("sneaky/extra"));
+
         let _ = fs::remove_dir_all(&base);
     }
 

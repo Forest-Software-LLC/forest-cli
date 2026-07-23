@@ -98,7 +98,7 @@ pub fn plan_install_uefn(
         if spec.alias != default_alias {
             return Err(anyhow!(
                 "Dependency aliases aren't supported on UEFN ({} is aliased to '{}'). Verse imports \
-                 are already scope-namespaced - remove the alias and disambiguate call sites with \
+                 are already scope-namespaced; remove the alias and disambiguate call sites with \
                  qualified access: ({}.<scope>.<name>:)Fn(...)",
                 pkg_name, spec.alias, mount
             ));
@@ -142,7 +142,7 @@ pub fn plan_install_uefn(
                 }
             }
             return Err(anyhow!(
-                "{} resolves to multiple versions ({}) - UEFN installs one version per package \
+                "{} resolves to multiple versions ({}). UEFN installs one version per package \
                  (Verse module paths carry no version). Requested by: {}. Align the version \
                  ranges or remove one of the requesters.",
                 lock_key,
@@ -183,7 +183,7 @@ pub fn plan_install_uefn(
     for (mapped_scope, dir_name) in authored {
         if super::validate_uefn_package_name(dir_name).is_err() {
             warnings.push(format!(
-                "Authored package folder \"{}\" is not a valid Verse identifier - no module \
+                "Authored package folder \"{}\" is not a valid Verse identifier; no module \
                  marker generated for it.",
                 dir_name
             ));

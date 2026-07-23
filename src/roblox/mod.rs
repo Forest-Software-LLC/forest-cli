@@ -15,15 +15,14 @@ pub mod wally;
 pub const PACKAGES_DIR: &str = "Packages";
 
 /// Does `start` look like a Roblox project? Signals: a Rojo
-/// `default.project.json` or a Wally `wally.toml` in the directory or any
-/// ancestor, or any `*.project.json` directly in the directory.
+/// `default.project.json`, a Wally `wally.toml`, or any `*.project.json`,
+/// all checked in the directory ITSELF only. No ancestor walk: a stray
+/// wally.toml anywhere up the tree (home dir, drive root) would otherwise
+/// poison detection for every project on the machine, and a wrong platform
+/// guess is far worse than falling back to the picker.
 pub fn detect_project(start: &std::path::Path) -> bool {
-    let mut dir = Some(start);
-    while let Some(current) = dir {
-        if current.join("default.project.json").is_file() || current.join("wally.toml").is_file() {
-            return true;
-        }
-        dir = current.parent();
+    if start.join("default.project.json").is_file() || start.join("wally.toml").is_file() {
+        return true;
     }
     std::fs::read_dir(start)
         .map(|entries| {

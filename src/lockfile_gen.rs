@@ -72,7 +72,7 @@ pub(crate) async fn fetch_signed_url(
     if !registry_integrity.eq_ignore_ascii_case(lockfile_integrity.trim()) {
         return Err(anyhow!(
             "Integrity mismatch for {}@{}: lockfile has {} but the registry reports {}. \
-             Refusing to install — if this version was republished, delete forest-lock.json and re-run `forest install`.",
+             Refusing to install. If this version was republished, delete forest-lock.json and re-run `forest install`.",
             pkg_name, version, lockfile_integrity, registry_integrity
         ));
     }
@@ -105,6 +105,10 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
         .ok_or_else(|| anyhow::anyhow!("Missing platform in forest.json"))?
         .to_string(); // clone the value so we don't hold a borrow
 
+    // Platforms may widen the roots beyond the invoking manifest (UEFN
+    // resolves the whole workspace: project manifest + authored packages).
+    let roots = Platform::parse(&platform)?.resolution_roots(roots)?;
+
     msg.update("Resolving dependencies...");
     let (lockfile_packages, license_warnings) = get_lockfile_packages(roots.clone(), platform.clone()).await
         .context("Failed to resolve lockfile packages")?;
@@ -118,7 +122,7 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
     if !license_warnings.is_empty() {
         msg.emit(
             MessageType::Info,
-            "Run `forest audit` for license details (automated review — not legal advice).",
+            "Run `forest audit` for license details (automated review, not legal advice).",
         );
     }
 

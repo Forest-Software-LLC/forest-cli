@@ -56,7 +56,7 @@ pub async fn install_command(
             }
         };
         if let Some(plat) = chosen_platform {
-            plat.init(&std::env::current_dir()?)?;
+            plat.init(&std::env::current_dir()?).await?;
             // The scaffold may have placed the manifest elsewhere
             // (UEFN: Content/) - re-run discovery to land on it.
             if !Path::new("forest.json").exists() {
@@ -76,7 +76,7 @@ pub async fn install_command(
     } else if init_platform.is_some() {
         msg.emit(
             MessageType::Info,
-            "forest.json already exists - ignoring --init.",
+            "forest.json already exists; ignoring --init.",
         );
     }
 
@@ -203,13 +203,17 @@ pub async fn install_command(
             );
         }
 
-        // Check existing install (case-insensitive: a hand-edited manifest
-        // key that differs only by case is still the same package)
-        if let Some(existing_key) = deps.keys().find(|k| k.eq_ignore_ascii_case(&canonical_full)) {
+        // Already declared (case-insensitive: a hand-edited manifest key
+        // that differs only by case is still the same package)? Declared is
+        // not the same as ON DISK - a hand-deleted folder loses its receipt,
+        // so materializing the lockfile below restores it. When everything
+        // is present this ends in "Already up to date!".
+        if let Some(existing_key) = deps.keys().find(|k| k.eq_ignore_ascii_case(&canonical_full)).cloned() {
             msg.emit(
                 MessageType::Info,
-                &format!("Package {} is already installed.", existing_key),
+                &format!("Package {} is already in forest.json. Verifying installed packages...", existing_key),
             );
+            sync_from_lockfile(&info, &platform, msg, force).await?;
             return Ok(());
         }
 
@@ -281,49 +285,64 @@ pub async fn install_command(
         }
     } else {
         // No specific package: install all via lockfile
-        let lock_content: Option<Value> = if Path::new("forest-lock.json").exists() {
-            Some(serde_json::from_str(&fs::read_to_string("forest-lock.json")?)?)
-        } else {
-            msg.emit(
-                MessageType::Warn,
-                "No lockfile found. Commit forest-lock.json to avoid inconsistencies.",
-            );
-            None
-        };
-
-        // Only the current format installs straight from the lockfile; anything
-        // else (older format, unknown version) is re-resolved like a missing one.
-        let usable = lock_content.as_ref()
-            .and_then(|c| c.get("file_version"))
-            .and_then(Value::as_u64)
-            == Some(2);
-
-        if usable {
-            msg.destroy();
-            let summary = make_directories(&serde_json::from_value(lock_content.unwrap()).unwrap(), normalize_forest_deps(&info.clone()), &platform, force).await?;
-
-            msg = Message::new("");
-            if summary.installed == 0 {
-                msg.finish(MessageType::Success, "Already up to date!");
-                return Ok(());
-            }
-        } else {
-            if lock_content.is_some() {
-                msg.emit(
-                    MessageType::Warn,
-                    "Lockfile format is out of date — regenerating forest-lock.json.",
-                );
-            }
-            let info_clone = info.clone();
-            let lockfile_content = lockfile_gen(&info_clone, &mut msg, force).await?;
-            // Convert content to string
-            let lockfile_content = serde_json::to_string_pretty(&lockfile_content)?;
-
-            fs::write("forest-lock.json", lockfile_content)?;
-        }
-
-        msg.finish(MessageType::Success, "Installed all dependencies!");
+        sync_from_lockfile(&info, &platform, msg, force).await?;
     }
 
+    Ok(())
+}
+
+/// Materialize the tree from the lockfile (regenerating it when missing or
+/// outdated). Shared tail of the bulk `forest install` and of a targeted
+/// install whose dependency is already declared - in that case this is what
+/// restores a hand-deleted package folder (its receipt died with it, so
+/// reconciliation reinstalls it).
+async fn sync_from_lockfile(
+    info: &Value,
+    platform: &str,
+    mut msg: Message,
+    force: bool,
+) -> Result<()> {
+    let lock_content: Option<Value> = if Path::new("forest-lock.json").exists() {
+        Some(serde_json::from_str(&fs::read_to_string("forest-lock.json")?)?)
+    } else {
+        msg.emit(
+            MessageType::Warn,
+            "No lockfile found. Commit forest-lock.json to avoid inconsistencies.",
+        );
+        None
+    };
+
+    // Only the current format installs straight from the lockfile; anything
+    // else (older format, unknown version) is re-resolved like a missing one.
+    let usable = lock_content.as_ref()
+        .and_then(|c| c.get("file_version"))
+        .and_then(Value::as_u64)
+        == Some(2);
+
+    if usable {
+        msg.destroy();
+        let summary = make_directories(&serde_json::from_value(lock_content.unwrap()).unwrap(), normalize_forest_deps(&info.clone()), platform, force).await?;
+
+        msg = Message::new("");
+        if summary.installed == 0 {
+            msg.finish(MessageType::Success, "Already up to date!");
+            return Ok(());
+        }
+    } else {
+        if lock_content.is_some() {
+            msg.emit(
+                MessageType::Warn,
+                "Lockfile format is out of date; regenerating forest-lock.json.",
+            );
+        }
+        let info_clone = info.clone();
+        let lockfile_content = lockfile_gen(&info_clone, &mut msg, force).await?;
+        // Convert content to string
+        let lockfile_content = serde_json::to_string_pretty(&lockfile_content)?;
+
+        fs::write("forest-lock.json", lockfile_content)?;
+    }
+
+    msg.finish(MessageType::Success, "Installed all dependencies!");
     Ok(())
 }

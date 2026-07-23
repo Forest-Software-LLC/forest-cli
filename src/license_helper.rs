@@ -106,14 +106,14 @@ impl LicenseInfo {
     pub fn headline(&self) -> String {
         match self.rating.as_str() {
             "unsafe" => format!(
-                "{} - license '{}' is a LEGAL RISK for closed-source games",
+                "{}: license '{}' is a LEGAL RISK for closed-source games",
                 self.label, self.license
             ),
             "caution" => format!(
-                "{} - license '{}' is usable with conditions",
+                "{}: license '{}' is usable with conditions",
                 self.label, self.license
             ),
-            _ => format!("{} - license '{}'", self.label, self.license),
+            _ => format!("{}: license '{}'", self.label, self.license),
         }
     }
 }
@@ -168,7 +168,7 @@ mod tests {
         assert!(info.is_flagged());
         assert_eq!(
             info.headline(),
-            "scope/pkg@1.2.3 - license 'GPL-3.0' is a LEGAL RISK for closed-source games"
+            "scope/pkg@1.2.3: license 'GPL-3.0' is a LEGAL RISK for closed-source games"
         );
     }
 
@@ -182,7 +182,7 @@ mod tests {
         assert!(info.caveats.is_empty());
         assert_eq!(
             info.headline(),
-            "scope/pkg@2.0.0 - license 'Apache-2.0' is usable with conditions"
+            "scope/pkg@2.0.0: license 'Apache-2.0' is usable with conditions"
         );
     }
 

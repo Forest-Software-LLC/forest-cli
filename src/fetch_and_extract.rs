@@ -82,7 +82,7 @@ pub(crate) fn obtain_verified_bytes(
     if expected_sha256.trim().is_empty() {
         // An unaddressable entry, not a weaker check: without the hash there is
         // no trusted way to fetch this package.
-        bail!("Lockfile entry has no integrity hash — delete forest-lock.json and re-run `forest install`");
+        bail!("Lockfile entry has no integrity hash. Delete forest-lock.json and re-run `forest install`");
     }
 
     // Ensure output directory exists
@@ -135,7 +135,7 @@ fn verify_integrity(bytes: &[u8], expected_sha256: &str) -> Result<()> {
     if !actual.eq_ignore_ascii_case(expected_sha256.trim()) {
         bail!(
             "Integrity check failed: expected sha256 {} but downloaded content hashes to {}. \
-             The package may have been tampered with — nothing was extracted.",
+             The package may have been tampered with; nothing was extracted.",
             expected_sha256, actual
         );
     }

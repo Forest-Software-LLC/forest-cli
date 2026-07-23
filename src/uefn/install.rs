@@ -41,7 +41,6 @@ pub async fn make_directories_uefn(
     root_deps: HashMap<String, DepSpec>,
     force: bool,
 ) -> Result<InstallSummary> {
-    // cwd is the manifest dir (Content/ - install_command descends there).
     let cwd = std::env::current_dir().context("Failed to read current directory")?;
     let project = super::find_project(&cwd).ok_or_else(|| {
         anyhow!(
@@ -49,6 +48,16 @@ pub async fn make_directories_uefn(
              Is forest.json inside a UEFN project's Content folder?"
         )
     })?;
+    // The mount, markers, and lockfile all live at the project's Content
+    // folder regardless of where install was invoked (e.g. inside an
+    // authored package, where the local manifest declares the dep but
+    // resolution is workspace-wide). Everything below is Content-relative,
+    // and the caller's subsequent forest-lock.json write lands here too.
+    if cwd != project.content_dir {
+        std::env::set_current_dir(&project.content_dir).with_context(|| {
+            format!("Failed to enter {}", project.content_dir.display())
+        })?;
+    }
     // Scoped markers embed the project's Verse path, which is why install
     // must be re-run after a project rename or first publish - regeneration
     // below self-heals the markers.
@@ -103,14 +112,14 @@ pub async fn make_directories_uefn(
 
     for path in &rec.blocked {
         warn(&format!(
-            "{} is expected from the lockfile but isn't Forest-managed (no install receipt) - \
-             move it out or remove the dependency; skipping. (--force never overwrites it either.)",
+            "{} is expected from the lockfile but isn't Forest-managed (no install receipt). \
+             Move it out or remove the dependency; skipping. --force never overwrites it either.",
             path
         ));
     }
     for path in &tree.unknown {
         warn(&format!(
-            "{} is neither installed nor authored - add a forest.json to make it an authored \
+            "{} is neither installed nor authored. Add a forest.json to make it an authored \
              package, or move it out of {}.",
             path, mount_name
         ));
@@ -264,7 +273,7 @@ pub async fn make_directories_uefn(
     // marker is gone; anything non-Forest inside keeps the dir alive.
     remove_empty_scope_dirs(&mount)?;
 
-    for warning in super::lint_root_function_defs(&cwd) {
+    for warning in super::lint_root_function_defs(&project.content_dir) {
         warn(&warning);
     }
 
