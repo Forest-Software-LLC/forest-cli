@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use urlencoding::encode;
 
-use crate::lockfile_gen::{LockFile, PACKAGES_DIR};
+use crate::lockfile_gen::LockFile;
+use crate::roblox::PACKAGES_DIR;
 use crate::lockfile_solver::DepSpec;
 use crate::utils::get_ci;
 

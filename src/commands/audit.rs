@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use urlencoding::encode;
 
 use crate::http::api_request;
-use crate::licensce_helper::{extract_license_info, LicenseInfo};
+use crate::license_helper::{extract_license_info, LicenseInfo};
 use crate::lockfile_gen::lockfile_gen;
 use crate::lockfile_solver::DepSpec;
 use crate::message::{self, Message, MessageType};

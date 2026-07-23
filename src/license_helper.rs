@@ -25,25 +25,6 @@ WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 "#;
 
-const SPDX_LICENSES: [&str; 15] = [
-    "MIT",
-    "Apache-2.0",
-    "GPL-3.0",
-    "GPL-2.0",
-    "MPL-2.0",
-    "ISC",
-    "Unlicense",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "LGPL-3.0",
-    "LGPL-2.1",
-    "AGPL-3.0",
-    "EPL-2.0",
-    "CDDL-1.0",
-    "Zlib",
-];
-
-
 pub fn get_mit_license_text(copyright_holder: &str) -> String {
     MIT_LICENSE_TEXT
         .replace("{YEAR}", &chrono::Utc::now().format("%Y").to_string())
@@ -63,32 +44,29 @@ fn find_license_file(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     return found_license_path;
 }
 
+/// Contract normalization: lowercase + collapse every whitespace run to a
+/// single space (the fingerprint phrases assume it - an MIT header split
+/// across lines must still match "mit license").
+fn normalize_license_text(text: &str) -> String {
+    text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Deterministic license-text identification via the shared contract's
+/// ORDERED fingerprint table (shared/contracts/licenses.json): the first
+/// rule whose `allOf` substrings are all present AND (`anyOf` absent or one
+/// present) wins. Order is load-bearing - AGPL/LGPL texts contain "general
+/// public license" too, so the specific rules come first. Same table, same
+/// semantics as forest-backend and forest-trust-gateway.
 fn infer_license(text: &str) -> Option<&'static str> {
-    let lc = text.to_ascii_lowercase();
-    if lc.contains("mit license") {
-        Some("MIT")
-    } else if lc.contains("apache license") && lc.contains("version 2.0") {
-        Some("Apache-2.0")
-    } else if lc.contains("gnu general public license") && lc.contains("version 3") {
-        Some("GPL-3.0")
-    } else if lc.contains("gnu general public license") && lc.contains("version 2") {
-        Some("GPL-2.0")
-    } else if lc.contains("mozilla public license") && lc.contains("2.0") {
-        Some("MPL-2.0")
-    } else if lc.contains("isc license") || lc.contains("permission to use, copy, modify, and/or distribute this software for any purpose with or without fee") {
-        Some("ISC")
-    } else if lc.contains("the unlicense") || lc.contains("this is free and unencumbered software released into the public domain") {
-        Some("Unlicense")
-    } else if lc.contains("redistribution and use in source and binary forms") {
-        // Very rough BSD heuristic
-        if lc.contains("neither the name") || lc.contains("3-clause") {
-            Some("BSD-3-Clause")
-        } else {
-            Some("BSD-2-Clause")
-        }
-    } else {
-        None
-    }
+    let norm = normalize_license_text(text);
+    crate::contracts::licenses()
+        .text_fingerprints
+        .iter()
+        .find(|f| {
+            f.all_of.iter().all(|s| norm.contains(s.as_str()))
+                && (f.any_of.is_empty() || f.any_of.iter().any(|s| norm.contains(s.as_str())))
+        })
+        .map(|f| f.id.as_str())
 }
 
 
@@ -128,14 +106,14 @@ impl LicenseInfo {
     pub fn headline(&self) -> String {
         match self.rating.as_str() {
             "unsafe" => format!(
-                "{} — license '{}' is a LEGAL RISK for closed-source games",
+                "{} - license '{}' is a LEGAL RISK for closed-source games",
                 self.label, self.license
             ),
             "caution" => format!(
-                "{} — license '{}' is usable with conditions",
+                "{} - license '{}' is usable with conditions",
                 self.label, self.license
             ),
-            _ => format!("{} — license '{}'", self.label, self.license),
+            _ => format!("{} - license '{}'", self.label, self.license),
         }
     }
 }
@@ -190,7 +168,7 @@ mod tests {
         assert!(info.is_flagged());
         assert_eq!(
             info.headline(),
-            "scope/pkg@1.2.3 — license 'GPL-3.0' is a LEGAL RISK for closed-source games"
+            "scope/pkg@1.2.3 - license 'GPL-3.0' is a LEGAL RISK for closed-source games"
         );
     }
 
@@ -204,7 +182,7 @@ mod tests {
         assert!(info.caveats.is_empty());
         assert_eq!(
             info.headline(),
-            "scope/pkg@2.0.0 — license 'Apache-2.0' is usable with conditions"
+            "scope/pkg@2.0.0 - license 'Apache-2.0' is usable with conditions"
         );
     }
 
@@ -218,12 +196,67 @@ mod tests {
             assert!(!info.is_flagged(), "rating {:?} must not be flagged", info.rating);
         }
     }
+
+    // ---- Shared-contract vectors (cross-language drift tripwire) -------------
+    // These are the canonical vectors every consumer asserts; a submodule bump
+    // that changes inference behavior fails here instead of drifting silently.
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LicenseVectors {
+        rating_lookups: Vec<(String, String)>,
+        inference: Vec<(String, Option<String>)>,
+    }
+
+    fn license_vectors() -> LicenseVectors {
+        serde_json::from_str(include_str!("../shared/contracts/licenses.vectors.json"))
+            .expect("licenses.vectors.json failed to parse")
+    }
+
+    #[test]
+    fn contract_inference_vectors_all_pass() {
+        for (text, expected) in license_vectors().inference {
+            assert_eq!(
+                infer_license(&text),
+                expected.as_deref(),
+                "inference mismatch for {:?}",
+                &text[..text.len().min(60)]
+            );
+        }
+    }
+
+    #[test]
+    fn contract_rating_ids_are_known_spdx() {
+        // The CLI has no local rating function - ratings are registry-side -
+        // so ratingLookups is asserted for id-membership only.
+        for (id, _) in license_vectors().rating_lookups {
+            if id == "NotARealLicense" {
+                continue;
+            }
+            assert!(
+                crate::contracts::licenses().spdx_licenses.contains(&id),
+                "rating vector id {} missing from spdxLicenses",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_spdx_canonicalizes_contract_ids() {
+        assert_eq!(sanitize_spdx("mit"), "MIT");
+        assert_eq!(sanitize_spdx("0bsd"), "0BSD");
+        assert_eq!(sanitize_spdx("cc-by-sa-4.0"), "CC-BY-SA-4.0");
+        assert_eq!(sanitize_spdx("Custom-Thing"), "Custom-Thing");
+    }
 }
 
 pub fn sanitize_spdx(license: &str) -> &str {
-    // Fix common mistakes such as lowercase, missing dashes, etc.
+    // Fix common mistakes such as lowercase, missing dashes, etc. The
+    // allowed-id list comes from the shared contract (single source of truth
+    // with the registry - includes 0BSD and CC-BY-SA-4.0 the old inline
+    // list lacked).
     let l = license.trim().to_uppercase();
-    for &spdx in &SPDX_LICENSES {
+    for spdx in &crate::contracts::licenses().spdx_licenses {
         if l == spdx.to_uppercase() {
             return spdx;
         }

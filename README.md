@@ -1,6 +1,6 @@
 # forest 🌲
 
-The command-line client for [Forest](https://forest.dev) — a package manager for Roblox.
+The command-line client for [Forest](https://forest.dev) - a package manager for Roblox.
 
 Forest handles the parts of dependency management that Luau tooling has historically left to chance: real semver resolution with a lockfile, license verification at publish time, and cryptographically verified installs and updates.
 
@@ -26,13 +26,14 @@ forest login                   # authenticate via the browser
 forest install scope/package   # add a dependency (alias: forest i, forest grow)
 forest install                 # install everything from the lockfile
 forest install --force         # reinstall from scratch, ignoring installed state
+forest install x/y --init uefn # no forest.json yet? create one for the platform and continue
 forest remove scope/package    # remove a dependency (alias: forest chop)
 forest publish                 # publish the current package
 forest audit                   # check dependencies for updates and license issues
 forest update                  # update the CLI itself
 ```
 
-Dependencies land in `packages/` with generated Luau pointer modules, so requiring them from your game code just works. `forest-lock.json` pins every transitive dependency to an exact version and content hash — commit it.
+Dependencies land in `packages/` with generated Luau pointer modules, so requiring them from your game code just works. `forest-lock.json` pins every transitive dependency to an exact version and content hash - commit it.
 
 Installs are incremental: packages already on disk that match the lockfile are skipped (each installed folder carries a tiny `.forest-receipt`, ignored by Rojo like LICENSE files), and downloaded archives are kept in a local content-addressed cache (`~/.forest/cache`, verified by SHA-256 on every read; set `FOREST_NO_CACHE=1` to disable). Forest writes nothing to your project root beyond `forest.json` and `forest-lock.json`.
 
@@ -41,7 +42,7 @@ Installs are incremental: packages already on disk that match the lockfile are s
 Forest treats its own infrastructure as untrusted:
 
 - **Installs are content-addressed.** The lockfile records each package's SHA-256; the CLI derives download locations from that hash and verifies every archive before extracting a single file. A compromised registry or CDN cannot alter a package your lockfile already pins.
-- **Updates are offline-signed.** `forest update` only accepts release manifests carrying a valid SSH signature from one of the release keys pinned in this source (see [src/release_verify.rs](src/release_verify.rs)). Signatures are produced on hardware keys that never touch CI or the release host — a compromise of either cannot push code to existing installs.
+- **Updates are offline-signed.** `forest update` only accepts release manifests carrying a valid SSH signature from one of the release keys pinned in this source (see [src/release_verify.rs](src/release_verify.rs)). Signatures are produced on hardware keys that never touch CI or the release host - a compromise of either cannot push code to existing installs.
 - **Builds are attested.** Release binaries carry GitHub build provenance; verify any downloaded binary with `gh attestation verify`.
 - **Nothing executes at install time.** Forest packages are pure Luau source. There is no install-script mechanism.
 
@@ -50,17 +51,20 @@ Found a security issue? Please report it privately.
 ## Building from source
 
 ```sh
+git submodule update --init    # shared/ = forest-shared-resources contracts (required)
 cargo build --release          # target/release/forest(.exe)
 cargo test
 ```
+
+The `shared/` submodule pins [forest-shared-resources](https://github.com/Forest-Software-LLC/forest-shared-resources) at a tagged release; its contract JSONs are embedded at compile time and asserted by unit tests, so the build fails loudly without the submodule.
 
 By default the CLI talks to the production API. Set `ENV=dev` to target a local backend (`localhost:3001`) instead.
 
 ## The Forest ecosystem
 
-- [forest.dev](https://forest.dev) — registry and web UI
-- [docs](https://docs.forest.dev) — documentation
-- `releases.forest.dev` — CLI releases and install scripts
+- [forest.dev](https://forest.dev) - registry and web UI
+- [docs](https://docs.forest.dev) - documentation
+- `releases.forest.dev` - CLI releases and install scripts
 
 ## License
 
