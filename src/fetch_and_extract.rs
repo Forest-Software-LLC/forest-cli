@@ -14,20 +14,20 @@ use indicatif::ProgressBar;
 use crate::cache::TarballCache;
 use crate::utils::sha256_hex;
 
-/// Reader wrapper that tracks progress and updates an indicatif ProgressBar.
+/// Reader wrapper that reports bytes transferred to an indicatif ProgressBar.
+/// Positions are raw byte counts (`{bytes}`/`{total_bytes}` in templates);
+/// the bar's length is set from Content-Length in `download_bytes`.
 struct ProgressReader<R> {
     inner: R,
     bar: ProgressBar,
-    total: u64,
     transferred: u64,
 }
 
 impl<R: Read> ProgressReader<R> {
-    fn new(inner: R, bar: ProgressBar, total: u64) -> Self {
+    fn new(inner: R, bar: ProgressBar) -> Self {
         ProgressReader {
             inner,
             bar,
-            total,
             transferred: 0,
         }
     }
@@ -36,10 +36,9 @@ impl<R: Read> ProgressReader<R> {
 impl<R: Read> Read for ProgressReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
-        if n > 0 && self.total > 0 {
+        if n > 0 {
             self.transferred += n as u64;
-            let pct = (self.transferred as f64 / self.total as f64 * 100.0).round() as u64;
-            self.bar.set_position(pct);
+            self.bar.set_position(self.transferred);
         }
         Ok(n)
     }
@@ -59,7 +58,6 @@ pub fn fetch_and_extract_verbatim(
     let bytes = obtain_verified_bytes(url, expected_sha256, out_dir, &bar, cache)?;
     extract_tgz_verbatim(bytes, out_dir)?;
 
-    bar.set_position(100);
     bar.finish();
 
     Ok(())
@@ -117,9 +115,12 @@ fn download_bytes(url: &str, bar: &ProgressBar) -> Result<Vec<u8>> {
     let total = resp
         .content_length()
         .unwrap_or(0);
+    if total > 0 {
+        bar.set_length(total);
+    }
 
     // Wrap response reader with progress
-    let mut reader = ProgressReader::new(resp, bar.clone(), total);
+    let mut reader = ProgressReader::new(resp, bar.clone());
 
     let mut bytes = Vec::with_capacity(total as usize);
     reader

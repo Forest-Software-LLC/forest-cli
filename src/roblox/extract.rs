@@ -30,8 +30,6 @@ pub fn fetch_and_extract(
     let bytes = obtain_verified_bytes(url, expected_sha256, out_dir, &bar, cache)?;
     extract_tgz(bytes, out_dir, archive_root)?;
 
-    // Ensure bar is complete
-    bar.set_position(100);
     bar.finish();
 
     Ok(())

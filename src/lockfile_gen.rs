@@ -110,7 +110,7 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
     let roots = Platform::parse(&platform)?.resolution_roots(roots)?;
 
     msg.update("Resolving dependencies...");
-    let (lockfile_packages, license_warnings, root_renames) = get_lockfile_packages(roots.clone(), platform.clone()).await
+    let (lockfile_packages, license_warnings, root_renames) = get_lockfile_packages(roots.clone(), platform.clone(), msg).await
         .context("Failed to resolve lockfile packages")?;
 
     // A claimed/renamed scope resolves under its old name but the lockfile is keyed by the canonical one. re-key the roots to match

@@ -326,8 +326,14 @@ async fn sync_from_lockfile(
         msg = Message::new("");
         if summary.installed == 0 {
             msg.finish(MessageType::Success, "Already up to date!");
-            return Ok(());
+        } else {
+            msg.finish(MessageType::Success, &format!(
+                "Installed {} package{}!",
+                summary.installed,
+                if summary.installed == 1 { "" } else { "s" }
+            ));
         }
+        return Ok(());
     } else {
         if lock_content.is_some() {
             msg.emit(

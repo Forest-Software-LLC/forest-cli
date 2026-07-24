@@ -22,6 +22,7 @@ use crate::roblox::plan::plan_install;
 use crate::roblox::PACKAGES_DIR;
 
 /// One tarball to download + extract, queued to the bounded worker pool.
+/// No bar here: the worker that picks the job up creates its progress line.
 struct DownloadJob {
     url: String,
     name: String,
@@ -29,7 +30,6 @@ struct DownloadJob {
     integrity: String,
     dir: PathBuf,
     root: String,
-    bar: ProgressBar,
 }
 
 pub async fn make_directories_roblox(
@@ -115,29 +115,58 @@ pub async fn make_directories_roblox(
         .collect();
     let mut private_iter = private_entries.into_iter();
     if let Some((pkg, ver, integrity)) = private_iter.next() {
-        let (key, url) = fetch_signed_url(pkg, ver, integrity, "roblox".to_string()).await?;
-        private_urls.insert(key, url);
+        // These round-trips run with the install spinner paused; a counter
+        // keeps the terminal alive while a tree of private packages authorizes.
+        let auth_bar = ProgressBar::new((private_iter.len() + 1) as u64);
+        auth_bar.set_style(
+            ProgressStyle::with_template("{spinner:.green} Authorizing private packages {pos}/{len}")?
+                .tick_strings(crate::message::TICK_STRINGS),
+        );
+        auth_bar.enable_steady_tick(std::time::Duration::from_millis(70));
 
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_WORKERS));
-        let mut tasks = tokio::task::JoinSet::new();
-        for (pkg, ver, integrity) in private_iter {
-            let semaphore = Arc::clone(&semaphore);
-            tasks.spawn(async move {
-                let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
-                fetch_signed_url(pkg, ver, integrity, "roblox".to_string()).await
-            });
-        }
-        while let Some(joined) = tasks.join_next().await {
-            let (key, url) = joined.map_err(|e| anyhow!("Signed-URL task panicked: {e}"))??;
+        // Collected (not `?`-propagated) so the bar's line is cleared before
+        // any error message prints under it.
+        let prefetch: Result<()> = async {
+            let (key, url) = fetch_signed_url(pkg, ver, integrity, "roblox".to_string()).await?;
             private_urls.insert(key, url);
-        }
+            auth_bar.inc(1);
+
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_WORKERS));
+            let mut tasks = tokio::task::JoinSet::new();
+            for (pkg, ver, integrity) in private_iter {
+                let semaphore = Arc::clone(&semaphore);
+                tasks.spawn(async move {
+                    let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+                    fetch_signed_url(pkg, ver, integrity, "roblox".to_string()).await
+                });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                let (key, url) = joined.map_err(|e| anyhow!("Signed-URL task panicked: {e}"))??;
+                private_urls.insert(key, url);
+                auth_bar.inc(1);
+            }
+            Ok(())
+        }.await;
+        auth_bar.finish_and_clear();
+        prefetch?;
     }
 
     // Download + extract only what reconciliation says is missing or changed.
     // The no-op path skips the MultiProgress entirely (no bar flash).
     if !to_install.is_empty() {
+        // Overall bar on top; each worker adds a byte-accurate line below it
+        // for the download it is actively running (created on pick-up,
+        // cleared on completion) — a big tree shows at most DOWNLOAD_WORKERS
+        // in-flight lines instead of one mostly-idle bar per package.
         let mp = MultiProgress::new();
-        let style = ProgressStyle::with_template("{bar:40.cyan/blue} {msg}")?
+        let total_bar = mp.add(ProgressBar::new(to_install.len() as u64));
+        total_bar.set_style(
+            ProgressStyle::with_template("{spinner:.green} Installing packages {bar:30.cyan/blue} {pos}/{len}")?
+                .progress_chars("=> ")
+                .tick_strings(crate::message::TICK_STRINGS),
+        );
+        total_bar.enable_steady_tick(std::time::Duration::from_millis(70));
+        let job_style = ProgressStyle::with_template("  {bar:30.cyan/blue} {bytes:>10} {wide_msg}")?
             .progress_chars("=> ");
 
         let mut jobs: Vec<DownloadJob> = Vec::new();
@@ -147,10 +176,6 @@ pub async fn make_directories_roblox(
             if !dir_path.exists() {
                 fs::create_dir_all(&dir_path)?;
             }
-
-            let bar = mp.add(ProgressBar::new(100));
-            bar.set_style(style.clone());
-            bar.set_message(format!("{} @ {}", pkg.name, pkg.version));
 
             // Public tarballs are content-addressed: the integrity hash IS the
             // path, so a lockfile can't point the CLI anywhere else.
@@ -172,7 +197,6 @@ pub async fn make_directories_roblox(
                 integrity: pkg.integrity.clone(),
                 dir: dir_path,
                 root: pkg.root.clone(),
-                bar,
             });
         }
 
@@ -188,12 +212,18 @@ pub async fn make_directories_roblox(
             let queue = Arc::clone(&queue);
             let first_err = Arc::clone(&first_err);
             let tarball_cache = tarball_cache.clone();
+            let mp = mp.clone();
+            let total_bar = total_bar.clone();
+            let job_style = job_style.clone();
             workers.push(std::thread::spawn(move || {
                 loop {
                     let job = queue.lock().expect("job queue poisoned").pop();
                     let Some(job) = job else { break };
-                    // Clear the bar even on failure, or its line sticks around
-                    // garbling everything printed after it.
+                    // Length 1 renders empty until download_bytes learns the
+                    // real size from Content-Length; cache hits never draw.
+                    let bar = mp.add(ProgressBar::new(1));
+                    bar.set_style(job_style.clone());
+                    bar.set_message(format!("{} @ {}", job.name, job.version));
                     // The receipt is written only after ITS dir extracted
                     // successfully — per-package atomicity: a dir without a
                     // receipt (crash, partial extract) is never trusted.
@@ -202,7 +232,7 @@ pub async fn make_directories_roblox(
                         &job.integrity,
                         &job.dir,
                         &job.root,
-                        job.bar.clone(),
+                        bar.clone(),
                         tarball_cache.as_ref(),
                     )
                     .and_then(|_| {
@@ -213,7 +243,11 @@ pub async fn make_directories_roblox(
                             root: job.root.clone(),
                         })
                     });
-                    job.bar.finish_and_clear();
+                    // Clear the bar even on failure, or its line sticks around
+                    // garbling everything printed after it.
+                    bar.finish_and_clear();
+                    mp.remove(&bar);
+                    total_bar.inc(1);
                     if let Err(e) = result {
                         first_err.lock().expect("error slot poisoned").get_or_insert(e);
                     }
@@ -228,6 +262,7 @@ pub async fn make_directories_roblox(
                 }
             }
         }
+        total_bar.finish_and_clear();
         let pool_err = first_err.lock().expect("error slot poisoned").take();
         if let Some(e) = pool_err {
             return Err(e);

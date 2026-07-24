@@ -22,6 +22,7 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use crate::http::{api_request, packages_api_request};
 use crate::license_helper::LicenseInfo;
+use crate::message::Message;
 use crate::utils::{digest_package_name, PackageName };
 
 /// Concurrent version-list prefetches in flight at once.
@@ -101,9 +102,12 @@ pub struct DepSpec {
 /// root manifest keys whose registry identity is a different package name
 /// entirely (claimed/renamed scopes, e.g. a wally scope claimed under a new
 /// username) — casing-only differences are not renames.
-pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform : String) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>)> {
+pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform : String, msg: &mut Message) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>)> {
     let mut resolved: ResolvedVersions = HashMap::new();
     let mut license_warnings: Vec<LicenseInfo> = Vec::new();
+    // Live spinner counter: versions whose metadata has been fetched. The BFS
+    // discovers the tree as it goes, so there is no fixed total to show.
+    let mut resolved_count: usize = 0;
 
     // Make queue with digest_package_name using normalized specs
     let mut queue: VecDeque<(PackageName, String, u8)> = root_deps.clone().into_iter()
@@ -134,6 +138,11 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
     while let Some((name, version_range, depth)) = queue.pop_front() {
         // Case variants of one package all land on the same lowercased key
         let key = name.full_name.to_lowercase();
+
+        msg.update(&format!(
+            "Resolving {} ({} resolved, {} queued)",
+            name.full_name, resolved_count, queue.len()
+        ));
 
         // fetch available versions (first encounter under any casing)
         if !resolved.contains_key(&key) {
@@ -245,6 +254,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         }
 
         vs.resolved = true;
+        resolved_count += 1;
 
         let license_info = crate::license_helper::extract_license_info(
             &package_info,

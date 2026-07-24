@@ -2,6 +2,11 @@ use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 
+/// Shared spinner frames so every live display (main spinner, install
+/// progress bars) animates identically. Last frame doubles as indicatif's
+/// finished state; all our bars finish_and_clear, so it never shows.
+pub const TICK_STRINGS: &[&str] = &["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+
 /// A simple spinner-based message utility, similar to Ora in JS.
 pub struct Message {
     spinner: ProgressBar,
@@ -40,7 +45,7 @@ impl Message {
         let style = ProgressStyle::with_template("{spinner:.green} {msg}")
             .unwrap()
             //.tick_strings(&["▂","▃","▅","▆","▇","█","▓","▒","░"," "]);
-            .tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]);
+            .tick_strings(TICK_STRINGS);
         spinner.set_style(style);
         spinner.enable_steady_tick(Duration::from_millis(70));
         spinner.set_message(message.to_string());
