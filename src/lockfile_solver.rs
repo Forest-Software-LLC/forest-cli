@@ -97,8 +97,11 @@ pub struct DepSpec {
 
 /// Resolves the dependency graph. Also returns license-safety issues for any
 /// resolved version the registry rated caution/unsafe — each version is fetched
-/// exactly once, so issues are naturally deduplicated.
-pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform : String) -> Result<(LockfilePackages, Vec<LicenseInfo>)> {
+/// exactly once, so issues are naturally deduplicated. The final map records
+/// root manifest keys whose registry identity is a different package name
+/// entirely (claimed/renamed scopes, e.g. a wally scope claimed under a new
+/// username) — casing-only differences are not renames.
+pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform : String) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>)> {
     let mut resolved: ResolvedVersions = HashMap::new();
     let mut license_warnings: Vec<LicenseInfo> = Vec::new();
 
@@ -403,10 +406,18 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         }
     }
 
+    // Root keys resolving to a different package name (scope claimed and
+    // renamed): the lockfile is keyed by the canonical name, so the caller
+    // must re-key its root deps or install planning can't map them back.
+    let mut root_renames: HashMap<String, String> = HashMap::new();
+
     for (name, dep_spec) in &root_deps {
         // Manifest keys may carry non-canonical casing (hand-edited or
         // pre-canonicalization installs) — the lowercased key still hits.
         if let Some(state) = resolved.get(&name.to_lowercase()) {
+            if !state.canonical.eq_ignore_ascii_case(name) {
+                root_renames.insert(name.clone(), state.canonical.clone());
+            }
             // Only get keys that satisfy the version range
             let req = VersionReq::parse(&dep_spec.version)
                 .with_context(|| format!("Invalid range {} for {}", dep_spec.version, name))?;
@@ -437,7 +448,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         }
     }
 
-    Ok((lockfile, license_warnings))
+    Ok((lockfile, license_warnings, root_renames))
 }
 
 

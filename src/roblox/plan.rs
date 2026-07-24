@@ -87,7 +87,12 @@ pub fn plan_install(lockfile: &LockFile, root_deps: &HashMap<String, DepSpec>) -
                     &path_parts.clone()[1..],
                 )?;
             } else if dir_pkg_name.is_empty() {
-                return Err(anyhow!("Failed to determine directory package name for {}", pkg_name));
+                return Err(anyhow!(
+                    "{} resolved to the root of the install tree but is not declared in forest.json. \
+                     If its scope was renamed (e.g. a claimed wally scope), update the dependency key \
+                     to the new name, or delete forest-lock.json and re-run `forest install`.",
+                    pkg_name
+                ));
             }
 
             let nested_sep = format!("/{}/", PACKAGES_DIR);
