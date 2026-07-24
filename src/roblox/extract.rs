@@ -39,8 +39,12 @@ pub fn fetch_and_extract(
 fn extract_tgz(bytes: Vec<u8>, out_dir: &Path, archive_root: &str) -> Result<()> {
     let decompressor = GzDecoder::new(Cursor::new(bytes));
 
-    // Extract tar archive
-    let root_path = Path::new(archive_root).to_path_buf();
+    // Tar entry paths are always forward-slashed, but versions published
+    // from Windows before the gateway normalized `root` carry backslash
+    // archiveRoots (e.g. `AnimNation\init.luau`) — on mac/linux that parses
+    // as a single component and the prefix matching below never fires.
+    let archive_root = archive_root.replace('\\', "/");
+    let root_path = Path::new(&archive_root).to_path_buf();
 
     // `archive_root` is the package's init file (e.g. `src/init.luau`). In Roblox a
     // folder module is `init.luau` plus its sibling files/subfolders, so the real
