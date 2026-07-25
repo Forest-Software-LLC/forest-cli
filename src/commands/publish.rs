@@ -63,7 +63,9 @@ fn version_builder(current_version: &str) -> String {
 
 /// Load ignore patterns from `.gitignore` and `.forestignore` (either may be
 /// absent). `.forestignore` is applied last so its patterns override `.gitignore`.
-fn load_forest_ignore(directory: &Path) -> Gitignore {
+/// `forced_patterns` (platform-mandated exclusions like Roblox's `Packages/`
+/// mount) go last of all, so no ignore file can whitelist them back in.
+fn load_forest_ignore(directory: &Path, forced_patterns: &[String]) -> Gitignore {
     let mut builder = GitignoreBuilder::new(directory);
 
     for ignore_name in [".gitignore", ".forestignore"] {
@@ -73,6 +75,12 @@ fn load_forest_ignore(directory: &Path) -> Gitignore {
             if let Some(err) = builder.add(&ignore_file) {
                 warn(&format!("Failed to parse {}: {}", ignore_name, err));
             }
+        }
+    }
+
+    for pattern in forced_patterns {
+        if let Err(err) = builder.add_line(None, pattern) {
+            warn(&format!("Failed to apply ignore pattern {}: {}", pattern, err));
         }
     }
 
@@ -468,8 +476,9 @@ pub async fn publish_command() -> Result<()> {
 
     let mut msg = Message::new("Got manifest, preparing tarball...");
 
-    // Prepare tarball
-    let matcher = load_forest_ignore(&cwd);
+    // Prepare tarball. Platform-mandated exclusions (Roblox: the Packages/
+    // mount + forest-lock.json when deps are declared) ride along here.
+    let matcher = load_forest_ignore(&cwd, &platform.publish_ignores(&forest_json));
 
     // Platform pre-pack lint: the gateway hard-rejects these files, but
     // warning BEFORE the upload is the better error location.
@@ -551,5 +560,51 @@ pub async fn publish_command() -> Result<()> {
         .context("Failed to write updated forest.json")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tarball_entries(dir: &Path, forced: &[String]) -> Vec<String> {
+        let matcher = load_forest_ignore(dir, forced);
+        let buf = create_tarball_buffer(dir, &matcher).unwrap();
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(buf.as_slice()));
+        let mut entries: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn forced_ignores_exclude_install_artifacts_and_beat_forestignore() {
+        let base = std::env::temp_dir().join(format!("forest-publish-ignore-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("src")).unwrap();
+        fs::create_dir_all(base.join("Packages").join("dep")).unwrap();
+        fs::write(base.join("forest.json"), "{}").unwrap();
+        fs::write(base.join("forest-lock.json"), "{}").unwrap();
+        fs::write(base.join("src").join("init.luau"), "return {}").unwrap();
+        fs::write(base.join("Packages").join("dep").join("init.lua"), "return {}").unwrap();
+        // A whitelist in .forestignore must NOT re-include forced exclusions.
+        fs::write(base.join(".forestignore"), "!Packages/\n!forest-lock.json\n").unwrap();
+
+        let forced = vec!["/Packages/".to_string(), "/forest-lock.json".to_string()];
+        assert_eq!(
+            tarball_entries(&base, &forced),
+            vec!["forest.json", "src/init.luau"]
+        );
+
+        // Without forced patterns the whitelist keeps them in (pre-existing
+        // behavior for dep-less manifests).
+        let entries = tarball_entries(&base, &[]);
+        assert!(entries.contains(&"Packages/dep/init.lua".to_string()));
+        assert!(entries.contains(&"forest-lock.json".to_string()));
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }
 

@@ -201,6 +201,17 @@ impl Platform {
         }
     }
 
+    /// Ignore patterns force-appended to the publish matcher AFTER
+    /// .gitignore/.forestignore, so they can't be un-ignored. Roblox excludes
+    /// the `Packages/` mount and `forest-lock.json` once the manifest
+    /// declares dependencies.
+    pub fn publish_ignores(&self, forest_json: &Value) -> Vec<String> {
+        match self {
+            Platform::Roblox => crate::roblox::publish::publish_ignores(forest_json),
+            Platform::Uefn => Vec::new(),
+        }
+    }
+
     /// Pre-pack warnings for files the registry will reject.
     pub fn prepack_warnings(&self, cwd: &Path, matcher: &Gitignore) -> Vec<String> {
         match self {

@@ -79,6 +79,25 @@ pub fn publish_preflight(cwd: &Path, forest_json: &mut Value) -> Result<Prefligh
     Ok(Preflight::Continue)
 }
 
+/// Ignore patterns forced onto the publish matcher: when the manifest
+/// declares dependencies, the hoisted install mount and the lockfile are
+/// install artifacts, not package content — consumers regenerate both from
+/// the manifest, and packing them would ship every resolved dependency
+/// inside the tarball.
+pub fn publish_ignores(forest_json: &Value) -> Vec<String> {
+    let has_deps = forest_json
+        .get("dependencies")
+        .and_then(Value::as_object)
+        .map_or(false, |deps| !deps.is_empty());
+    if !has_deps {
+        return Vec::new();
+    }
+    vec![
+        format!("/{}/", crate::roblox::PACKAGES_DIR),
+        "/forest-lock.json".to_string(),
+    ]
+}
+
 /// Roblox package-name rule: letter start, then letters/digits/`_`/`-`.
 pub fn validate_package_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
@@ -126,6 +145,19 @@ mod tests {
         assert!(validate_package_name("1thing").is_err());
         assert!(validate_package_name("_lead").is_err(), "must start with a letter");
         assert!(validate_package_name("a.b").is_err());
+    }
+
+    #[test]
+    fn publish_ignores_pack_artifacts_only_when_deps_declared() {
+        let with_deps = serde_json::json!({ "dependencies": { "roads": "^1.0.0" } });
+        assert_eq!(
+            publish_ignores(&with_deps),
+            vec!["/Packages/".to_string(), "/forest-lock.json".to_string()]
+        );
+
+        let empty_deps = serde_json::json!({ "dependencies": {} });
+        assert!(publish_ignores(&empty_deps).is_empty());
+        assert!(publish_ignores(&serde_json::json!({})).is_empty());
     }
 
     #[test]
