@@ -428,33 +428,19 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
             if !state.canonical.eq_ignore_ascii_case(name) {
                 root_renames.insert(name.clone(), state.canonical.clone());
             }
-            // Only get keys that satisfy the version range
             let req = VersionReq::parse(&dep_spec.version)
                 .with_context(|| format!("Invalid range {} for {}", dep_spec.version, name))?;
 
-            let mut versions: Vec<String> = state.versions.keys()
-                .filter(|v| req.matches(&Version::parse(v).unwrap()))
-                .cloned()
-                .collect();
+            // Use the version the lockfile actually holds for this root, not
+            // the max satisfying registry version. A dep's tighter constraint
+            // can merge the root into a lower bucket, and the registry max
+            // would then name a version with no lockfile entry, so build_tree
+            // silently no-ops and the root never gets planned.
+            let root_version = select_root_bucket(state.buckets.keys(), &req)
+                .ok_or_else(|| anyhow::anyhow!("No versions found for {} matching {}", name, dep_spec.version))?;
 
-            if versions.is_empty() {
-                return Err(anyhow::anyhow!("No versions found for {} matching {}", name, dep_spec.version));
-            }
-
-            versions.sort_by(|a,b| Version::parse(b).unwrap().cmp(&Version::parse(a).unwrap()));
-
-            if let Some(first) = versions.first() {
-                // Collect dependencies to avoid holding a mutable borrow during recursion
-                /*let deps: Vec<(String, String)> = normalized_root_deps.clone().iter()
-                    .map(|(dn, dv)| (dn.clone(), dv.version.clone()))
-                    .collect();
-
-                */
-                //let dep_names: Vec<String> = deps.iter().map(|(dn, _)| dn.clone()).collect();
-                //let _name_for_next =  get_dupe_name(name.clone(), dep_names);
-                // Lockfile keys are canonical — never the manifest's casing
-                build_tree(&state.canonical, &dep_spec.alias, first, "~", &mut lockfile);
-            }
+            // Lockfile keys use canonical casing, not the manifest's
+            build_tree(&state.canonical, &dep_spec.alias, &root_version, "~", &mut lockfile);
         }
     }
 
@@ -462,7 +448,57 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
 }
 
 
+/// Highest bucket version satisfying `req`. Roots processed by the BFS
+/// always have a matching bucket, so None is defensive.
+fn select_root_bucket<'a>(buckets: impl Iterator<Item = &'a String>, req: &VersionReq) -> Option<String> {
+    buckets
+        .filter_map(|v| Version::parse(v).ok().map(|parsed| (v, parsed)))
+        .filter(|(_, parsed)| req.matches(parsed))
+        .max_by(|(_, a), (_, b)| a.cmp(b))
+        .map(|(v, _)| v.clone())
+}
+
 pub async fn _test() -> Result<()> {
-   
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(range: &str) -> VersionReq {
+        VersionReq::parse(range).unwrap()
+    }
+
+    fn buckets(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn root_annotates_from_its_bucket_not_the_registry_max() {
+        // A dep's ~1.2.0 merged the root into the 1.2.3 bucket while the
+        // registry also has 1.5.0. Picking the registry max meant a version
+        // with no lockfile entry, so the root was never annotated.
+        let b = buckets(&["1.2.3"]);
+        assert_eq!(
+            select_root_bucket(b.iter(), &req("^1.0.0")),
+            Some("1.2.3".to_string())
+        );
+    }
+
+    #[test]
+    fn highest_matching_bucket_wins() {
+        let b = buckets(&["1.2.3", "2.0.0", "1.5.0"]);
+        assert_eq!(
+            select_root_bucket(b.iter(), &req("^1.0.0")),
+            Some("1.5.0".to_string())
+        );
+    }
+
+    #[test]
+    fn no_matching_bucket_is_none() {
+        let b = buckets(&["2.0.0"]);
+        assert_eq!(select_root_bucket(b.iter(), &req("^1.0.0")), None);
+    }
 }

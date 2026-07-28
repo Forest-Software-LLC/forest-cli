@@ -61,10 +61,40 @@ fn version_builder(current_version: &str) -> String {
 
 }
 
+/// Find README.md in any casing (readme.md, Readme.md, etc).
+fn find_readme(directory: &Path) -> Option<std::path::PathBuf> {
+    fs::read_dir(directory).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        let is_readme = path.is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .map_or(false, |n| n.eq_ignore_ascii_case("README.md"));
+        is_readme.then_some(path)
+    })
+}
+
+/// Scaffold README that publish offers to create.
+const README_SCAFFOLD: &str = "# Package README\n\nThis is the README for the package.";
+
+/// Whether a README has real content. Whitespace, markdown decoration, and
+/// the scaffold text don't count, so empty files and stubs fail.
+fn readme_is_substantial(contents: &str) -> bool {
+    const MIN_CONTENT_CHARS: usize = 30;
+    // Only count what the author actually wrote
+    let authored = contents
+        .replace("Package README", "")
+        .replace("This is the README for the package.", "");
+    let content_chars = authored
+        .chars()
+        .filter(|c| !c.is_whitespace() && !"#*-=_`>".contains(*c))
+        .count();
+    content_chars >= MIN_CONTENT_CHARS
+}
+
 /// Load ignore patterns from `.gitignore` and `.forestignore` (either may be
 /// absent). `.forestignore` is applied last so its patterns override `.gitignore`.
-/// `forced_patterns` (platform-mandated exclusions like Roblox's `Packages/`
-/// mount) go last of all, so no ignore file can whitelist them back in.
+/// `forced_patterns` go last of all so ignore files can't whitelist them back in.
 fn load_forest_ignore(directory: &Path, forced_patterns: &[String]) -> Gitignore {
     let mut builder = GitignoreBuilder::new(directory);
 
@@ -188,38 +218,6 @@ pub async fn publish_command() -> Result<()> {
     }
 
 
-    // Get readme if exists
-    let readme_path = cwd.join("README.md");
-    if readme_path.exists() {
-        let readme_contents = fs::read_to_string(&readme_path)
-            .context("Failed to read README.md")?;
-        metadata["readme"] = Value::String(readme_contents);
-    } else {
-        if metadata["public"] == Value::Bool(true) {
-            warn("No README.md found. It's required to include a README for public packages.");
-            let create_readme = Select::with_theme(&ColorfulTheme::default())
-                .with_prompt("Would you like Forest to insert an empty README.md?")
-                .default(0)
-                .items(&["Yes", "No, I'll add my own."])
-                .interact()?;
-
-            if create_readme == 0 {
-                fs::write(cwd.join("README.md"), "# Package README\n\nThis is the README for the package.".to_string())
-                    .context("Failed to write README.md")?;
-                info("Created empty README.md. Please edit it to include information about how to use your package.");
-                
-                return Ok(());
-            } else {
-                fail("Publishing cancelled. Please add a README.md and try again.");
-                return Ok(());
-            }
-        } else {
-            info("No README.md found. It's recommended to include a README for private packages, but not required.");
-            metadata["readme"] = Value::String(String::new());
-        }
-    }
-    
-
     // Fetch user info from API to see what orgs they are allowed to publish to.
 
     let (userdata_resp, _) = api_request(format!("v1/user/{}", current_user).as_str(), reqwest::Method::GET, None, None)
@@ -330,8 +328,12 @@ pub async fn publish_command() -> Result<()> {
 
         if status_code.is_success() {
             metadata["public"] = latest_package_data["public"].clone();
-            println!("Latest package visibility: {:?}", metadata["public"]);
-            // Do something with latest_package_data
+            if let Some(public) = metadata["public"].as_bool() {
+                info(&format!(
+                    "Existing package is {}; this version will keep that visibility.",
+                    if public { "public" } else { "private" }
+                ));
+            }
             if did_set_name_or_author {
                 let version_confirm = Select::with_theme(&ColorfulTheme::default())
                     .with_prompt(format!("Package @{}/{} already exists, publish package anyways?", forest_json["author"].as_str().unwrap(), forest_json["name"].as_str().unwrap()))
@@ -398,6 +400,44 @@ pub async fn publish_command() -> Result<()> {
             .interact()?;
 
         metadata["public"] = Value::Bool(public == 0);
+    }
+
+    // Must run after visibility is settled since the README requirement
+    // depends on it. Any earlier and metadata["public"] is still null,
+    // which reads as private.
+    match find_readme(&cwd) {
+        Some(readme_path) => {
+            let readme_contents = fs::read_to_string(&readme_path)
+                .context("Failed to read README.md")?;
+            if !readme_is_substantial(&readme_contents) {
+                fail("README.md is empty or nearly empty. Please describe what the package does and how to use it, then publish again.");
+                return Ok(());
+            }
+            metadata["readme"] = Value::String(readme_contents);
+        }
+        None if metadata["public"] == Value::Bool(true) => {
+            warn("No README.md found. It's required to include a README for public packages.");
+            let create_readme = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Would you like Forest to insert an empty README.md?")
+                .default(0)
+                .items(&["Yes", "No, I'll add my own."])
+                .interact()?;
+
+            if create_readme == 0 {
+                fs::write(cwd.join("README.md"), README_SCAFFOLD)
+                    .context("Failed to write README.md")?;
+                info("Created README.md. Fill it in with how to use your package. Publishing it unedited will be rejected.");
+
+                return Ok(());
+            } else {
+                fail("Publishing cancelled. Please add a README.md and try again.");
+                return Ok(());
+            }
+        }
+        None => {
+            info("No README.md found. It's recommended to include a README for private packages, but not required.");
+            metadata["readme"] = Value::String(String::new());
+        }
     }
 
 
@@ -577,6 +617,21 @@ mod tests {
             .collect();
         entries.sort();
         entries
+    }
+
+    #[test]
+    fn readme_substance_check_rejects_empty_and_stub_readmes() {
+        assert!(!readme_is_substantial(""));
+        assert!(!readme_is_substantial("   \n\n  \t"));
+        assert!(!readme_is_substantial("# MyPackage"));
+        assert!(!readme_is_substantial("# MyPackage\n\n---\n\n> \n"));
+        assert!(!readme_is_substantial(README_SCAFFOLD), "unedited scaffold must fail");
+        // Padding the scaffold with markdown decoration must not sneak past.
+        assert!(!readme_is_substantial(&format!("{}\n\n----\n####\n", README_SCAFFOLD)));
+
+        assert!(readme_is_substantial(
+            "# NavMesh\n\nGrid-based pathfinding for Roblox. Call NavMesh.new(grid) and :FindPath(a, b)."
+        ));
     }
 
     #[test]
