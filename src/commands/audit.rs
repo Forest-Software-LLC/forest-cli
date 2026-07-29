@@ -11,7 +11,7 @@ use crate::license_helper::{extract_license_info, LicenseInfo};
 use crate::lockfile_gen::lockfile_gen;
 use crate::lockfile_solver::DepSpec;
 use crate::message::{self, Message, MessageType};
-use crate::utils::{digest_package_name, get_ci, normalize_forest_deps};
+use crate::utils::{digest_package_name, get_ci, normalize_forest_deps, resolve_dep_ref, DepRef};
 
 struct AuditRow {
     name: String,
@@ -154,31 +154,63 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
         .and_then(|l| l.get("packages"))
         .and_then(Value::as_object);
 
+    // The reference may be the full scope/name, the alias, or the bare name.
     let target = match &target_package {
         None => AuditTarget::All,
-        Some(raw) => {
-            let name = raw.trim_start_matches('@');
-            if !name.contains('/') {
+        Some(raw) => match resolve_dep_ref(&roots, raw) {
+            DepRef::Match(key) => AuditTarget::Root(key),
+            DepRef::Ambiguous(candidates) => {
                 msg.finish(
-                    MessageType::Fail,
-                    &format!("Invalid package name '{}'. Use the full name: <scope>/<name>.", raw),
+                    MessageType::Warn,
+                    &format!(
+                        "\"{}\" matches more than one dependency: {}. Use the full <scope>/<name>.",
+                        raw,
+                        candidates.join(", ")
+                    ),
                 );
                 return Ok(());
             }
-            if let Some(key) = roots.keys().find(|k| k.eq_ignore_ascii_case(name)) {
-                AuditTarget::Root(key.clone())
-            } else if let Some(key) =
-                lock_packages.and_then(|pkgs| pkgs.keys().find(|k| k.eq_ignore_ascii_case(name)))
-            {
-                AuditTarget::Transitive(key.clone())
-            } else {
-                msg.finish(
-                    MessageType::Fail,
-                    &format!("Package {} is not a dependency of this project.", name),
-                );
-                return Ok(());
+            DepRef::NotFound => {
+                // Not a declared dep - maybe transitive, so try the
+                // lockfile's resolved tree (full key or bare name; lockfile
+                // entries carry no aliases).
+                let name = raw.trim_start_matches('@');
+                let candidates: Vec<&String> = lock_packages
+                    .map(|pkgs| {
+                        pkgs.keys()
+                            .filter(|k| {
+                                k.eq_ignore_ascii_case(name)
+                                    || (!name.contains('/')
+                                        && k.rsplit('/').next().map_or(false, |n| n.eq_ignore_ascii_case(name)))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match candidates.as_slice() {
+                    [key] => AuditTarget::Transitive((*key).clone()),
+                    [] => {
+                        msg.finish(
+                            MessageType::Fail,
+                            &format!("Package {} is not a dependency of this project.", name),
+                        );
+                        return Ok(());
+                    }
+                    many => {
+                        let mut keys: Vec<&str> = many.iter().map(|k| k.as_str()).collect();
+                        keys.sort();
+                        msg.finish(
+                            MessageType::Warn,
+                            &format!(
+                                "\"{}\" matches more than one dependency: {}. Use the full <scope>/<name>.",
+                                raw,
+                                keys.join(", ")
+                            ),
+                        );
+                        return Ok(());
+                    }
+                }
             }
-        }
+        },
     };
 
     let check_roots: Vec<(&String, &DepSpec)> = match &target {

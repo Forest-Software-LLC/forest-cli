@@ -4,12 +4,25 @@ use serde_json::{Value, Map};
 
 use crate::message::{Message, MessageType};
 use crate::lockfile_gen::{lockfile_gen};
+use crate::utils::{normalize_forest_deps, resolve_dep_ref, DepRef};
 
-/// Install dependencies for a forest package.
+/// Remove a dependency from a forest package.
 pub async fn remove_command(
     target_package: String,
 ) -> Result<()> {
     let mut msg = Message::new("Removing...");
+
+    // Same manifest discovery as install: some platforms keep forest.json
+    // away from the project root (UEFN: inside Content/).
+    if !Path::new("forest.json").exists() {
+        if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
+            std::env::set_current_dir(&manifest_dir)?;
+            msg.emit(
+                MessageType::Info,
+                &format!("Using manifest at {}", manifest_dir.join("forest.json").display()),
+            );
+        }
+    }
 
     // Ensure forest.json exists
     if !Path::new("forest.json").exists() {
@@ -27,23 +40,31 @@ pub async fn remove_command(
         info["dependencies"] = Value::Object(Map::new());
     }
 
-    let deps = info.get_mut("dependencies").unwrap().as_object_mut().unwrap();
-    // Case-insensitive removal
-    let existing_key = deps.keys()
-        .find(|k| k.eq_ignore_ascii_case(&target_package))
-        .cloned();
-    match existing_key {
-        None => {
+    // The reference may be the full scope/name, the alias, or the bare name.
+    let key = match resolve_dep_ref(&normalize_forest_deps(&info), &target_package) {
+        DepRef::NotFound => {
             msg.finish(
                 MessageType::Info,
                 &format!("Package {} is not installed.", target_package),
             );
             return Ok(());
         }
-        Some(key) => {
-            deps.remove(&key);
+        DepRef::Ambiguous(candidates) => {
+            msg.finish(
+                MessageType::Warn,
+                &format!(
+                    "\"{}\" matches more than one installed package: {}. Use the full <scope>/<name>.",
+                    target_package,
+                    candidates.join(", ")
+                ),
+            );
+            return Ok(());
         }
-    }
+        DepRef::Match(key) => key,
+    };
+
+    let deps = info.get_mut("dependencies").unwrap().as_object_mut().unwrap();
+    deps.remove(&key);
 
     info["dependencies"] = Value::Object(deps.clone());
 
@@ -58,7 +79,7 @@ pub async fn remove_command(
 
     msg.finish(
         MessageType::Success,
-        &format!("Package {} removed!", target_package),
+        &format!("Package {} removed!", key),
     );
 
     Ok(())

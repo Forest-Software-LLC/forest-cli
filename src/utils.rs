@@ -45,6 +45,64 @@ pub fn get_ci<'a, V>(map: &'a HashMap<String, V>, key: &str) -> Option<&'a V> {
     })
 }
 
+/// How a user-typed package reference resolved against the manifest's
+/// declared dependencies.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DepRef {
+    /// The manifest key it refers to.
+    Match(String),
+    NotFound,
+    /// A bare name that several declared packages answer to (their keys,
+    /// sorted) - the caller should warn and ask for the full <scope>/<name>.
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve a package reference against the declared dependencies. Accepts the
+/// full `scope/name` key, the install alias, or the bare package name - all
+/// case-insensitive, leading `@` ignored. Alias matches win over name-part
+/// matches (the alias is the name code requires by); the name part is only
+/// consulted when no declared alias claims the reference.
+pub fn resolve_dep_ref(roots: &HashMap<String, DepSpec>, reference: &str) -> DepRef {
+    let reference = reference.trim_start_matches('@');
+
+    if reference.contains('/') {
+        return match roots
+            .keys()
+            .find(|k| k.trim_start_matches('@').eq_ignore_ascii_case(reference))
+        {
+            Some(key) => DepRef::Match(key.clone()),
+            None => DepRef::NotFound,
+        };
+    }
+
+    // Deps without an explicit alias default it to their name part, so this
+    // covers the plain-name case too - and two scopes shipping the same
+    // name both land here, which is exactly the ambiguity to surface.
+    let alias_matches: Vec<&String> = roots
+        .iter()
+        .filter(|(_, spec)| spec.alias.eq_ignore_ascii_case(reference))
+        .map(|(k, _)| k)
+        .collect();
+    let matches = if alias_matches.is_empty() {
+        roots
+            .keys()
+            .filter(|k| k.rsplit('/').next().map_or(false, |n| n.eq_ignore_ascii_case(reference)))
+            .collect()
+    } else {
+        alias_matches
+    };
+
+    match matches.len() {
+        0 => DepRef::NotFound,
+        1 => DepRef::Match(matches[0].clone()),
+        _ => {
+            let mut keys: Vec<String> = matches.into_iter().cloned().collect();
+            keys.sort();
+            DepRef::Ambiguous(keys)
+        }
+    }
+}
+
 pub fn normalize_forest_deps(forest_json : &Value) -> HashMap<String, DepSpec> {
      let roots : HashMap<String, DepSpec> = forest_json
         .get("dependencies")
@@ -72,5 +130,71 @@ pub fn normalize_forest_deps(forest_json : &Value) -> HashMap<String, DepSpec> {
         }); 
 
     roots
-    
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roots(pairs: &[(&str, &str)]) -> HashMap<String, DepSpec> {
+        pairs
+            .iter()
+            .map(|(key, alias)| {
+                let alias = if alias.is_empty() {
+                    digest_package_name(key).name
+                } else {
+                    alias.to_string()
+                };
+                (key.to_string(), DepSpec { alias, version: "^1.0.0".to_string() })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_key_matches_case_insensitively() {
+        let r = roots(&[("Scope/Pkg", "")]);
+        assert_eq!(resolve_dep_ref(&r, "scope/pkg"), DepRef::Match("Scope/Pkg".into()));
+        assert_eq!(resolve_dep_ref(&r, "@scope/pkg"), DepRef::Match("Scope/Pkg".into()));
+        assert_eq!(resolve_dep_ref(&r, "other/pkg"), DepRef::NotFound);
+    }
+
+    #[test]
+    fn bare_name_matches_the_default_alias() {
+        let r = roots(&[("stratiz/Signal", ""), ("acme/Promise", "")]);
+        assert_eq!(resolve_dep_ref(&r, "signal"), DepRef::Match("stratiz/Signal".into()));
+        assert_eq!(resolve_dep_ref(&r, "Missing"), DepRef::NotFound);
+    }
+
+    #[test]
+    fn explicit_alias_matches_and_owns_the_local_name() {
+        // a/foo is locally known as "bar"; typing "foo" no longer means it.
+        let r = roots(&[("a/foo", "bar"), ("b/baz", "")]);
+        assert_eq!(resolve_dep_ref(&r, "bar"), DepRef::Match("a/foo".into()));
+        assert_eq!(resolve_dep_ref(&r, "foo"), DepRef::Match("a/foo".into()));
+    }
+
+    #[test]
+    fn alias_match_beats_another_packages_bare_name() {
+        // b/foo claimed "bar" as its alias; c/bar's name part also says
+        // "bar" but its alias points elsewhere. The alias holder wins.
+        let r = roots(&[("b/foo", "bar"), ("c/bar", "Something")]);
+        assert_eq!(resolve_dep_ref(&r, "bar"), DepRef::Match("b/foo".into()));
+    }
+
+    #[test]
+    fn same_name_across_scopes_is_ambiguous() {
+        let r = roots(&[("a/Signal", "SignalA"), ("b/Signal", "SignalB")]);
+        match resolve_dep_ref(&r, "signal") {
+            DepRef::Ambiguous(keys) => assert_eq!(keys, vec!["a/Signal".to_string(), "b/Signal".to_string()]),
+            other => panic!("expected Ambiguous, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn same_default_alias_across_scopes_is_ambiguous() {
+        // UEFN shape: no aliases exist, so both default to the name part.
+        let r = roots(&[("a/Signal", ""), ("b/Signal", "")]);
+        assert!(matches!(resolve_dep_ref(&r, "Signal"), DepRef::Ambiguous(_)));
+    }
 }
