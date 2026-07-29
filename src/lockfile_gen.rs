@@ -5,7 +5,7 @@
 //! `Platform::install` (src/platform.rs) — this module contains no
 //! platform-specific logic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -190,14 +190,20 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
 
     // Surface registry license-safety ratings for anything caution/unsafe in
     // the resolved tree (direct and transitive) before files land on disk.
-    // One line per package — the full caveats live in `forest audit`.
-    for warning in &license_warnings {
-        msg.emit(MessageType::Warn, &warning.headline());
-    }
+    // One consolidated line — per-package details live in `forest audit`.
     if !license_warnings.is_empty() {
+        let flagged: HashSet<&str> = license_warnings
+            .iter()
+            .map(|w| w.label.split('@').next().unwrap_or(&w.label))
+            .collect();
+        let count = flagged.len();
         msg.emit(
-            MessageType::Info,
-            "Run `forest audit` for license details (automated review, not legal advice).",
+            MessageType::Warn,
+            &format!(
+                "{} package{} license considerations, please run `forest audit` to view.",
+                count,
+                if count == 1 { " has" } else { "s have" }
+            ),
         );
     }
 

@@ -101,21 +101,6 @@ impl LicenseInfo {
     pub fn is_flagged(&self) -> bool {
         matches!(self.rating.as_str(), "unsafe" | "caution")
     }
-
-    /// One-line summary, suitable for install-time warnings.
-    pub fn headline(&self) -> String {
-        match self.rating.as_str() {
-            "unsafe" => format!(
-                "{}: license '{}' is a LEGAL RISK for closed-source games",
-                self.label, self.license
-            ),
-            "caution" => format!(
-                "{}: license '{}' is usable with conditions",
-                self.label, self.license
-            ),
-            _ => format!("{}: license '{}'", self.label, self.license),
-        }
-    }
 }
 
 /// Extract the license rating from a registry version-info response.
@@ -166,24 +151,16 @@ mod tests {
         assert_eq!(info.rating, "unsafe");
         assert_eq!(info.caveats.len(), 2);
         assert!(info.is_flagged());
-        assert_eq!(
-            info.headline(),
-            "scope/pkg@1.2.3: license 'GPL-3.0' is a LEGAL RISK for closed-source games"
-        );
     }
 
     #[test]
-    fn caution_is_flagged_with_softer_headline() {
+    fn caution_rating_is_flagged() {
         let info = extract_license_info(
             &json!({ "license": "Apache-2.0", "licenseRating": "caution" }),
             "scope/pkg@2.0.0",
         );
         assert!(info.is_flagged());
         assert!(info.caveats.is_empty());
-        assert_eq!(
-            info.headline(),
-            "scope/pkg@2.0.0: license 'Apache-2.0' is usable with conditions"
-        );
     }
 
     #[test]

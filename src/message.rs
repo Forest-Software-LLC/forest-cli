@@ -29,7 +29,7 @@ pub fn fail(text: &str) {
 }
 
 pub fn warn(text: &str) {
-    println!("{} {}", "⚠️ ".yellow(), text.yellow().bold());
+    println!("{} {}", "⚠️ ".yellow(), text.yellow());
 }
 
 pub fn info(text: &str) {
