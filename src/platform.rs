@@ -46,8 +46,10 @@ pub enum InitMode {
     Package,
     /// `forest init --project` and install's create-on-install path: a bare
     /// consuming manifest (dependencies + platform), no package prompts.
-    /// Must stay safe in non-interactive terminals.
-    Project,
+    /// Must stay safe in non-interactive terminals. `from_install` marks the
+    /// create-on-install path, where the "run `forest install`" follow-up
+    /// hint would be nonsense (the install continues immediately).
+    Project { from_install: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

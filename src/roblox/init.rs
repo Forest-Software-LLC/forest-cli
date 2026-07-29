@@ -73,10 +73,12 @@ pub fn init(cwd: &Path, mode: InitMode) -> Result<()> {
     }
 
     match mode {
-        InitMode::Project => {
+        InitMode::Project { from_install } => {
             scaffold_project(cwd, dependencies, license)?;
             success(&format!("Initialized a new project in {}", cwd.display()));
-            info("You can now run `forest install` to install dependencies!");
+            if !from_install {
+                info("You can now run `forest install` to install dependencies!");
+            }
         }
         InitMode::Package => {
             // Both prompts `?`-propagate: package authoring is inherently

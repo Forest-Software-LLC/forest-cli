@@ -66,7 +66,7 @@ pub async fn init(cwd: &Path, mode: InitMode) -> Result<()> {
     // inside the mount (install's create-on-install path calls this — the
     // triage's NewPackage arm would otherwise demand a login and prompt in
     // the middle of an install).
-    let target = if mode == InitMode::Project {
+    let target = if matches!(mode, InitMode::Project { .. }) {
         match super::find_project(cwd) {
             Some(project) if project.project_root == cwd => {
                 UefnInitTarget::Project { dir: project.content_dir, found_project: true }
@@ -175,7 +175,9 @@ pub async fn init(cwd: &Path, mode: InitMode) -> Result<()> {
             }
 
             success(&format!("Initialized a new UEFN project manifest in {}", dir.display()));
-            info("You can now run `forest install <scope>/<name>` to add packages!");
+            if !matches!(mode, InitMode::Project { from_install: true }) {
+                info("You can now run `forest install <scope>/<name>` to add packages!");
+            }
         }
     }
     Ok(())
@@ -386,7 +388,7 @@ mod tests {
         let pkg = base.join("Content").join("ForestPackages").join("myscope").join("MyPkg");
         fs::create_dir_all(&pkg).unwrap();
 
-        init(&pkg, InitMode::Project).await.unwrap();
+        init(&pkg, InitMode::Project { from_install: true }).await.unwrap();
 
         assert!(!pkg.join("README.md").exists(), "no package scaffold in project mode");
         let manifest: serde_json::Value =

@@ -56,7 +56,7 @@ pub async fn install_command(
             }
         };
         if let Some(plat) = chosen_platform {
-            plat.init(&std::env::current_dir()?, crate::platform::InitMode::Project).await?;
+            plat.init(&std::env::current_dir()?, crate::platform::InitMode::Project { from_install: true }).await?;
             // The scaffold may have placed the manifest elsewhere
             // (UEFN: Content/) - re-run discovery to land on it.
             if !Path::new("forest.json").exists() {

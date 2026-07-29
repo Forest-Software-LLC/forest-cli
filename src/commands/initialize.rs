@@ -28,6 +28,6 @@ pub async fn init_command(platform: Option<String>, project: bool) -> Result<()>
         None => Platform::detect_or_prompt(&cwd)?,
     };
 
-    let mode = if project { InitMode::Project } else { InitMode::Package };
+    let mode = if project { InitMode::Project { from_install: false } } else { InitMode::Package };
     platform.init(&cwd, mode).await
 }
