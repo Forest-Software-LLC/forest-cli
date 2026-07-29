@@ -56,7 +56,7 @@ pub async fn install_command(
             }
         };
         if let Some(plat) = chosen_platform {
-            plat.init(&std::env::current_dir()?).await?;
+            plat.init(&std::env::current_dir()?, crate::platform::InitMode::Project).await?;
             // The scaffold may have placed the manifest elsewhere
             // (UEFN: Content/) - re-run discovery to land on it.
             if !Path::new("forest.json").exists() {
@@ -213,7 +213,7 @@ pub async fn install_command(
                 MessageType::Info,
                 &format!("Package {} is already in forest.json. Verifying installed packages...", existing_key),
             );
-            sync_from_lockfile(&info, &platform, msg, force).await?;
+            sync_from_lockfile(&info, msg, force).await?;
             return Ok(());
         }
 
@@ -285,7 +285,7 @@ pub async fn install_command(
         }
     } else {
         // No specific package: install all via lockfile
-        sync_from_lockfile(&info, &platform, msg, force).await?;
+        sync_from_lockfile(&info, msg, force).await?;
     }
 
     Ok(())
@@ -298,7 +298,6 @@ pub async fn install_command(
 /// reconciliation reinstalls it).
 async fn sync_from_lockfile(
     info: &Value,
-    platform: &str,
     mut msg: Message,
     force: bool,
 ) -> Result<()> {
@@ -321,7 +320,7 @@ async fn sync_from_lockfile(
 
     if usable {
         msg.destroy();
-        let summary = make_directories(&serde_json::from_value(lock_content.unwrap()).unwrap(), normalize_forest_deps(&info.clone()), platform, force).await?;
+        let summary = make_directories(&serde_json::from_value(lock_content.unwrap()).unwrap(), normalize_forest_deps(&info.clone()), info, force).await?;
 
         msg = Message::new("");
         if summary.installed == 0 {

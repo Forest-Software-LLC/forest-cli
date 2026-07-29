@@ -71,9 +71,13 @@ pub fn publish_preflight(cwd: &Path, forest_json: &mut Value) -> Result<Prefligh
             })
             .interact_text()?;
 
-        forest_json["root"] = Value::String(target_root);
+        // Forward slashes always: a backslash root published from Windows
+        // never prefix-matches on extraction elsewhere (see extract.rs).
+        forest_json["root"] = Value::String(target_root.replace('\\', "/"));
     } else {
-        forest_json["root"] = Value::String(init_lua_path.strip_prefix(cwd).unwrap().to_string_lossy().to_string());
+        forest_json["root"] = Value::String(
+            init_lua_path.strip_prefix(cwd).unwrap().to_string_lossy().replace('\\', "/"),
+        );
     }
 
     Ok(Preflight::Continue)
@@ -83,7 +87,8 @@ pub fn publish_preflight(cwd: &Path, forest_json: &mut Value) -> Result<Prefligh
 /// declares dependencies, the hoisted install mount and the lockfile are
 /// install artifacts, not package content — consumers regenerate both from
 /// the manifest, and packing them would ship every resolved dependency
-/// inside the tarball.
+/// inside the tarball. The mount lives wherever the manifest's `root` puts
+/// it (e.g. `src/Packages/`), so the pattern is derived, not hardcoded.
 pub fn publish_ignores(forest_json: &Value) -> Vec<String> {
     let has_deps = forest_json
         .get("dependencies")
@@ -93,7 +98,7 @@ pub fn publish_ignores(forest_json: &Value) -> Vec<String> {
         return Vec::new();
     }
     vec![
-        format!("/{}/", crate::roblox::PACKAGES_DIR),
+        format!("/{}/", crate::roblox::packages_base(forest_json)),
         "/forest-lock.json".to_string(),
     ]
 }
@@ -111,14 +116,11 @@ pub fn validate_package_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Hyphenated names can't be dot-indexed in Luau, so discourage without
-/// rejecting.
-pub fn name_advisory(name: &str) -> Option<String> {
-    if !name.contains('-') {
-        return None;
-    }
-    let pascal: String = name
-        .split('-')
+/// PascalCase a package name into a valid Luau identifier (hyphen segments
+/// joined and capitalized: "nav-mesh" -> "NavMesh"). Shared by the hyphen
+/// advisory and init's starter-module scaffold.
+pub(crate) fn pascal_ident(name: &str) -> String {
+    name.split('-')
         .map(|part| {
             let mut c = part.chars();
             match c.next() {
@@ -126,10 +128,18 @@ pub fn name_advisory(name: &str) -> Option<String> {
                 None => String::new(),
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Hyphenated names can't be dot-indexed in Luau, so discourage without
+/// rejecting.
+pub fn name_advisory(name: &str) -> Option<String> {
+    if !name.contains('-') {
+        return None;
+    }
     Some(format!(
         "warning: hyphenated package names can't be dot-indexed in Luau requires; consider PascalCase (e.g. \"{}\")",
-        pascal
+        pascal_ident(name)
     ))
 }
 
@@ -158,6 +168,29 @@ mod tests {
         let empty_deps = serde_json::json!({ "dependencies": {} });
         assert!(publish_ignores(&empty_deps).is_empty());
         assert!(publish_ignores(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn publish_ignores_follow_the_root_mount() {
+        // A nested root moves the mount inside the root dir; the exclusion
+        // must move with it or the tarball ships every installed dependency.
+        let nested = serde_json::json!({
+            "dependencies": { "roads": "^1.0.0" },
+            "root": "src/init.luau"
+        });
+        assert_eq!(
+            publish_ignores(&nested),
+            vec!["/src/Packages/".to_string(), "/forest-lock.json".to_string()]
+        );
+
+        let top_level = serde_json::json!({
+            "dependencies": { "roads": "^1.0.0" },
+            "root": "init.luau"
+        });
+        assert_eq!(
+            publish_ignores(&top_level),
+            vec!["/Packages/".to_string(), "/forest-lock.json".to_string()]
+        );
     }
 
     #[test]

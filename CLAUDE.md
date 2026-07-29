@@ -9,7 +9,7 @@ The `forest` command-line package manager for **forestpm** (Roblox packages). Ru
 |---------|---------|------|
 | `login` | | [commands/login.rs](src/commands/login.rs) — opens the browser to `FRONTEND_URL/auth/verify/cli`, stores the token |
 | `publish` | | [commands/publish.rs](src/commands/publish.rs) — tars the package (respecting `.forestignore`) and uploads |
-| `init` | | [commands/initialize.rs](src/commands/initialize.rs) — scaffolds `forest.json` |
+| `init` | | [commands/initialize.rs](src/commands/initialize.rs) — package-authoring scaffold (name/root prompts, starter root module, `root` in forest.json, Packages mounted inside the root dir); `--project` = bare consuming manifest (also what install's create-on-install uses) |
 | `install [pkg]` | `i`, `grow` | [commands/install.rs](src/commands/install.rs) — `-v/--version`, `-a/--alias`, `-f/--force` (full reinstall) |
 | `remove <pkg>` | `chop` | [commands/remove.rs](src/commands/remove.rs) |
 
@@ -17,7 +17,7 @@ The `forest` command-line package manager for **forestpm** (Roblox packages). Ru
 - [src/http.rs](src/http.rs) — API client wrapper. Shared `OnceLock` clients (keep-alive + timeouts): async for API calls, blocking for tarball downloads (gzip OFF there — transparent decompression would break integrity hashing).
 - [src/tokens.rs](src/tokens.rs) — auth-token storage (home dir via the `dirs` crate).
 - [src/lockfile_gen.rs](src/lockfile_gen.rs) + [src/lockfile_solver.rs](src/lockfile_solver.rs) — dependency resolution (`semver` + `version-ranges`) + install execution. Version lists prefetch concurrently; the BFS awaits memoized handles at the original points, so lockfiles stay deterministic. Downloads run on a bounded 8-worker pool.
-- [src/install_plan.rs](src/install_plan.rs) — pure path/pointer planning (no IO); layout pinned by unit tests.
+- [src/roblox/plan.rs](src/roblox/plan.rs) — pure path/pointer planning (no IO); layout pinned by unit tests. Plan paths stay in the virtual `./Packages/...` format; the physical mount (`packages_base` in [src/roblox/mod.rs](src/roblox/mod.rs): `<parent-of-root>/Packages`, e.g. `src/Packages` for root `src/init.luau`) is applied only at execution points in [src/roblox/install.rs](src/roblox/install.rs).
 - [src/receipts.rs](src/receipts.rs) — incremental installs with **zero files outside `Packages/`**: each installed dir carries a `.forest-receipt` (extension-less ⇒ Rojo-ignored, like LICENSE) written after its extraction succeeds; pointer dirs are recognized by their generated init.lua header. Install = scan tree → reconcile vs plan: matching `(integrity, root)` receipts are kept, stale forest-managed dirs deleted, receipt-less dirs never trusted (covers crashes, branch switches, pre-receipt trees). Nested packages can't be kept when an ancestor reinstalls. `--force` ignores all receipts.
 - [src/cache.rs](src/cache.rs) — content-addressed tarball cache at `~/.forest/cache/<sha256>.tgz` (re-verified on every read; corrupt ⇒ delete + redownload). `FOREST_CACHE_DIR` overrides, `FOREST_NO_CACHE=1` disables. Private packages are cached too (hash is the trust anchor; access enforced at first download).
 - [src/fetch_and_extract.rs](src/fetch_and_extract.rs) — cache lookup → download → sha256 verify → unpack (`tar` + `flate2`).
@@ -53,5 +53,6 @@ cargo build --release      # target/release/forest(.exe)
 
 ## Gotchas
 - `licensce_helper.rs` is misspelled in the filename; match it exactly when importing.
-- Install state lives ONLY inside `Packages/` (per-dir `.forest-receipt` files) — nothing is written to the project root besides forest.json/forest-lock.json. Deleting a package dir deletes its receipt with it; `install --force` reinstalls everything.
-- `Packages/` entries starting with `_` or `.` are never touched (Wally `_Index` coexistence).
+- Install state lives ONLY inside the Packages mount (per-dir `.forest-receipt` files) — nothing is written to the project root besides forest.json/forest-lock.json. Deleting a package dir deletes its receipt with it; `install --force` reinstalls everything.
+- The mount's location follows forest.json's `root`: manifests with a nested root (package authoring) install to `<root-parent>/Packages`; root-less manifests (projects) keep `./Packages`. forest-lock.json always stays at the manifest dir.
+- Mount entries starting with `_` or `.` are never touched (Wally `_Index` coexistence).

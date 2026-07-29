@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use crate::http::api_request;
 use crate::message::{info, success, warn};
+use crate::platform::InitMode;
 
 /// What a `forest init -p uefn` should scaffold at `cwd`.
 enum UefnInitTarget {
@@ -59,8 +60,24 @@ fn infer_uefn_target(cwd: &Path) -> UefnInitTarget {
     UefnInitTarget::Project { dir: cwd.to_path_buf(), found_project: false }
 }
 
-pub async fn init(cwd: &Path) -> Result<()> {
-    match infer_uefn_target(cwd) {
+pub async fn init(cwd: &Path, mode: InitMode) -> Result<()> {
+    // Project mode skips the position triage entirely: it must produce the
+    // bare project manifest without prompts or login, even when run from
+    // inside the mount (install's create-on-install path calls this — the
+    // triage's NewPackage arm would otherwise demand a login and prompt in
+    // the middle of an install).
+    let target = if mode == InitMode::Project {
+        match super::find_project(cwd) {
+            Some(project) if project.project_root == cwd => {
+                UefnInitTarget::Project { dir: project.content_dir, found_project: true }
+            }
+            Some(_) => UefnInitTarget::Project { dir: cwd.to_path_buf(), found_project: true },
+            None => UefnInitTarget::Project { dir: cwd.to_path_buf(), found_project: false },
+        }
+    } else {
+        infer_uefn_target(cwd)
+    };
+    match target {
         UefnInitTarget::Package { name } => {
             if cwd.join("forest.json").exists() {
                 warn("forest.json already exists here. Please remove it before initializing.");
@@ -340,7 +357,7 @@ mod tests {
         let pkg = base.join("Content").join("ForestPackages").join("myscope").join("bad-name");
         fs::create_dir_all(&pkg).unwrap();
 
-        init(&pkg).await.unwrap();
+        init(&pkg, InitMode::Package).await.unwrap();
         assert!(!pkg.join("forest.json").exists(), "invalid folder name must not scaffold");
         let _ = fs::remove_dir_all(&base);
     }
@@ -350,12 +367,32 @@ mod tests {
         let base = fixture("proj-scaffold");
         make_project(&base);
 
-        init(&base).await.unwrap();
+        init(&base, InitMode::Package).await.unwrap();
 
         let content = base.join("Content");
         assert!(content.join("forest.json").exists());
         assert!(content.join("ForestPackages").exists(), "the mount is pre-created so authoring is one cd away");
         assert!(!content.join("Packages").exists(), "no Roblox mount on a UEFN project");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn project_mode_bypasses_the_package_triage() {
+        // Install's create-on-install runs in Project mode; even from a
+        // package position inside the mount it must produce the bare project
+        // manifest (never the login-requiring NewPackage/Package arms).
+        let base = fixture("proj-mode");
+        make_project(&base);
+        let pkg = base.join("Content").join("ForestPackages").join("myscope").join("MyPkg");
+        fs::create_dir_all(&pkg).unwrap();
+
+        init(&pkg, InitMode::Project).await.unwrap();
+
+        assert!(!pkg.join("README.md").exists(), "no package scaffold in project mode");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(pkg.join("forest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["platform"], "uefn");
+        assert!(manifest.get("name").is_none());
         let _ = fs::remove_dir_all(&base);
     }
 }

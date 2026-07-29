@@ -38,6 +38,18 @@ pub fn discover_manifest_dir(start: &Path) -> Option<PathBuf> {
     crate::uefn::discover_manifest_dir(start)
 }
 
+/// What a `forest init` should scaffold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitMode {
+    /// `forest init`: start authoring a new package (name/version/root
+    /// scaffold, Packages mounted inside the root dir).
+    Package,
+    /// `forest init --project` and install's create-on-install path: a bare
+    /// consuming manifest (dependencies + platform), no package prompts.
+    /// Must stay safe in non-interactive terminals.
+    Project,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     Roblox,
@@ -147,15 +159,18 @@ impl Platform {
     }
 
     /// Execute an install plan: layout, extraction, bookkeeping, and
-    /// post-install UX are wholly owned by the platform module.
+    /// post-install UX are wholly owned by the platform module. The manifest
+    /// rides along because layout can depend on it (Roblox mounts Packages/
+    /// inside the `root` dir); UEFN ignores it.
     pub async fn install(
         &self,
         lockfile: &LockFile,
         root_deps: HashMap<String, DepSpec>,
+        manifest: &Value,
         force: bool,
     ) -> Result<InstallSummary> {
         match self {
-            Platform::Roblox => crate::roblox::install::make_directories_roblox(lockfile, root_deps, force).await,
+            Platform::Roblox => crate::roblox::install::make_directories_roblox(lockfile, root_deps, manifest, force).await,
             Platform::Uefn => crate::uefn::install::make_directories_uefn(lockfile, root_deps, force).await,
         }
     }
@@ -223,10 +238,10 @@ impl Platform {
     /// The `forest init` scaffold for this platform. Async because some
     /// scaffolds consult the registry (UEFN's scope picker offers the same
     /// author list as publish).
-    pub async fn init(&self, cwd: &Path) -> Result<()> {
+    pub async fn init(&self, cwd: &Path, mode: InitMode) -> Result<()> {
         match self {
-            Platform::Roblox => crate::roblox::init::init(cwd),
-            Platform::Uefn => crate::uefn::init::init(cwd).await,
+            Platform::Roblox => crate::roblox::init::init(cwd, mode),
+            Platform::Uefn => crate::uefn::init::init(cwd, mode).await,
         }
     }
 

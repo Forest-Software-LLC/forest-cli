@@ -35,6 +35,7 @@ struct DownloadJob {
 pub async fn make_directories_roblox(
     lockfile: &LockFile,
     root_deps: HashMap<String, DepSpec>,
+    manifest: &serde_json::Value,
     force: bool,
 ) -> Result<InstallSummary> {
     // `_`/`.`-prefixed folders in packages/ are exempt from install cleanup
@@ -48,22 +49,35 @@ pub async fn make_directories_roblox(
         }
     }
 
-    // All path/pointer computation is pure and lives in roblox/plan.rs.
+    // All path/pointer computation is pure and lives in roblox/plan.rs; plan
+    // paths stay in the virtual `./Packages/...` format and are mapped onto
+    // the physical mount (derived from the manifest's `root`) only here.
     let plan = plan_install(lockfile, &root_deps)?;
+    let base = crate::roblox::packages_base(manifest);
 
-    if !Path::new(PACKAGES_DIR).exists() {
-        fs::create_dir_all(PACKAGES_DIR)?;
+    // A manifest that gained a nested root (first publish / new init) can
+    // leave a top-level mount from earlier installs behind; it's outside this
+    // run's managed tree, so just point at it (it may also be Wally's).
+    if base != PACKAGES_DIR && Path::new(PACKAGES_DIR).is_dir() {
+        crate::message::warn(&format!(
+            "Dependencies now install to {}/; the old {}/ directory is no longer managed and can be deleted if Wally isn't using it.",
+            base, PACKAGES_DIR
+        ));
+    }
+
+    if !Path::new(&base).exists() {
+        fs::create_dir_all(&base)?;
     }
 
     // The tree describes itself: every installed dir carries a
     // `.forest-receipt` (written after its extraction succeeded) and pointer
     // dirs are recognized by their generated header — no bookkeeping outside
-    // Packages/. `--force` simply refuses to trust any of it, and a tree from
+    // the mount. `--force` simply refuses to trust any of it, and a tree from
     // an older forest (no receipts) reinstalls everything the same way.
     let tree = if force {
         crate::roblox::receipts::TreeScan::default()
     } else {
-        crate::roblox::receipts::scan(Path::new(PACKAGES_DIR))
+        crate::roblox::receipts::scan(Path::new(&base))
     };
     let rec = crate::roblox::receipts::reconcile(&plan, &tree);
     let (to_install, kept, stale_dirs) = (rec.to_install, rec.kept, rec.stale_dirs);
@@ -72,21 +86,21 @@ pub async fn make_directories_roblox(
     // renamed alias's old dir would otherwise delete the freshly extracted
     // new one. exists() guard: children of already-deleted parents are gone.
     for dir in &stale_dirs {
-        let p = Path::new(dir);
+        let p = crate::roblox::physical_path(&base, dir);
         if p.exists() {
-            fs::remove_dir_all(p).with_context(|| format!("Failed to remove stale {}", dir))?;
+            fs::remove_dir_all(&p).with_context(|| format!("Failed to remove stale {}", dir))?;
         }
     }
 
-    // The top level of Packages/ stays fully managed: any non-exempt dir that
+    // The top level of the mount stays fully managed: any non-exempt dir that
     // isn't a desired root alias is junk or a pre-receipt leftover. (This is
     // also what clears old trees on --force and first-run-after-upgrade.)
-    prune_top_level(&plan)?;
+    prune_top_level(&plan, &base)?;
 
     // A reinstall target may hold old content (integrity/root changed) —
     // clear it before extraction.
     for &i in &to_install {
-        let target = PathBuf::from(&plan.packages[i].path);
+        let target = crate::roblox::physical_path(&base, &plan.packages[i].path);
         if target.exists() {
             fs::remove_dir_all(&target)
                 .with_context(|| format!("Failed to clear {}", plan.packages[i].path))?;
@@ -172,7 +186,7 @@ pub async fn make_directories_roblox(
         let mut jobs: Vec<DownloadJob> = Vec::new();
         for &i in &to_install {
             let pkg = &plan.packages[i];
-            let dir_path = PathBuf::from(&pkg.path);
+            let dir_path = crate::roblox::physical_path(&base, &pkg.path);
             if !dir_path.exists() {
                 fs::create_dir_all(&dir_path)?;
             }
@@ -272,9 +286,9 @@ pub async fn make_directories_roblox(
     // Pointer files are always regenerated: a few tiny idempotent writes,
     // self-healing, and immune to hoist-layout drift.
     for pointer in &plan.pointers {
-        let target_dir = Path::new(&pointer.dir);
+        let target_dir = crate::roblox::physical_path(&base, &pointer.dir);
         if !target_dir.exists() {
-            fs::create_dir_all(target_dir)?;
+            fs::create_dir_all(&target_dir)?;
         }
         fs::write(target_dir.join("init.lua"), &pointer.init_lua)?;
     }
@@ -282,15 +296,16 @@ pub async fn make_directories_roblox(
     Ok(InstallSummary { installed: to_install.len(), kept })
 }
 
-/// Keep the top level of `Packages/` fully managed even when installing
+/// Keep the top level of the mount fully managed even when installing
 /// incrementally: any non-exempt dir that isn't a desired root alias is junk
 /// or a pre-receipt leftover and gets removed. `_`/`.` entries are exempt —
 /// a project mid-migration may share this directory with Wally's own
 /// `Packages`, whose `_Index` must survive (only DIRS are removed, so
 /// wally's root link scripts survive too). Case-insensitive membership
 /// because Windows/macOS case-fold names (exact-case renames are handled by
-/// the stale/reinstall path, not here).
-fn prune_top_level(plan: &crate::roblox::plan::InstallPlan) -> Result<()> {
+/// the stale/reinstall path, not here). `base` is the physical mount; plan
+/// paths stay in the virtual `./Packages/...` format.
+fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str) -> Result<()> {
     let prefix = format!("./{}/", PACKAGES_DIR);
     let desired: std::collections::HashSet<String> = plan.packages.iter()
         .filter_map(|p| {
@@ -299,7 +314,7 @@ fn prune_top_level(plan: &crate::roblox::plan::InstallPlan) -> Result<()> {
         })
         .collect();
 
-    for entry in fs::read_dir(PACKAGES_DIR)? {
+    for entry in fs::read_dir(base)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('_') || name.starts_with('.') {
@@ -310,4 +325,42 @@ fn prune_top_level(plan: &crate::roblox::plan::InstallPlan) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::roblox::plan::{InstallPlan, PlannedPackage};
+
+    #[test]
+    fn prune_manages_a_nested_mount_and_spares_exempt_entries() {
+        let base_dir = std::env::temp_dir().join(format!("forest-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base_dir);
+        let mount = base_dir.join("src").join("Packages");
+        fs::create_dir_all(mount.join("Knit")).unwrap();
+        fs::create_dir_all(mount.join("Junk")).unwrap();
+        fs::create_dir_all(mount.join("_Index")).unwrap();
+        fs::create_dir_all(mount.join(".cache")).unwrap();
+
+        // Plan paths stay virtual ("./Packages/...") regardless of the mount.
+        let plan = InstallPlan {
+            packages: vec![PlannedPackage {
+                path: "./Packages/Knit".to_string(),
+                name: "acme/knit".to_string(),
+                version: "1.0.0".to_string(),
+                integrity: "aa".to_string(),
+                root: "init.luau".to_string(),
+                public: true,
+            }],
+            pointers: vec![],
+        };
+
+        prune_top_level(&plan, &mount.to_string_lossy()).unwrap();
+
+        assert!(mount.join("Knit").exists(), "desired alias survives");
+        assert!(!mount.join("Junk").exists(), "junk under the nested mount is pruned");
+        assert!(mount.join("_Index").exists(), "wally's _Index is exempt");
+        assert!(mount.join(".cache").exists(), "dot entries are exempt");
+        let _ = fs::remove_dir_all(&base_dir);
+    }
 }

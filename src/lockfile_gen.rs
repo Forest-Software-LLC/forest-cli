@@ -91,9 +91,11 @@ pub struct InstallSummary {
 }
 
 /// Materialize a lockfile on disk. Thin dispatcher: each platform owns its
-/// entire layout/extraction/bookkeeping pipeline.
-pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, DepSpec>, platform: &str, force: bool) -> Result<InstallSummary> {
-    Platform::parse(platform)?.install(lockfile, root_deps, force).await
+/// entire layout/extraction/bookkeeping pipeline. Takes the whole manifest
+/// (not just the platform string) because layout can depend on other
+/// manifest fields — Roblox mounts Packages/ inside the `root` dir.
+pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, DepSpec>, manifest: &Value, force: bool) -> Result<InstallSummary> {
+    Platform::from_manifest(manifest)?.install(lockfile, root_deps, manifest, force).await
 }
 
 /// Generate a lockfile JSON string given the forest manifest & message spinner.
@@ -171,7 +173,7 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
     // make_directories draws its own download bars — hide the spinner while
     // they own the terminal, or the two draw systems leave stuck lines.
     msg.pause();
-    make_directories(&lockfile, roots, &platform, force).await
+    make_directories(&lockfile, roots, forest_json, force).await
         .context("Failed to create directories for lockfile packages")?;
     msg.resume();
 

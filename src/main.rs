@@ -42,12 +42,18 @@ enum Commands {
     /// Publish a package
     Publish,
 
-    /// Initialize a new package
+    /// Start development on a new package
     Init {
         /// Platform for the package (roblox or uefn). Skips the interactive
         /// picker when provided, making `init` scriptable.
         #[arg(short = 'p', long = "platform")]
         platform: Option<String>,
+
+        /// Create a bare project manifest (dependencies + platform) for
+        /// consuming packages, instead of the package-authoring scaffold.
+        /// Non-interactive-safe.
+        #[arg(long = "project")]
+        project: bool,
     },
 
     /// Install dependencies for the package
@@ -142,8 +148,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Publish => {
             publish_command().await?;
         }
-        Commands::Init { platform } => {
-            init_command(platform).await?;
+        Commands::Init { platform, project } => {
+            init_command(platform, project).await?;
         }
         Commands::Install { package, version, alias, force, init } => {
             install_command(package, version, alias, force, init).await?;

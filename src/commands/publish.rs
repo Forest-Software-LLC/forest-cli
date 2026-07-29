@@ -661,5 +661,30 @@ mod tests {
 
         let _ = fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn forced_ignores_exclude_the_nested_mount_of_a_rooted_manifest() {
+        // A manifest with root src/init.luau mounts Packages inside src/;
+        // the derived pattern must keep that mount out of the tarball.
+        let base = std::env::temp_dir().join(format!("forest-publish-nested-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("src").join("Packages").join("dep")).unwrap();
+        fs::write(base.join("forest.json"), "{}").unwrap();
+        fs::write(base.join("forest-lock.json"), "{}").unwrap();
+        fs::write(base.join("src").join("init.luau"), "return {}").unwrap();
+        fs::write(base.join("src").join("Packages").join("dep").join("init.lua"), "return {}").unwrap();
+
+        let manifest = serde_json::json!({
+            "dependencies": { "acme/dep": "^1.0.0" },
+            "root": "src/init.luau"
+        });
+        let forced = crate::roblox::publish::publish_ignores(&manifest);
+        assert_eq!(
+            tarball_entries(&base, &forced),
+            vec!["forest.json", "src/init.luau"]
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }
 

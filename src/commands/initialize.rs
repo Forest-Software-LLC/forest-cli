@@ -2,15 +2,18 @@ use anyhow::Result;
 use std::env;
 
 use crate::message::warn;
-use crate::platform::Platform;
+use crate::platform::{InitMode, Platform};
 
-/// Initialize a new Forest project or package.
+/// Start development on a new Forest package (or, with `--project`, scaffold
+/// a bare consuming manifest).
 ///
 /// `platform` lets callers skip the interactive picker (e.g. `forest init
-/// --platform roblox`). When `None`, we prompt as before. This keeps `init`
-/// scriptable/agent-friendly without an interactive terminal. What actually
-/// gets scaffolded is wholly platform-owned (roblox/init.rs, uefn/init.rs).
-pub async fn init_command(platform: Option<String>) -> Result<()> {
+/// --platform roblox`), keeping `init` scriptable. `project` selects the
+/// bare project scaffold — the same one install's create-on-install path
+/// uses. What actually gets scaffolded is wholly platform-owned
+/// (roblox/init.rs, uefn/init.rs).
+pub async fn init_command(platform: Option<String>, project: bool) -> Result<()> {
+    let cwd = env::current_dir()?;
     let platform = match platform {
         Some(p) => match Platform::parse(&p) {
             Ok(platform) => platform,
@@ -22,8 +25,9 @@ pub async fn init_command(platform: Option<String>) -> Result<()> {
                 return Ok(());
             }
         },
-        None => Platform::detect_or_prompt(&env::current_dir()?)?,
+        None => Platform::detect_or_prompt(&cwd)?,
     };
 
-    platform.init(&env::current_dir()?).await
+    let mode = if project { InitMode::Project } else { InitMode::Package };
+    platform.init(&cwd, mode).await
 }
