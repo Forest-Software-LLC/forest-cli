@@ -85,6 +85,18 @@ fn extract_tgz(bytes: Vec<u8>, out_dir: &Path, archive_root: &str) -> Result<()>
         let entry_path = entry.path().context("Invalid tar entry path")?;
         let entry_path = entry_path.to_path_buf();
 
+        // forest.json and Rojo project files are authoring metadata, not part
+        // of the installed module. Rojo reads *.project.json files inside the
+        // mounted tree and errors when their paths don't exist post-extraction.
+        let is_authoring_metadata = entry_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|name| name == "forest.json" || name.ends_with(".project.json"))
+            .unwrap_or(false);
+        if is_authoring_metadata {
+            continue;
+        }
+
         // Detect a top-level LICENSE
         let is_top_level = entry_path.components().count() == 1;
         let is_license = is_top_level
@@ -239,6 +251,52 @@ mod tests {
         assert_eq!(fs::read_to_string(out.join("Nested").join("Deep.luau")).unwrap(), "return {} -- deep");
         assert_eq!(fs::read_to_string(out.join("LICENSE")).unwrap(), "MIT");
         assert!(out.join("wally.toml").exists());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn drops_manifest_and_rojo_project_files() {
+        // Rojo reads any *.project.json in the mounted tree and errors on
+        // paths that don't exist after extraction; forest.json is authoring
+        // metadata. Neither belongs in the installed package.
+        let tgz = make_tgz_with(&[
+            ("init.luau", "return {} -- root"),
+            ("forest.json", "{}"),
+            ("default.project.json", "{}"),
+            ("Nested/dev.project.json", "{}"),
+            ("Nested/Deep.luau", "return {} -- deep"),
+        ]);
+        let hash = sha256_hex(&tgz);
+        let url = serve_once(tgz);
+        let out = temp_out_dir("drop-metadata");
+
+        fetch_and_extract(&url, &hash, &out, "init.luau", ProgressBar::hidden(), None).unwrap();
+
+        assert!(out.join("init.luau").exists());
+        assert!(out.join("Nested").join("Deep.luau").exists());
+        assert!(!out.join("forest.json").exists());
+        assert!(!out.join("default.project.json").exists());
+        assert!(!out.join("Nested").join("dev.project.json").exists());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn drops_metadata_inside_a_folder_module_root() {
+        let tgz = make_tgz_with(&[
+            ("forest.json", "{}"),
+            ("src/init.luau", "return {} -- root"),
+            ("src/forest.json", "{}"),
+            ("src/default.project.json", "{}"),
+        ]);
+        let hash = sha256_hex(&tgz);
+        let url = serve_once(tgz);
+        let out = temp_out_dir("drop-metadata-nested");
+
+        fetch_and_extract(&url, &hash, &out, "src/init.luau", ProgressBar::hidden(), None).unwrap();
+
+        assert!(out.join("init.luau").exists());
+        assert!(!out.join("forest.json").exists());
+        assert!(!out.join("default.project.json").exists());
         let _ = fs::remove_dir_all(&out);
     }
 
