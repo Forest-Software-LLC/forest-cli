@@ -14,7 +14,7 @@ use urlencoding::encode;
 use reqwest::Method;
 use crate::http::packages_api_request;
 use crate::platform::Platform;
-use crate::utils::{digest_package_name, normalize_forest_deps};
+use crate::utils::{digest_package_name, get_ci, normalize_forest_deps};
 use crate::lockfile_solver::{get_lockfile_packages, DepSpec, LockfileEntry};
 use crate::message::{Message, MessageType};
 
@@ -24,6 +24,42 @@ use crate::message::{Message, MessageType};
 pub struct LockFile {
     pub file_version: u32,
     pub packages: HashMap<String, Vec<LockfileEntry>>,
+}
+
+/// Whether the lockfile still satisfies the manifest's declared dependencies.
+/// Root deps pin their resolved version at the tree root (`location == "~"`),
+/// so each declared range is checked against that pin, and a pin whose package
+/// is no longer declared means the dep was removed by hand. Any mismatch (or
+/// an unparseable range/version) sends install back through resolution, which
+/// reports invalid ranges properly.
+pub fn lockfile_satisfies_manifest(
+    lockfile: &LockFile,
+    roots: &HashMap<String, DepSpec>,
+) -> bool {
+    for (name, spec) in roots {
+        let Ok(req) = semver::VersionReq::parse(&spec.version) else {
+            return false;
+        };
+        let Some(root_entry) = get_ci(&lockfile.packages, name)
+            .and_then(|entries| entries.iter().find(|e| e.location == "~"))
+        else {
+            return false;
+        };
+        let Ok(version) = semver::Version::parse(&root_entry.version) else {
+            return false;
+        };
+        if !req.matches(&version) {
+            return false;
+        }
+    }
+
+    for (name, entries) in &lockfile.packages {
+        if entries.iter().any(|e| e.location == "~") && get_ci(roots, name).is_none() {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Tarballs are content-addressed on the CDN (`/{public|private}/{sha256}.tgz`),
@@ -263,6 +299,81 @@ mod tests {
 
     fn renames(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    /// (package, version, location) triples -> a minimal lockfile.
+    fn lockfile(entries: &[(&str, &str, &str)]) -> LockFile {
+        let mut packages: HashMap<String, Vec<LockfileEntry>> = HashMap::new();
+        for (pkg, version, location) in entries {
+            packages.entry(pkg.to_string()).or_default().push(LockfileEntry {
+                version: version.to_string(),
+                integrity: String::new(),
+                public: true,
+                root: String::new(),
+                location: location.to_string(),
+                dependencies: HashMap::new(),
+            });
+        }
+        LockFile { file_version: 2, packages }
+    }
+
+    fn roots(pairs: &[(&str, &str)]) -> HashMap<String, DepSpec> {
+        pairs.iter()
+            .map(|(name, range)| {
+                let alias = name.split('/').last().unwrap().to_string();
+                (name.to_string(), DepSpec { alias, version: range.to_string() })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn satisfied_lockfile_is_trusted() {
+        let lf = lockfile(&[("a/b", "1.5.2", "~"), ("c/d", "0.3.0", "b")]);
+        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")])));
+    }
+
+    #[test]
+    fn bumped_range_invalidates_the_lockfile() {
+        // The reported bug: ^1.5.0 was installed, the manifest now says
+        // ^2.0.0, and install kept saying "already up to date".
+        let lf = lockfile(&[("a/b", "1.5.2", "~")]);
+        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^2.0.0")])));
+    }
+
+    #[test]
+    fn newly_declared_dep_invalidates_the_lockfile() {
+        let lf = lockfile(&[("a/b", "1.5.2", "~")]);
+        assert!(!lockfile_satisfies_manifest(
+            &lf,
+            &roots(&[("a/b", "^1.5.0"), ("c/d", "^0.3.0")]),
+        ));
+    }
+
+    #[test]
+    fn removed_dep_with_lingering_root_pin_invalidates_the_lockfile() {
+        let lf = lockfile(&[("a/b", "1.5.2", "~"), ("c/d", "0.3.0", "~")]);
+        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")])));
+    }
+
+    #[test]
+    fn undeclared_transitive_entries_are_fine() {
+        // c/d lives inside a/b's subtree, not at the root - it's a/b's
+        // dependency, not a removed manifest entry.
+        let lf = lockfile(&[("a/b", "1.5.2", "~"), ("c/d", "0.3.0", "b")]);
+        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")])));
+    }
+
+    #[test]
+    fn key_casing_differences_still_match() {
+        let lf = lockfile(&[("Scope/Pkg", "1.5.2", "~")]);
+        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("scope/pkg", "^1.5.0")])));
+    }
+
+    #[test]
+    fn unparseable_range_forces_reresolution() {
+        // The solver owns range errors; the check just refuses the fast path.
+        let lf = lockfile(&[("a/b", "1.5.2", "~")]);
+        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "not-a-range")])));
     }
 
     #[test]

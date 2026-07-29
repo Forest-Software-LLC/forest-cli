@@ -8,7 +8,7 @@ use std::collections::{HashMap};
 use crate::http::packages_api_request;
 use crate::lockfile_solver::DepSpec;
 use crate::message::{Message, MessageType};
-use crate::lockfile_gen::{lockfile_gen, make_directories};
+use crate::lockfile_gen::{lockfile_gen, lockfile_satisfies_manifest, make_directories, LockFile};
 use crate::utils::normalize_forest_deps;
 
 /// Install dependencies for a forest package.
@@ -312,15 +312,46 @@ async fn sync_from_lockfile(
     };
 
     // Only the current format installs straight from the lockfile; anything
-    // else (older format, unknown version) is re-resolved like a missing one.
-    let usable = lock_content.as_ref()
-        .and_then(|c| c.get("file_version"))
-        .and_then(Value::as_u64)
-        == Some(2);
+    // else (older format, unknown version, unparseable) is re-resolved like a
+    // missing one.
+    let lockfile: Option<LockFile> = match &lock_content {
+        Some(c) if c.get("file_version").and_then(Value::as_u64) == Some(2) => {
+            serde_json::from_value(c.clone()).ok()
+        }
+        _ => None,
+    };
 
-    if usable {
+    // The lockfile is only trusted while it still satisfies forest.json's
+    // declared ranges - a hand-edited range (^1.5.0 -> ^2.0.0) or a removed
+    // dependency re-resolves instead of silently keeping the old pin.
+    let lockfile = match lockfile {
+        Some(lf) => {
+            let roots = crate::platform::Platform::from_manifest(info)?
+                .resolution_roots(normalize_forest_deps(info))?;
+            if lockfile_satisfies_manifest(&lf, &roots) {
+                Some(lf)
+            } else {
+                msg.emit(
+                    MessageType::Info,
+                    "forest.json dependencies changed; updating forest-lock.json.",
+                );
+                None
+            }
+        }
+        None => {
+            if lock_content.is_some() {
+                msg.emit(
+                    MessageType::Warn,
+                    "Lockfile format is out of date; regenerating forest-lock.json.",
+                );
+            }
+            None
+        }
+    };
+
+    if let Some(lockfile) = lockfile {
         msg.destroy();
-        let summary = make_directories(&serde_json::from_value(lock_content.unwrap()).unwrap(), normalize_forest_deps(&info.clone()), info, force).await?;
+        let summary = make_directories(&lockfile, normalize_forest_deps(&info.clone()), info, force).await?;
 
         msg = Message::new("");
         if summary.installed == 0 {
@@ -333,20 +364,14 @@ async fn sync_from_lockfile(
             ));
         }
         return Ok(());
-    } else {
-        if lock_content.is_some() {
-            msg.emit(
-                MessageType::Warn,
-                "Lockfile format is out of date; regenerating forest-lock.json.",
-            );
-        }
-        let info_clone = info.clone();
-        let lockfile_content = lockfile_gen(&info_clone, &mut msg, force).await?;
-        // Convert content to string
-        let lockfile_content = serde_json::to_string_pretty(&lockfile_content)?;
-
-        fs::write("forest-lock.json", lockfile_content)?;
     }
+
+    let info_clone = info.clone();
+    let lockfile_content = lockfile_gen(&info_clone, &mut msg, force).await?;
+    // Convert content to string
+    let lockfile_content = serde_json::to_string_pretty(&lockfile_content)?;
+
+    fs::write("forest-lock.json", lockfile_content)?;
 
     msg.finish(MessageType::Success, "Installed all dependencies!");
     Ok(())
