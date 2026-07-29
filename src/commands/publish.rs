@@ -173,10 +173,13 @@ fn create_tarball_buffer(dir: &Path, matcher: &Gitignore) -> Result<Vec<u8>> {
 pub async fn publish_command() -> Result<()> {
     let cwd = env::current_dir().context("Failed to get current directory")?;
 
-    let (session_resp, status_code) = api_request("v1/auth/session", reqwest::Method::GET, None, None)
-        .await
-        .context("Failed to get session information")?;
-    
+    // The spinner is destroyed before every prompt or printed line below -
+    // dialoguer and an active spinner fight over the terminal.
+    let msg = Message::new("Verifying session...");
+    let session_result = api_request("v1/auth/session", reqwest::Method::GET, None, None).await;
+    msg.destroy();
+    let (session_resp, status_code) = session_result.context("Failed to get session information")?;
+
     if status_code == StatusCode::UNAUTHORIZED {
         fail("You must be logged in to publish a package. Please run `forest login`.");
         return Ok(());
@@ -220,9 +223,10 @@ pub async fn publish_command() -> Result<()> {
 
     // Fetch user info from API to see what orgs they are allowed to publish to.
 
-    let (userdata_resp, _) = api_request(format!("v1/user/{}", current_user).as_str(), reqwest::Method::GET, None, None)
-        .await
-        .context("Failed to get user information")?;
+    let msg = Message::new("Fetching account info...");
+    let userdata_result = api_request(format!("v1/user/{}", current_user).as_str(), reqwest::Method::GET, None, None).await;
+    msg.destroy();
+    let (userdata_resp, _) = userdata_result.context("Failed to get user information")?;
 
     let org_authors = userdata_resp.get("orgs") // "orgs" is an array of org data with { "name" : string, "rank" : string}
         .and_then(Value::as_array)
@@ -304,9 +308,11 @@ pub async fn publish_command() -> Result<()> {
     if forest_json["name"].is_string() {
         let platform = platform.as_str();
         let name = forest_json["name"].as_str().unwrap().to_string();
-        let (versions_resp, status_code) = api_request(&format!("v1/package/{}/{}/{}", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None)
-            .await
-            .context("Failed to fetch package versions")?;
+        let msg = Message::new("Checking the registry for this package...");
+        let versions_result = api_request(&format!("v1/package/{}/{}/{}", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None).await;
+        let latest_result = packages_api_request(&format!("v1/package/{}/{}/{}/latest", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None).await;
+        msg.destroy();
+        let (versions_resp, status_code) = versions_result.context("Failed to fetch package versions")?;
 
         if status_code.is_success() {
             let versions_array = versions_resp.get("versions")
@@ -322,9 +328,7 @@ pub async fn publish_command() -> Result<()> {
                 .collect::<Vec<String>>();
         }
 
-        let (latest_package_data, status_code) = packages_api_request(&format!("v1/package/{}/{}/{}/latest", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None)
-            .await
-            .context("Failed to fetch latest package data")?;
+        let (latest_package_data, status_code) = latest_result.context("Failed to fetch latest package data")?;
 
         if status_code.is_success() {
             metadata["public"] = latest_package_data["public"].clone();
@@ -523,7 +527,7 @@ pub async fn publish_command() -> Result<()> {
     // Platform pre-pack lint: the gateway hard-rejects these files, but
     // warning BEFORE the upload is the better error location.
     for warning in platform.prepack_warnings(&cwd, &matcher) {
-        warn(&warning);
+        msg.emit(MessageType::Warn, &warning);
     }
 
     let tar_buf = create_tarball_buffer(&cwd, &matcher)
