@@ -41,10 +41,14 @@ fn walk(container: &Path, container_str: &str, tree: &mut TreeScan) {
             continue;
         }
         let path_str = format!("{container_str}/{name}");
-        if let Some(receipt) = read_receipt(&path) {
-            tree.receipts.insert(path_str.clone(), receipt);
-        } else if is_pointer_dir(&path) {
+        // Pointer check first: older builds wrote pointer init.lua into a
+        // package dir without clearing it, so a dir can carry both a stale
+        // receipt and a pointer header. Trusting that receipt would keep the
+        // dir as if the real package were still inside it.
+        if is_pointer_dir(&path) {
             tree.pointer_dirs.push(path_str.clone());
+        } else if let Some(receipt) = read_receipt(&path) {
+            tree.receipts.insert(path_str.clone(), receipt);
         }
         let nested = path.join(PACKAGES_DIR);
         if nested.is_dir() {
@@ -110,9 +114,9 @@ pub fn reconcile(plan: &InstallPlan, tree: &TreeScan) -> Reconciliation {
     let desired_ptr_dirs: HashSet<&str> = plan.pointers.iter().map(|p| p.dir.as_str()).collect();
 
     // Anything forest-managed on disk that the plan no longer wants. A dir
-    // that switched roles (package↔pointer) is NOT stale: the installer
-    // rewrites it in place (to_install clears its target first; pointer
-    // init.lua is regenerated over the dir).
+    // that switched roles (package to pointer or back) is NOT stale: the
+    // installer handles it (to_install clears its target first; the pointer
+    // writer wipes a dir that still carries a receipt).
     let mut stale_dirs: Vec<String> = tree
         .receipts
         .keys()
@@ -247,6 +251,52 @@ mod tests {
         let rec = reconcile(&new, &tree_of(&old));
         assert_eq!(rec.to_install, vec![0, 1]);
         assert_eq!(rec.kept, 0);
+    }
+
+    #[test]
+    fn scan_never_trusts_a_receipt_next_to_a_pointer_header() {
+        // Older builds wrote pointer init.lua into a still populated package
+        // dir. If the leftover receipt were trusted, a later install would
+        // keep the dir even though its require target is gone.
+        let base = std::env::temp_dir().join(format!("forest-receipts-mixed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let packages = base.join("Packages");
+        let broken = packages.join("Knit").join("Packages").join("X");
+        fs::create_dir_all(&broken).unwrap();
+        write(&broken, &Receipt { name: "acme/x".into(), version: "1.0.0".into(), integrity: "xx".into(), root: "src/init.luau".into() }).unwrap();
+        fs::write(broken.join("init.luau"), "return {}").unwrap();
+        fs::write(
+            broken.join("init.lua"),
+            format!("{POINTER_HEADER}\nreturn require(script.Parent.Parent.Parent['X'])"),
+        )
+        .unwrap();
+
+        let tree = scan(&packages);
+
+        assert!(tree.receipts.is_empty(), "stale receipt beside a pointer must not be trusted");
+        assert_eq!(tree.pointer_dirs, vec!["./Packages/Knit/Packages/X".to_string()]);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pointer_turning_back_into_a_package_reinstalls_it() {
+        // forest i scope/x hoisted X to the root and left a pointer at the
+        // nested spot; forest remove scope/x nests it again. The pointer dir
+        // has no receipt so X must reinstall there, and the root copy goes
+        // stale.
+        let old = plan_of(
+            vec![pkg("./Packages/Knit", "aa"), pkg("./Packages/X", "xx")],
+            &["./Packages/Knit/Packages/X"],
+        );
+        let new = plan_of(
+            vec![pkg("./Packages/Knit", "aa"), pkg("./Packages/Knit/Packages/X", "xx")],
+            &[],
+        );
+        let rec = reconcile(&new, &tree_of(&old));
+        assert_eq!(rec.to_install, vec![1], "nested X installs fresh over the pointer dir");
+        assert_eq!(rec.kept, 1, "Knit is untouched");
+        assert_eq!(rec.stale_dirs, vec!["./Packages/X".to_string()]);
     }
 
     #[test]
