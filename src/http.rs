@@ -175,9 +175,11 @@ async fn api_request_with_base(
             .await
             .context("Failed to send refresh request")?;
         let data: Value = refresh_resp.json().await.unwrap_or_default();
+        // The refresh response nests tokens under "tokens", same shape as login
+        let new_tokens = data.get("tokens").unwrap_or(&Value::Null);
         if let (Some(at), Some(rt)) = (
-            data.get("accessToken").and_then(Value::as_str),
-            data.get("refreshToken").and_then(Value::as_str)
+            new_tokens.get("accessToken").and_then(Value::as_str),
+            new_tokens.get("refreshToken").and_then(Value::as_str)
         ) {
             store_tokens(at, rt)?;
             tokens = get_stored_tokens()?;
