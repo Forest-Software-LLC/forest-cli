@@ -1,6 +1,6 @@
 [package]
 name = "forest"
-version = "1.8.0"
+version = "1.8.1"
 edition = "2021"
 authors = ["Forest Software LLC"]
 description = "Forest CLI – Package manager"
@@ -8,14 +8,12 @@ license = "LICENSE"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 reqwest = { version = "0.11", default-features = false, features = ["json", "multipart", "blocking", "rustls-tls", "rustls-tls-webpki-roots", "gzip"] }
 tar = "0.4"
 flate2 = { version = "1.0", features = ["miniz_oxide"] }
 anyhow = "1.0"
-dotenvy = "0.15"
 open = "3.2"
-rpassword = "7.0"
 serde = { version = "1.0", features = ["derive"] }
 dirs = "4.0"          # for locating the home directory
 serde_json = "1.0"
@@ -26,7 +24,6 @@ urlencoding = "2.1.3"
 semver = "1.0.26"
 walkdir = "2.5.0"
 ignore = "0.4.23"
-version-ranges = "0.1"
 chrono = "0.4.42"
 self-replace = "1"    # atomic self-replacement for `forest update` (handles Windows)
 sha2 = "0.10"         # verify downloaded binaries against the release manifest
