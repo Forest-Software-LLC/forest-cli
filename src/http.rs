@@ -6,6 +6,11 @@ use std::{env, sync::Arc, sync::OnceLock, time::Duration};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Sent on every request. The `forest-cli/` prefix is the analytics
+/// classification contract (shared/contracts/user-agents.json, asserted in
+/// contracts.rs); forest-cdn-worker and forest-backend classify CLI traffic
+/// by it. Keep it stable.
+pub const USER_AGENT: &str = concat!("forest-cli/", env!("CARGO_PKG_VERSION"));
 /// Publish uploads can legitimately take minutes on a slow uplink, so
 /// multipart requests override the total timeout with this instead.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -17,6 +22,7 @@ fn async_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         Client::builder()
+            .user_agent(USER_AGENT)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -35,6 +41,7 @@ pub fn blocking_client() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
+            .user_agent(USER_AGENT)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(Duration::from_secs(120))
             .gzip(false)

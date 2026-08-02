@@ -81,6 +81,23 @@ mod tests {
         assert_eq!(rules.epic_path_roots.len(), 3);
     }
 
+    // Loader lives inside the test module on purpose: the CLI only EMITS the
+    // User-Agent; classification runs registry-side. The contract is carried
+    // solely so this assertion fails loudly if the prefix ever drifts.
+    #[test]
+    fn user_agent_starts_with_the_contract_cli_prefix() {
+        #[derive(Deserialize)]
+        struct UaContract {
+            prefixes: std::collections::HashMap<String, String>,
+        }
+        let contract: UaContract =
+            serde_json::from_str(include_str!("../shared/contracts/user-agents.json"))
+                .expect("shared/contracts/user-agents.json failed to parse");
+        let prefix = &contract.prefixes["cli"];
+        assert!(prefix.ends_with('/'), "prefix matching is version-proof only with the trailing slash");
+        assert!(crate::http::USER_AGENT.starts_with(prefix.as_str()));
+    }
+
     #[test]
     fn licenses_parse_with_fingerprint_order_preserved() {
         let contract = licenses();

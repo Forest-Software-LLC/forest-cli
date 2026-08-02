@@ -46,7 +46,7 @@ struct ReleaseManifest {
 /// key (see release_verify.rs), the manifest is not a release.
 async fn fetch_manifest(timeout: Option<Duration>) -> Result<ReleaseManifest> {
     let base = release_base();
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().user_agent(crate::http::USER_AGENT);
     if let Some(t) = timeout {
         builder = builder.timeout(t);
     }
