@@ -1,6 +1,7 @@
 //! Roblox tarball extraction: Rojo folder-module semantics. The archive root
 //! (the package's declared init file) picks the source directory, the root
 //! file is renamed to `init.<ext>` so the installed folder is requirable,
+//! auto-running `*.server.lua(u)` / `*.client.lua(u)` files are scrubbed,
 //! and a top-level LICENSE is hoisted. Trusted-byte acquisition (cache /
 //! download / hash gate) is shared core (src/fetch_and_extract.rs).
 
@@ -14,6 +15,14 @@ use tar::Archive;
 
 use crate::cache::TarballCache;
 use crate::fetch_and_extract::obtain_verified_bytes;
+
+/// Suffixes Rojo syncs as Script/LocalScript instances.
+const RUNNABLE_SUFFIXES: [&str; 4] = [
+    ".server.lua",
+    ".server.luau",
+    ".client.lua",
+    ".client.luau",
+];
 
 /// Install a package tarball into `out_dir`: serve it from the
 /// content-addressed cache when possible, otherwise download from `url` and
@@ -94,6 +103,20 @@ fn extract_tgz(bytes: Vec<u8>, out_dir: &Path, archive_root: &str) -> Result<()>
             .map(|name| name == "forest.json" || name.ends_with(".project.json"))
             .unwrap_or(false);
         if is_authoring_metadata {
+            continue;
+        }
+
+        // Script/LocalScript files run on place load without being required,
+        // so never install them. The declared root is exempt: the init
+        // rename below makes it an inert ModuleScript.
+        let is_runnable_script = entry_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|name| {
+                RUNNABLE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+            })
+            .unwrap_or(false);
+        if is_runnable_script && entry_path != root_path {
             continue;
         }
 
@@ -297,6 +320,69 @@ mod tests {
         assert!(out.join("init.luau").exists());
         assert!(!out.join("forest.json").exists());
         assert!(!out.join("default.project.json").exists());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn scrubs_server_and_client_scripts() {
+        // A Script/LocalScript inside an installed package would execute on
+        // place load without ever being required. Never install them.
+        let tgz = make_tgz_with(&[
+            ("src/init.luau", "return {} -- root"),
+            ("src/Helper.luau", "return {} -- helper"),
+            ("src/Backdoor.server.luau", "print('pwned')"),
+            ("src/Backdoor.server.lua", "print('pwned')"),
+            ("src/Sneaky.client.luau", "print('pwned')"),
+            ("src/Sneaky.client.lua", "print('pwned')"),
+            ("src/Nested/init.server.luau", "print('pwned')"),
+            ("src/Nested/Deep.luau", "return {} -- deep"),
+        ]);
+        let hash = sha256_hex(&tgz);
+        let url = serve_once(tgz);
+        let out = temp_out_dir("scrub-scripts");
+
+        fetch_and_extract(&url, &hash, &out, "src/init.luau", ProgressBar::hidden(), None).unwrap();
+
+        assert!(out.join("init.luau").exists());
+        assert!(out.join("Helper.luau").exists());
+        assert!(out.join("Nested").join("Deep.luau").exists());
+        assert!(!out.join("Backdoor.server.luau").exists());
+        assert!(!out.join("Backdoor.server.lua").exists());
+        assert!(!out.join("Sneaky.client.luau").exists());
+        assert!(!out.join("Sneaky.client.lua").exists());
+        assert!(!out.join("Nested").join("init.server.luau").exists(),
+            "an init.server file would turn the whole folder into a Script");
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn scrubs_scripts_in_top_level_root_layout() {
+        let tgz = make_tgz_with(&[
+            ("init.luau", "return {} -- root"),
+            ("Runner.server.luau", "print('pwned')"),
+        ]);
+        let hash = sha256_hex(&tgz);
+        let url = serve_once(tgz);
+        let out = temp_out_dir("scrub-top-level");
+
+        fetch_and_extract(&url, &hash, &out, "init.luau", ProgressBar::hidden(), None).unwrap();
+
+        assert!(out.join("init.luau").exists());
+        assert!(!out.join("Runner.server.luau").exists());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn root_declared_as_server_script_becomes_module_init() {
+        let tgz = make_tgz_with(&[("Main.server.luau", "return {} -- root")]);
+        let hash = sha256_hex(&tgz);
+        let url = serve_once(tgz);
+        let out = temp_out_dir("scrub-root-exempt");
+
+        fetch_and_extract(&url, &hash, &out, "Main.server.luau", ProgressBar::hidden(), None).unwrap();
+
+        assert_eq!(fs::read_to_string(out.join("init.luau")).unwrap(), "return {} -- root");
+        assert!(!out.join("Main.server.luau").exists());
         let _ = fs::remove_dir_all(&out);
     }
 
