@@ -133,7 +133,7 @@ fn resolve_final_module(link_path: &Path, expr: &str) -> Option<(PathBuf, String
 /// Extract the argument of the first `require(...)` in the source. Works on
 /// both generated forms (`return require(...)` and the rewritten
 /// `local MODULE = require(...)`).
-fn require_expr(source: &str) -> Option<String> {
+pub(crate) fn require_expr(source: &str) -> Option<String> {
     let start = source.find("require(")? + "require(".len();
     let rest = &source[start..];
     let mut depth = 1usize;
