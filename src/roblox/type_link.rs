@@ -546,7 +546,6 @@ fn render(header: &str, expr: &str, exports: &[ExportedType]) -> String {
     if exports.is_empty() {
         return format!("{header}\nreturn require({expr})\n");
     }
-    let exported_names: HashSet<String> = exports.iter().map(|e| e.name.clone()).collect();
     let mut out = format!("{header}\nlocal {LOCAL_NAME} = require({expr})\n");
     for export in exports {
         match &export.generics {
@@ -557,7 +556,7 @@ fn render(header: &str, expr: &str, exports: &[ExportedType]) -> String {
                 ));
             }
             Some(inner) => {
-                let Some((decls, args)) = render_params(inner, &exported_names) else {
+                let Some((decls, args)) = render_params(inner) else {
                     // Unparseable generics: skip just this type.
                     continue;
                 };
@@ -573,29 +572,28 @@ fn render(header: &str, expr: &str, exports: &[ExportedType]) -> String {
 }
 
 /// Turn a generic parameter list into the re-export's declaration side
-/// (params with defaults, module-local defaults qualified) and application
-/// side (bare param names, `...` kept for type packs).
-fn render_params(inner: &str, exported: &HashSet<String>) -> Option<(String, String)> {
+/// (params with defaults) and application side (bare param names, `...`
+/// kept for type packs).
+///
+/// Defaults are copied VERBATIM:
+/// The old Luau solver cannot resolve qualified names in default position at all
+/// (`T = MODULE.Signal<x>` is "Unknown type"), while an unqualified name
+/// referencing one of the target's exported types resolves against this
+/// link's own re-export of it, which is in scope in the same file. Defaults
+/// upstream Luau itself rejects (generic applications, foreign-module
+/// types) fail identically here.
+fn render_params(inner: &str) -> Option<(String, String)> {
     let raw = split_top_level(inner, ',');
     if raw.is_empty() {
         return None;
     }
-    let mut names: HashSet<String> = HashSet::new();
-    let mut parsed: Vec<(String, bool, Option<String>)> = Vec::new();
-    for param in &raw {
-        let (name, is_pack, default) = parse_param(param)?;
-        names.insert(name.clone());
-        parsed.push((name, is_pack, default));
-    }
     let mut decls = Vec::new();
     let mut args = Vec::new();
-    for (name, is_pack, default) in parsed {
+    for param in &raw {
+        let (name, is_pack, default) = parse_param(param)?;
         let dots = if is_pack { "..." } else { "" };
         match default {
-            Some(default) => decls.push(format!(
-                "{name}{dots} = {}",
-                qualify_default(&default, exported, &names)
-            )),
+            Some(default) => decls.push(format!("{name}{dots} = {default}")),
             None => decls.push(format!("{name}{dots}")),
         }
         args.push(format!("{name}{dots}"));
@@ -625,44 +623,6 @@ fn parse_param(param: &str) -> Option<(String, bool, Option<String>)> {
         _ => return None,
     };
     Some((name, is_pack, default))
-}
-
-/// Qualify references to the target module's own exported types inside a
-/// generic default (`Signal<number>` -> `MODULE.Signal<number>`), leaving
-/// generic parameter names, builtins, and already-qualified names alone.
-fn qualify_default(default: &str, exported: &HashSet<String>, params: &HashSet<String>) -> String {
-    let chars: Vec<char> = default.chars().collect();
-    let mut out = String::with_capacity(default.len());
-    // Last non-whitespace char emitted: a preceding `.` (or ident char)
-    // means the next identifier is already qualified / mid-name.
-    let mut prev_sig: Option<char> = None;
-    let mut i = 0;
-    while i < chars.len() {
-        if let Some(end) = skip_string(&chars, i) {
-            out.extend(&chars[i..end]);
-            prev_sig = chars.get(end - 1).copied();
-            i = end;
-            continue;
-        }
-        let qualifiable = prev_sig != Some('.') && !matches!(prev_sig, Some(p) if is_ident_char(p));
-        if let Some((word, end)) = read_ident(&chars, i).filter(|_| qualifiable) {
-            if exported.contains(&word) && !params.contains(&word) {
-                out.push_str(LOCAL_NAME);
-                out.push('.');
-            }
-            out.push_str(&word);
-            prev_sig = chars.get(end - 1).copied();
-            i = end;
-            continue;
-        }
-        let c = chars[i];
-        out.push(c);
-        if !c.is_whitespace() {
-            prev_sig = Some(c);
-        }
-        i += 1;
-    }
-    out
 }
 
 #[cfg(test)]
@@ -851,9 +811,42 @@ mod tests {
         assert!(link.contains("export type State<T = any?> = MODULE.State<T>"), "{link}");
         assert!(link.contains("export type Pack<T...> = MODULE.Pack<T...>"), "{link}");
         assert!(link.contains("export type Fn<F = () -> ()> = MODULE.Fn<F>"), "{link}");
+        // Verbatim, NOT `MODULE.Signal<…>`: the old solver can't resolve
+        // qualified names in default position, while the unqualified name
+        // resolves against this link's own `Signal` re-export above.
         assert!(
-            link.contains("export type Pair<T = MODULE.Signal<number>> = MODULE.Pair<T>"),
-            "module-local default types must be qualified: {link}"
+            link.contains("export type Pair<T = Signal<number>> = MODULE.Pair<T>"),
+            "defaults must be copied verbatim: {link}"
+        );
+        let _ = fs::remove_dir_all(&mount);
+    }
+
+    #[test]
+    fn default_referencing_a_foreign_module_is_copied_verbatim() {
+        // A generic default naming another module's type through a local
+        // (`local Other = require(...)` + `<T = Other.Type>`) is copied
+        // as-is and is an unknown type in the link file — but the old Luau
+        // solver rejects qualified names in default position in the ORIGINAL
+        // module too, so verbatim copying is exact parity with upstream.
+        // Consumers are unaffected either way (declaration-site error only;
+        // bare `Foo` degrades permissively, explicit `Foo<X>` works).
+        let mount = fixture("foreign-default");
+        let dir = mount.join("pkg");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("init.lua"), format!("{WRAPPER_HEADER}\nreturn require(script[\"src\"])\n")).unwrap();
+        fs::write(dir.join("Other.lua"), "export type Type = number\nreturn {}\n").unwrap();
+        fs::write(
+            dir.join("src").join("init.lua"),
+            "local Other = require(script.Parent.Other)\nexport type Foo<T = Other.Type> = { v: T }\nreturn {}\n",
+        )
+        .unwrap();
+
+        relink_types(&mount);
+
+        let link = fs::read_to_string(dir.join("init.lua")).unwrap();
+        assert!(
+            link.contains("export type Foo<T = Other.Type> = MODULE.Foo<T>"),
+            "foreign-module default should be copied verbatim (unqualified): {link}"
         );
         let _ = fs::remove_dir_all(&mount);
     }
@@ -876,8 +869,7 @@ mod tests {
         let exports = extract_exports("export type Handler<\n\tT,\n\tU = any?\n> = (T) -> U\n");
         assert_eq!(exports.len(), 1);
         assert_eq!(exports[0].name, "Handler");
-        let (decls, args) =
-            render_params(exports[0].generics.as_ref().unwrap(), &HashSet::new()).unwrap();
+        let (decls, args) = render_params(exports[0].generics.as_ref().unwrap()).unwrap();
         assert_eq!(decls, "T, U = any?");
         assert_eq!(args, "T, U");
     }
