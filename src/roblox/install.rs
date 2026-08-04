@@ -289,6 +289,9 @@ pub async fn make_directories_roblox(
         write_pointer(&crate::roblox::physical_path(&base, &pointer.dir), &pointer.init_lua)?;
     }
 
+    // Luau doesn't carry `export type` through `return require(...)`, so we re-export the types
+    crate::roblox::type_link::relink_types(Path::new(&base));
+
     Ok(InstallSummary { installed: to_install.len(), kept })
 }
 
