@@ -9,6 +9,7 @@ pub mod install;
 pub mod plan;
 pub mod publish;
 pub mod receipts;
+pub mod type_link;
 pub mod wally;
 
 /// The Roblox install mount, relative to the manifest directory.
