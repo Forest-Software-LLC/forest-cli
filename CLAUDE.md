@@ -16,6 +16,7 @@ The `forest` command-line package manager for **forestpm** (Roblox + UEFN/Verse 
 | `remove <pkg>` | `chop` | [commands/remove.rs](src/commands/remove.rs) |
 | `update` | `upgrade` | [commands/update.rs](src/commands/update.rs) — self-update from the release CDN (`--check` = report only); swap via `self-replace`, manifest signature verified by [src/release_verify.rs](src/release_verify.rs) |
 | `audit [pkg]` | `outdated` | [commands/audit.rs](src/commands/audit.rs) — dependency update + license report; `-u/--update` bumps forest.json and reinstalls |
+| `tree [pkg]` | `ls`, `list` | [commands/tree.rs](src/commands/tree.rs) — renders the dependency tree from forest-lock.json (offline; warns when the lockfile is stale vs forest.json); `[pkg]` (scope/name, alias, or bare name) limits output to that root dep's subtree |
 
 ## Key modules
 - [src/platform.rs](src/platform.rs) — the platform seam: every platform-divergent behavior goes through the `Platform` enum, delegating into [src/roblox/](src/roblox/) or [src/uefn/](src/uefn/). Dependency rule: core modules (solver, lockfile, http, cache, receipts, fetch) never import platform code; platform modules import core, never each other. See [ARCHITECTURE.md](ARCHITECTURE.md).

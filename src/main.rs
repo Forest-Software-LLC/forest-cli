@@ -16,7 +16,7 @@ mod platform;
 mod release_verify;
 mod uefn;
 mod utils;
-use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, audit_command, maybe_notify_update};
+use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, audit_command, tree_command, maybe_notify_update};
 
 use std::env;
 
@@ -107,6 +107,13 @@ enum Commands {
         #[arg(short = 'u', long = "update")]
         update: bool,
     },
+
+    /// Show the installed dependency tree
+    #[command(alias = "ls", alias = "list")]
+    Tree {
+        /// Only show this package's subtree (e.g. scope/name, alias, or bare name)
+        package: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -162,6 +169,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Audit { package, update } => {
             audit_command(package, update).await?;
+        }
+        Commands::Tree { package } => {
+            tree_command(package)?;
         }
     }
 
