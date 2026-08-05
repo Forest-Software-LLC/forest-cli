@@ -431,6 +431,44 @@ fn extract_exports(cleaned: &str) -> Vec<ExportedType> {
             scan += 1;
             continue;
         };
+        // User-defined type function (`export type function Name(params)`,
+        // It re-exports as a plain generic forward: `export type Name<params> = MODULE.Name<params>`
+        // parameter list becomes the generic list. 
+        if name == "function" {
+            let fn_name_start = skip_ws(&chars, after_name);
+            let parsed = read_ident(&chars, fn_name_start).and_then(|(fn_name, after_fn_name)| {
+                let paren = skip_ws(&chars, after_fn_name);
+                let (params, after_params) = capture_parens(&chars, paren)?;
+                Some((fn_name, params, after_params))
+            });
+            let Some((fn_name, params, after_params)) = parsed else {
+                scan = after_name;
+                continue;
+            };
+            // Lua-style parameter list: keep only the names (the forward
+            // needs nothing else, so `: type` annotations are dropped).
+            // A variadic `...` anywhere makes the function unforwardable 
+            // a fixed-arity generic alias would reject the extra arguments callers may pass
+            let names: Option<Vec<String>> = if params.trim().is_empty() {
+                Some(Vec::new())
+            } else {
+                split_top_level(&params, ',')
+                    .iter()
+                    .map(|param| {
+                        let param_chars: Vec<char> = param.chars().collect();
+                        read_ident(&param_chars, 0).map(|(param_name, _)| param_name)
+                    })
+                    .collect()
+            };
+            if let Some(names) = names {
+                if seen.insert(fn_name.clone()) {
+                    let generics = if names.is_empty() { None } else { Some(names.join(", ")) };
+                    exports.push(ExportedType { name: fn_name, generics });
+                }
+            }
+            scan = after_params;
+            continue;
+        }
         // `cursor` walks the rest of the declaration: an optional generic
         // parameter list, then the `=` that makes it a real declaration.
         let mut cursor = skip_ws(&chars, after_name);
@@ -474,6 +512,34 @@ fn skip_ws(chars: &[char], mut i: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// Capture the inner text of a balanced `(…)` starting at chars[open], or
+/// None when chars[open] isn't `(`. String-aware like capture_generics.
+fn capture_parens(chars: &[char], open: usize) -> Option<(String, usize)> {
+    if chars.get(open) != Some(&'(') {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut i = open + 1;
+    while i < chars.len() {
+        if let Some(end) = skip_string(chars, i) {
+            i = end;
+            continue;
+        }
+        match chars[i] {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((chars[open + 1..i].iter().collect(), i + 1));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Capture the inner text of a balanced `<…>` starting at chars[open]. `->`
@@ -847,6 +913,58 @@ mod tests {
         assert!(
             link.contains("export type Foo<T = Other.Type> = MODULE.Foo<T>"),
             "foreign-module default should be copied verbatim (unqualified): {link}"
+        );
+        let _ = fs::remove_dir_all(&mount);
+    }
+
+    #[test]
+    fn type_functions_reexport_as_generic_forwards() {
+        // `export type function Name(ty)` (new-solver feature) forwards as
+        // `export type Name<ty> = MODULE.Name<ty>` — verified valid under
+        // the V2 solver, and one contained unknown-type diagnostic under the
+        // old solver (where the ORIGINAL declaration is a syntax error
+        // anyway, so such packages are new-solver-only by definition).
+        let mount = fixture("typefn");
+        let dir = mount.join("pkg");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("init.lua"), format!("{WRAPPER_HEADER}\nreturn require(script[\"src\"])\n")).unwrap();
+        fs::write(
+            dir.join("src").join("init.lua"),
+            concat!(
+                "export type function Wrap(ty)\n",
+                "\treturn types.unionof(ty, types.singleton(nil))\n",
+                "end\n",
+                "export type function Pick(ty, key)\n",
+                "\treturn ty\n",
+                "end\n",
+                "export type function Variadic(...)\n",
+                "\treturn types.number\n",
+                "end\n",
+                "export type function Annotated(ty: type)\n",
+                "\treturn ty\n",
+                "end\n",
+                "export type function TrailingVariadic(first: type, ...)\n",
+                "\treturn first\n",
+                "end\n",
+                "export type Plain = number\n",
+                "return {}\n",
+            ),
+        )
+        .unwrap();
+
+        relink_types(&mount);
+
+        let link = fs::read_to_string(dir.join("init.lua")).unwrap();
+        assert!(link.contains("export type Wrap<ty> = MODULE.Wrap<ty>"), "{link}");
+        assert!(link.contains("export type Pick<ty, key> = MODULE.Pick<ty, key>"), "{link}");
+        assert!(link.contains("export type Plain = MODULE.Plain"), "{link}");
+        assert!(
+            link.contains("export type Annotated<ty> = MODULE.Annotated<ty>"),
+            "`: type` annotations must be stripped, not fail the forward: {link}"
+        );
+        assert!(
+            !link.contains("Variadic"),
+            "a variadic type function (bare or after named params) has no generic-forward equivalent and must be skipped: {link}"
         );
         let _ = fs::remove_dir_all(&mount);
     }
