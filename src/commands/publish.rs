@@ -44,21 +44,25 @@ fn version_builder(current_version: &str) -> String {
         }
     }
 
-    let current_version_parts = current_version.split('.').collect::<Vec<&str>>();
-    let major = current_version_parts[0].parse::<u32>().unwrap();
-    let minor = current_version_parts[1].parse::<u32>().unwrap();
-    let patch = current_version_parts[2].parse::<u32>().unwrap();
+    bump_version(current_version, field)
+}
 
-    let new_version = match field {
+fn bump_version(current_version: &str, field: usize) -> String {
+    let Result::Ok(current) = semver::Version::parse(current_version) else {
+        return current_version.to_string();
+    };
+    let (major, minor, patch) = (current.major, current.minor, current.patch);
+    let pre = !current.pre.is_empty();
+
+    match field {
+        0 if pre => format!("{}.{}.{}", major, minor, patch),
         0 => format!("{}.{}.{}", major, minor, patch + 1),
+        1 if pre && patch == 0 => format!("{}.{}.0", major, minor),
         1 => format!("{}.{}.0", major, minor + 1),
+        2 if pre && minor == 0 && patch == 0 => format!("{}.0.0", major),
         2 => format!("{}.0.0", major + 1),
         _ => current_version.to_string(), // Fallback to current version if something goes wrong
-
-    };
-
-    return new_version;
-
+    }
 }
 
 /// Find README.md in any casing (readme.md, Readme.md, etc).
@@ -638,6 +642,34 @@ mod tests {
             .collect();
         entries.sort();
         entries
+    }
+
+    #[test]
+    fn bump_version_increments_stable_versions() {
+        assert_eq!(bump_version("1.2.3", 0), "1.2.4");
+        assert_eq!(bump_version("1.2.3", 1), "1.3.0");
+        assert_eq!(bump_version("1.2.3", 2), "2.0.0");
+    }
+
+    #[test]
+    fn bump_version_finalizes_prereleases_instead_of_double_bumping() {
+        // This used to panic: the old digit split hit "0-rc".parse::<u32>().
+        assert_eq!(bump_version("1.0.0-rc.1", 0), "1.0.0");
+        assert_eq!(bump_version("1.0.0-rc.1", 1), "1.0.0");
+        assert_eq!(bump_version("1.0.0-rc.1", 2), "1.0.0");
+
+        // Lower components already set: the bump is real, tag still drops.
+        assert_eq!(bump_version("1.2.3-rc.1", 0), "1.2.3");
+        assert_eq!(bump_version("1.2.3-rc.1", 1), "1.3.0");
+        assert_eq!(bump_version("1.2.3-rc.1", 2), "2.0.0");
+        assert_eq!(bump_version("1.2.0-rc.1", 1), "1.2.0");
+        assert_eq!(bump_version("1.2.0-rc.1", 2), "2.0.0");
+    }
+
+    #[test]
+    fn bump_version_returns_unparseable_versions_unchanged() {
+        assert_eq!(bump_version("not-a-version", 0), "not-a-version");
+        assert_eq!(bump_version("1.2", 1), "1.2");
     }
 
     #[test]
