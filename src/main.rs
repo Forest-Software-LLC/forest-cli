@@ -16,7 +16,7 @@ mod platform;
 mod release_verify;
 mod uefn;
 mod utils;
-use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, audit_command, tree_command, maybe_notify_update};
+use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, audit_command, tree_command, override_command, exclude_command, maybe_notify_update};
 
 use std::env;
 
@@ -114,6 +114,42 @@ enum Commands {
         /// Only show this package's subtree (e.g. scope/name, alias, or bare name)
         package: Option<String>,
     },
+
+    /// Force a transitive dependency onto a semver range (lists overrides when no package is given)
+    Override {
+        /// Package to override (scope/name, or a bare name that is unambiguous)
+        package: Option<String>,
+
+        /// The new range, skipping the interactive prompt (fails if it satisfies no versions)
+        #[arg(short = 'r', long = "range")]
+        range: Option<String>,
+
+        /// Apply without the confirmation prompt
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+
+        /// Remove the override for this package
+        #[arg(long = "remove")]
+        remove: bool,
+    },
+
+    /// Ban versions of a package from ever being installed (lists exclusions when no package is given)
+    Exclude {
+        /// Package to exclude versions of (scope/name, or a bare name that is unambiguous)
+        package: Option<String>,
+
+        /// The range of versions to ban (e.g. "=1.6.0"), skipping the interactive prompt
+        #[arg(short = 'r', long = "range")]
+        range: Option<String>,
+
+        /// Apply without the confirmation prompt
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+
+        /// Remove the exclusion for this package
+        #[arg(long = "remove")]
+        remove: bool,
+    },
 }
 
 #[tokio::main]
@@ -172,6 +208,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Tree { package } => {
             tree_command(package)?;
+        }
+        Commands::Override { package, range, yes, remove } => {
+            override_command(package, range, yes, remove).await?;
+        }
+        Commands::Exclude { package, range, yes, remove } => {
+            exclude_command(package, range, yes, remove).await?;
         }
     }
 

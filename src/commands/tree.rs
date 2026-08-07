@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::lockfile_gen::{lockfile_satisfies_manifest, LockFile};
 use crate::lockfile_solver::{DepSpec, LockfileEntry};
 use crate::message::{info, warn};
-use crate::utils::{digest_package_name, get_ci, normalize_forest_deps, resolve_dep_ref, DepRef};
+use crate::utils::{digest_package_name, get_ci, normalize_forest_deps, normalize_forest_excludes, normalize_forest_overrides, resolve_dep_ref, DepRef};
 
 /// Print the dependency tree from forest-lock.json. Fully offline: the
 /// lockfile stores each entry's resolved deps with exact versions, so no
@@ -70,13 +70,27 @@ pub fn tree_command(target_package: Option<String>) -> Result<()> {
 
     // Same trust check install uses (UEFN widens the roots to the whole
     // workspace). A stale lockfile still prints since it's what is on disk.
+    let overrides = normalize_forest_overrides(&manifest);
+    let excludes = normalize_forest_excludes(&manifest);
+    // A package can be both a direct dep and overridden (the override
+    // predating `install <pkg>`); the override only rewrites transitive
+    // edges, so call the split out instead of letting the tree imply
+    // the root is pinned too.
+    for key in overrides.keys() {
+        if get_ci(&roots, key).is_some() {
+            warn(&format!(
+                "Override for {} applies only to transitive occurrences; the direct dependency keeps its declared range.",
+                key
+            ));
+        }
+    }
     let resolution_roots = crate::platform::Platform::from_manifest(&manifest)?
         .resolution_roots(roots)?;
-    if !lockfile_satisfies_manifest(&lockfile, &resolution_roots) {
+    if !lockfile_satisfies_manifest(&lockfile, &resolution_roots, &overrides, &excludes) {
         warn("forest.json changed since the last install; run `forest install` to refresh the tree.");
     }
 
-    print!("{}", render_tree(&project_label(&manifest), &display_roots, &lockfile));
+    print!("{}", render_tree(&project_label(&manifest), &display_roots, &lockfile, &overrides, &excludes));
     Ok(())
 }
 
@@ -93,7 +107,7 @@ fn project_label(manifest: &Value) -> String {
     label
 }
 
-fn render_tree(label: &str, roots: &HashMap<String, DepSpec>, lockfile: &LockFile) -> String {
+fn render_tree(label: &str, roots: &HashMap<String, DepSpec>, lockfile: &LockFile, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>) -> String {
     let mut out = format!("{}\n", label.bold());
     let mut sorted: Vec<(&String, &DepSpec)> = roots.iter().collect();
     sorted.sort_by_key(|(k, _)| k.to_lowercase());
@@ -102,7 +116,7 @@ fn render_tree(label: &str, roots: &HashMap<String, DepSpec>, lockfile: &LockFil
     for (i, (name, spec)) in sorted.iter().enumerate() {
         let last = i + 1 == sorted.len();
         let entry = find_root_entry(lockfile, name, &spec.version);
-        render_dep(lockfile, name, spec, entry, "", last, &mut stack, &mut out);
+        render_dep(lockfile, overrides, excludes, name, spec, entry, "", last, true, &mut stack, &mut out);
     }
     out
 }
@@ -121,11 +135,14 @@ fn find_root_entry<'a>(lockfile: &'a LockFile, name: &str, range: &str) -> Optio
 
 fn render_dep(
     lockfile: &LockFile,
+    overrides: &HashMap<String, String>,
+    excludes: &HashMap<String, String>,
     name: &str,
     spec: &DepSpec,
     entry: Option<&LockfileEntry>,
     prefix: &str,
     last: bool,
+    is_root: bool,
     stack: &mut Vec<(String, String)>,
     out: &mut String,
 ) {
@@ -143,6 +160,18 @@ fn render_dep(
     // Call out deps installed under a different folder name than their own.
     if spec.alias != digest_package_name(name).name {
         label.push_str(&format!(" {}", format!("(as {})", spec.alias).dimmed()));
+    }
+    // Overrides rewrite transitive edges only — a root occurrence keeps its
+    // declared range, so tagging it would claim a pin that isn't applied.
+    if !is_root {
+        if let Some(range) = get_ci(overrides, name) {
+            label.push_str(&format!(" {}", format!("(overridden: {})", range).yellow()));
+        }
+    }
+    // Exclusions are uniform (they filter roots too), so every occurrence
+    // gets the tag.
+    if let Some(range) = get_ci(excludes, name) {
+        label.push_str(&format!(" {}", format!("(excluding {})", range).yellow()));
     }
 
     let Some(entry) = entry else {
@@ -167,7 +196,7 @@ fn render_dep(
         // Dep versions in the lockfile are exact, so match them verbatim.
         let dep_entry = get_ci(&lockfile.packages, dep_name)
             .and_then(|entries| entries.iter().find(|e| e.version == dep_spec.version));
-        render_dep(lockfile, dep_name, dep_spec, dep_entry, &child_prefix, dep_last, stack, out);
+        render_dep(lockfile, overrides, excludes, dep_name, dep_spec, dep_entry, &child_prefix, dep_last, false, stack, out);
     }
     stack.pop();
 }
@@ -197,6 +226,8 @@ mod tests {
     fn lockfile(packages: Vec<(&str, Vec<LockfileEntry>)>) -> LockFile {
         LockFile {
             file_version: 2,
+            overrides: HashMap::new(),
+            excludes: HashMap::new(),
             packages: packages.into_iter().map(|(n, e)| (n.to_string(), e)).collect(),
         }
     }
@@ -207,7 +238,76 @@ mod tests {
 
     fn render_plain(label: &str, roots: &HashMap<String, DepSpec>, lf: &LockFile) -> String {
         colored::control::set_override(false);
-        render_tree(label, roots, lf)
+        render_tree(label, roots, lf, &HashMap::new(), &HashMap::new())
+    }
+
+    fn map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn root_occurrence_of_an_overridden_package_is_not_tagged() {
+        // signal is both a direct dep (keeps its own range -> 2.0.3) and a
+        // transitive dep of comm (override applies -> 1.5.0). Only the
+        // transitive node carries the tag.
+        colored::control::set_override(false);
+        let lf = lockfile(vec![
+            ("sleitnick/signal", vec![
+                entry("2.0.3", "~", &[]),
+                entry("1.5.0", "Comm", &[]),
+            ]),
+            ("sleitnick/comm", vec![
+                entry("1.0.1", "~", &[("sleitnick/signal", "1.5.0")]),
+            ]),
+        ]);
+        let r = roots(&[("sleitnick/comm", "^1.0.0"), ("sleitnick/signal", "^2.0.0")]);
+        let overrides = map(&[("sleitnick/signal", "^1.0.0")]);
+        assert_eq!(
+            render_tree("proj", &r, &lf, &overrides, &HashMap::new()),
+            "proj\n\
+             ├── sleitnick/comm@1.0.1\n\
+             │   └── sleitnick/signal@1.5.0 (overridden: ^1.0.0)\n\
+             └── sleitnick/signal@2.0.3\n"
+        );
+    }
+
+    #[test]
+    fn excluded_packages_are_tagged_everywhere_including_roots() {
+        // Exclusions filter roots too, so the tag is uniform.
+        colored::control::set_override(false);
+        let lf = lockfile(vec![
+            ("a/x", vec![entry("1.0.0", "~", &[("b/y", "1.5.2")])]),
+            ("b/y", vec![
+                entry("1.5.2", "x", &[]),
+                entry("1.5.2", "~", &[]),
+            ]),
+        ]);
+        let r = roots(&[("a/x", "^1.0.0"), ("b/y", "^1.0.0")]);
+        let excludes = map(&[("b/y", "=1.6.0")]);
+        assert_eq!(
+            render_tree("proj", &r, &lf, &HashMap::new(), &excludes),
+            "proj\n\
+             ├── a/x@1.0.0\n\
+             │   └── b/y@1.5.2 (excluding =1.6.0)\n\
+             └── b/y@1.5.2 (excluding =1.6.0)\n"
+        );
+    }
+
+    #[test]
+    fn overridden_packages_are_tagged_wherever_they_appear() {
+        colored::control::set_override(false);
+        let lf = lockfile(vec![
+            ("a/x", vec![entry("1.0.0", "~", &[("b/y", "2.1.2")])]),
+            ("b/y", vec![entry("2.1.2", "x", &[])]),
+        ]);
+        let r = roots(&[("a/x", "^1.0.0")]);
+        let overrides = map(&[("b/y", "^2.0.0")]);
+        assert_eq!(
+            render_tree("proj", &r, &lf, &overrides, &HashMap::new()),
+            "proj\n\
+             └── a/x@1.0.0\n    \
+                 └── b/y@2.1.2 (overridden: ^2.0.0)\n"
+        );
     }
 
     #[test]

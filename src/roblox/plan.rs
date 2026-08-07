@@ -370,7 +370,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        (LockFile { file_version: 2, packages }, root_deps)
+        (LockFile { file_version: 2, overrides: HashMap::new(), excludes: HashMap::new(), packages }, root_deps)
     }
 
     #[test]
@@ -452,7 +452,7 @@ mod tests {
         );
         let root_deps: HashMap<String, DepSpec> =
             [dep("acme/a", "A", "^1.0.0"), dep("acme/c", "C", "^1.0.0")].into_iter().collect();
-        let lockfile = LockFile { file_version: 2, packages };
+        let lockfile = LockFile { file_version: 2, overrides: HashMap::new(), excludes: HashMap::new(), packages };
 
         let plan = plan_install(&lockfile, &root_deps).unwrap();
 

@@ -66,6 +66,10 @@ By default the CLI talks to the production API. Set `ENV=dev` to target a local 
 - [docs](https://docs.forest.dev) - documentation
 - `releases.forest.dev` - CLI releases and install scripts
 
+## AI use
+
+Forest is developed with AI assistance, directed and reviewed by the maintainers. See [AI_USE.md](AI_USE.md) for what that means in practice.
+
 ## License
 
 See [LICENSE](LICENSE).

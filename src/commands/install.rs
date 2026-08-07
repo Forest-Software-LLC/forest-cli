@@ -9,7 +9,7 @@ use crate::http::packages_api_request;
 use crate::lockfile_solver::DepSpec;
 use crate::message::{Message, MessageType};
 use crate::lockfile_gen::{lockfile_gen, lockfile_satisfies_manifest, make_directories, LockFile};
-use crate::utils::normalize_forest_deps;
+use crate::utils::{normalize_forest_deps, normalize_forest_excludes, normalize_forest_overrides};
 
 /// Install dependencies for a forest package.
 pub async fn install_command(
@@ -105,12 +105,14 @@ pub async fn install_command(
         }
     }
 
+    // Read before `deps` takes its mutable borrow of the manifest.
+    let manifest_overrides = normalize_forest_overrides(&info);
     let deps = info.get_mut("dependencies").unwrap().as_object_mut().unwrap();
 
     if let Some(pkg) = target_package {
         
 
-        let mut package_identifiers : Vec<&str> = pkg.split("/").collect();
+        let package_identifiers : Vec<&str> = pkg.split("/").collect();
 
 
         if package_identifiers.len() != 2 {
@@ -120,10 +122,6 @@ pub async fn install_command(
             );
             return Ok(());
         }        
-
-        if package_identifiers[0].starts_with('@') {
-            package_identifiers[0] = &package_identifiers[0][1..];
-        }
 
         // Validate alias
         if let Some(a) = &alias {
@@ -200,6 +198,25 @@ pub async fn install_command(
             msg.emit(
                 MessageType::Info,
                 &plat.resolved_note(&pkg, &canonical_full, &resolved_name),
+            );
+        }
+
+        // The override command refuses direct deps, but the reverse path —
+        // installing a package that is already overridden — lands in a
+        // split: transitive edges follow the override, this new direct dep
+        // follows its own range. Legal, but never silently. (Exclusions
+        // need no warning: they filter this new direct dep too.)
+        if let Some(override_key) = manifest_overrides
+            .keys()
+            .find(|k| crate::utils::same_package(k, &canonical_full))
+            .cloned()
+        {
+            msg.emit(
+                MessageType::Warn,
+                &format!(
+                    "{} is overridden in forest.json; the override applies only to transitive occurrences, not this direct dependency. Remove it with `forest override {} --remove` if that is not intended.",
+                    override_key, override_key
+                ),
             );
         }
 
@@ -328,7 +345,7 @@ async fn sync_from_lockfile(
         Some(lf) => {
             let roots = crate::platform::Platform::from_manifest(info)?
                 .resolution_roots(normalize_forest_deps(info))?;
-            if lockfile_satisfies_manifest(&lf, &roots) {
+            if lockfile_satisfies_manifest(&lf, &roots, &normalize_forest_overrides(info), &normalize_forest_excludes(info)) {
                 Some(lf)
             } else {
                 msg.emit(

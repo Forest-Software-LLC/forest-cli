@@ -202,6 +202,23 @@ pub async fn publish_command() -> Result<()> {
     let mut forest_json: Value = serde_json::from_str(&fs::read_to_string(&manifest_path)?)
         .context("Failed to parse forest.json")?;
 
+    // Overrides/excludes only apply to the project that declares them (the
+    // registry strips the fields), so consumers of this package will resolve
+    // its dependencies from their declared ranges alone.
+    let has_overrides = !crate::utils::normalize_forest_overrides(&forest_json).is_empty();
+    let has_excludes = !crate::utils::normalize_forest_excludes(&forest_json).is_empty();
+    if has_overrides || has_excludes {
+        let what = match (has_overrides, has_excludes) {
+            (true, true) => "overrides and excludes",
+            (true, false) => "overrides",
+            _ => "excludes",
+        };
+        crate::message::warn(&format!(
+            "forest.json declares {}; they apply only to this project and are ignored in the published package.",
+            what
+        ));
+    }
+
     // The platform owns every divergent step below (entry-point resolution,
     // naming rules, extra metadata, pre-pack lints) — commands stay
     // platform-blind. A missing/unknown platform is a hard error here: the

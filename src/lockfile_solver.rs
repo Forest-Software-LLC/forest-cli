@@ -96,15 +96,58 @@ pub struct DepSpec {
     pub version: String,
 }
 
+/// What the manifest's overrides and excludes actually did during
+/// resolution. All lists hold manifest keys, sorted for deterministic
+/// output.
+#[derive(Debug, Default)]
+pub struct SolveReport {
+    /// Total dependency edges the overrides rewrote during resolution.
+    pub override_edges: usize,
+    /// Overrides that matched no edge in the resolved graph.
+    pub override_unused: Vec<String>,
+    /// Overrides every rewritten edge would satisfy naturally — removing
+    /// them would not change the resolution.
+    pub override_unnecessary: Vec<String>,
+    /// Excludes whose package never appeared in the graph.
+    pub exclude_unused: Vec<String>,
+    /// Excludes that removed nothing any range would have picked — natural
+    /// resolution already lands outside the banned set.
+    pub exclude_inert: Vec<String>,
+}
+
 /// Resolves the dependency graph. Also returns license-safety issues for any
 /// resolved version the registry rated caution/unsafe — each version is fetched
 /// exactly once, so issues are naturally deduplicated. The final map records
 /// root manifest keys whose registry identity is a different package name
 /// entirely (claimed/renamed scopes, e.g. a wally scope claimed under a new
 /// username) — casing-only differences are not renames.
-pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform : String, msg: &mut Message) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>)> {
+pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, platform : String, msg: &mut Message) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>, SolveReport)> {
     let mut resolved: ResolvedVersions = HashMap::new();
     let mut license_warnings: Vec<LicenseInfo> = Vec::new();
+
+    // Overrides force every transitive edge to a package onto one range,
+    // replacing the parent's declared range. Root deps are never rewritten:
+    // their ranges are the user's own manifest entries. Keyed lowercased so
+    // any publisher casing of the dep name matches.
+    let overrides_lc: HashMap<String, String> = overrides.iter()
+        .map(|(k, v)| (k.to_lowercase(), v.clone()))
+        .collect();
+    // Declared ranges each override replaced, for the unused/unnecessary report.
+    let mut override_hits: HashMap<String, Vec<String>> = HashMap::new();
+
+    // Excludes ban versions outright: they are filtered from the candidate
+    // set wherever versions are matched, for roots and transitive deps
+    // alike, so declared ranges are still honored — or resolution fails
+    // naming the exclusion. An unparseable exclude range is a hard error,
+    // same as an unparseable dependency range.
+    let mut excludes_lc: HashMap<String, VersionReq> = HashMap::new();
+    for (pkg, range) in excludes {
+        let req = VersionReq::parse(range)
+            .with_context(|| format!("Invalid exclude range {} for {} in forest.json", range, pkg))?;
+        excludes_lc.insert(pkg.to_lowercase(), req);
+    }
+    // Every range requested for an excluded package, for the inert report.
+    let mut exclude_ranges_seen: HashMap<String, Vec<String>> = HashMap::new();
     // Live spinner counter: versions whose metadata has been fetched. The BFS
     // discovers the tree as it goes, so there is no fixed total to show.
     let mut resolved_count: usize = 0;
@@ -203,15 +246,29 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         let pkg_state = resolved.get_mut(&key)
             .expect("package state exists after first-encounter fetch");
 
-        // filter by range
+        // filter by range, then drop excluded versions from the candidates
         let req = VersionReq::parse(&version_range)
             .with_context(|| format!("Invalid range {} for {}", version_range, name.full_name))?;
+        let exclude_req = excludes_lc.get(&key);
+        if exclude_req.is_some() {
+            exclude_ranges_seen.entry(key.clone()).or_default().push(version_range.clone());
+        }
         let all_versions: Vec<String> = pkg_state.versions.keys().cloned().collect();
-        let mut matches: Vec<String> = all_versions.iter()
+        let raw_matches: Vec<String> = all_versions.iter()
             .filter(|v| Version::parse(v).map(|ver| req.matches(&ver)).unwrap_or(false))
             .cloned()
             .collect();
+        let mut matches: Vec<String> = raw_matches.iter()
+            .filter(|v| !version_excluded(exclude_req, v))
+            .cloned()
+            .collect();
         if matches.is_empty() {
+            if !raw_matches.is_empty() {
+                anyhow::bail!(
+                    "Every version of {} matching {} is excluded by forest.json; remove or narrow the exclusion with `forest exclude {} --remove`",
+                    name.full_name, version_range, name.full_name
+                );
+            }
             anyhow::bail!("No versions found for {} matching {}", name.full_name, version_range);
         }
 
@@ -221,6 +278,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         for (bucket_ver, ranges) in pkg_state.buckets.clone() {
             let mut in_bucket: Vec<String> = all_versions.iter()
                 .filter(|v| req.matches(&Version::parse(v).unwrap()))
+                .filter(|v| !version_excluded(exclude_req, v))
                 .cloned().collect();
             for br in &ranges {
                 let br_req = VersionReq::parse(br).unwrap();
@@ -303,6 +361,19 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
                 }
             })
             .collect::<anyhow::Result<_>>()?;
+
+        // Rewrite overridden edges before they are stored or queued, so
+        // bucket grouping and the phase-2 dep lookup both see the forced
+        // range. The alias (install folder name) stays the parent's.
+        let deps_hm: HashMap<String, DepSpec> = deps_hm.into_iter()
+            .map(|(dep_name, mut spec)| {
+                if let Some(forced) = overrides_lc.get(&dep_name.to_lowercase()) {
+                    override_hits.entry(dep_name.to_lowercase()).or_default().push(spec.version.clone());
+                    spec.version = forced.clone();
+                }
+                (dep_name, spec)
+            })
+            .collect();
 
         vs.dependencies = deps_hm.clone();
         vs.integrity = package_info.get("integrity")
@@ -444,7 +515,99 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, platform
         }
     }
 
-    Ok((lockfile, license_warnings, root_renames))
+    // 4) Solve report: which overrides/excludes did nothing (unused) and
+    // which no longer change the outcome (unnecessary/inert).
+    let mut report = SolveReport::default();
+    report.override_edges = override_hits.values().map(|hits| hits.len()).sum();
+    for (key, range) in overrides {
+        let lc = key.to_lowercase();
+        let Some(hits) = override_hits.get(&lc) else {
+            report.override_unused.push(key.clone());
+            continue;
+        };
+        let (Some(state), Ok(override_req)) = (resolved.get(&lc), VersionReq::parse(range)) else {
+            continue;
+        };
+        // "Natural resolution" respects exclusions, so judge the override
+        // against the non-excluded pool.
+        let exclude_req = excludes_lc.get(&lc);
+        let available: Vec<Version> = state.versions.keys()
+            .filter(|v| !version_excluded(exclude_req, v))
+            .filter_map(|v| Version::parse(v).ok())
+            .collect();
+        let mut declared: Vec<String> = hits.clone();
+        declared.sort();
+        declared.dedup();
+        if override_is_unnecessary(&available, &declared, &override_req) {
+            report.override_unnecessary.push(key.clone());
+        }
+    }
+    for (key, _) in excludes {
+        let lc = key.to_lowercase();
+        let Some(state) = resolved.get(&lc) else {
+            report.exclude_unused.push(key.clone());
+            continue;
+        };
+        let (Some(ranges), Some(exclude_req)) = (exclude_ranges_seen.get(&lc), excludes_lc.get(&lc)) else {
+            continue;
+        };
+        let available: Vec<Version> = state.versions.keys()
+            .filter_map(|v| Version::parse(v).ok())
+            .collect();
+        let mut ranges = ranges.clone();
+        ranges.sort();
+        ranges.dedup();
+        if exclusion_is_inert(&available, &ranges, exclude_req) {
+            report.exclude_inert.push(key.clone());
+        }
+    }
+    report.override_unused.sort();
+    report.override_unnecessary.sort();
+    report.exclude_unused.sort();
+    report.exclude_inert.sort();
+
+    Ok((lockfile, license_warnings, root_renames, report))
+}
+
+/// True when the version string parses and the exclusion range bans it.
+fn version_excluded(exclude_req: Option<&VersionReq>, v: &str) -> bool {
+    match (exclude_req, Version::parse(v)) {
+        (Some(req), Ok(ver)) => req.matches(&ver),
+        _ => false,
+    }
+}
+
+/// True when no requested range would naturally pick a banned version —
+/// the exclusion currently changes nothing (a newer allowed version now
+/// outranks the banned ones everywhere).
+fn exclusion_is_inert(available: &[Version], ranges: &[String], exclude_req: &VersionReq) -> bool {
+    !ranges.is_empty()
+        && ranges.iter().all(|range| {
+            let Ok(req) = VersionReq::parse(range) else {
+                return false;
+            };
+            available.iter()
+                .filter(|v| req.matches(v))
+                .max()
+                .map_or(true, |natural| !exclude_req.matches(natural))
+        })
+}
+
+/// True when every declared range the override replaced would naturally
+/// resolve to a version the override also accepts — removing the override
+/// would not change any edge it rewrote. A declared range matching nothing
+/// keeps the override load-bearing.
+fn override_is_unnecessary(available: &[Version], declared_ranges: &[String], override_req: &VersionReq) -> bool {
+    !declared_ranges.is_empty()
+        && declared_ranges.iter().all(|range| {
+            let Ok(req) = VersionReq::parse(range) else {
+                return false;
+            };
+            available.iter()
+                .filter(|v| req.matches(v))
+                .max()
+                .map_or(false, |natural| override_req.matches(natural))
+        })
 }
 
 
@@ -500,5 +663,93 @@ mod tests {
     fn no_matching_bucket_is_none() {
         let b = buckets(&["2.0.0"]);
         assert_eq!(select_root_bucket(b.iter(), &req("^1.0.0")), None);
+    }
+
+    fn versions(list: &[&str]) -> Vec<Version> {
+        list.iter().map(|v| Version::parse(v).unwrap()).collect()
+    }
+
+    #[test]
+    fn override_still_needed_when_parents_resolve_outside_it() {
+        // Parent declares ^1.0.0, override forces ^2.0.0: removing the
+        // override would land on 1.4.0.
+        let avail = versions(&["1.4.0", "2.1.2"]);
+        assert!(!override_is_unnecessary(
+            &avail,
+            &["^1.0.0".to_string()],
+            &req("^2.0.0")
+        ));
+    }
+
+    #[test]
+    fn override_unnecessary_when_natural_resolution_already_satisfies_it() {
+        // Parent bumped to ^2.0.0 upstream; the override changes nothing.
+        let avail = versions(&["1.4.0", "2.1.2"]);
+        assert!(override_is_unnecessary(
+            &avail,
+            &["^2.0.0".to_string()],
+            &req("^2.0.0")
+        ));
+    }
+
+    #[test]
+    fn override_kept_when_any_parent_still_needs_it() {
+        let avail = versions(&["1.4.0", "2.1.2"]);
+        assert!(!override_is_unnecessary(
+            &avail,
+            &["^1.0.0".to_string(), "^2.0.0".to_string()],
+            &req("^2.0.0")
+        ));
+    }
+
+    #[test]
+    fn override_kept_when_declared_range_matches_nothing() {
+        // Without the override the install would fail outright.
+        let avail = versions(&["2.1.2"]);
+        assert!(!override_is_unnecessary(
+            &avail,
+            &["^1.0.0".to_string()],
+            &req("^2.0.0")
+        ));
+    }
+
+    #[test]
+    fn exclusion_active_while_a_banned_version_is_the_natural_pick() {
+        // ^1.5.0 would naturally take 1.6.0 — the exclusion is doing work.
+        let avail = versions(&["1.5.2", "1.6.0"]);
+        assert!(!exclusion_is_inert(
+            &avail,
+            &["^1.5.0".to_string()],
+            &req("=1.6.0")
+        ));
+    }
+
+    #[test]
+    fn exclusion_inert_once_a_newer_allowed_version_wins() {
+        // 1.6.1 shipped; every range now lands past the banned 1.6.0.
+        let avail = versions(&["1.5.2", "1.6.0", "1.6.1"]);
+        assert!(exclusion_is_inert(
+            &avail,
+            &["^1.5.0".to_string()],
+            &req("=1.6.0")
+        ));
+    }
+
+    #[test]
+    fn exclusion_stays_active_if_any_range_still_hits_it() {
+        let avail = versions(&["1.5.2", "1.6.0", "1.6.1"]);
+        assert!(!exclusion_is_inert(
+            &avail,
+            &["^1.5.0".to_string(), "=1.6.0".to_string()],
+            &req("=1.6.0")
+        ));
+    }
+
+    #[test]
+    fn version_excluded_requires_a_parseable_version() {
+        assert!(version_excluded(Some(&req("=1.6.0")), "1.6.0"));
+        assert!(!version_excluded(Some(&req("=1.6.0")), "1.6.1"));
+        assert!(!version_excluded(None, "1.6.0"));
+        assert!(!version_excluded(Some(&req("=1.6.0")), "not-a-version"));
     }
 }

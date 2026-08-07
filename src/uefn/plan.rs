@@ -235,6 +235,8 @@ mod tests {
     fn lockfile(packages: Vec<(&str, Vec<LockfileEntry>)>) -> LockFile {
         LockFile {
             file_version: 2,
+            overrides: std::collections::HashMap::new(),
+            excludes: std::collections::HashMap::new(),
             packages: packages.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
         }
     }

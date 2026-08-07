@@ -14,7 +14,7 @@ use urlencoding::encode;
 use reqwest::Method;
 use crate::http::packages_api_request;
 use crate::platform::Platform;
-use crate::utils::{digest_package_name, get_ci, normalize_forest_deps};
+use crate::utils::{digest_package_name, get_ci, normalize_forest_deps, normalize_forest_excludes, normalize_forest_overrides};
 use crate::lockfile_solver::{get_lockfile_packages, DepSpec, LockfileEntry};
 use crate::message::{Message, MessageType};
 
@@ -23,6 +23,14 @@ use crate::message::{Message, MessageType};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LockFile {
     pub file_version: u32,
+    /// The manifest overrides this resolution was solved under, so adding,
+    /// changing, or removing an override invalidates the lockfile. Absent
+    /// from disk when empty — pre-override lockfiles parse unchanged.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub overrides: HashMap<String, String>,
+    /// Same recording for the manifest's excludes (banned version ranges).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub excludes: HashMap<String, String>,
     pub packages: HashMap<String, Vec<LockfileEntry>>,
 }
 
@@ -35,7 +43,23 @@ pub struct LockFile {
 pub fn lockfile_satisfies_manifest(
     lockfile: &LockFile,
     roots: &HashMap<String, DepSpec>,
+    overrides: &HashMap<String, String>,
+    excludes: &HashMap<String, String>,
 ) -> bool {
+    // The lockfile records the overrides/excludes it was solved under; any
+    // drift (added, changed, or removed entry) forces re-resolution. Ranges
+    // are compared verbatim — rewriting "^2.0" to "^2.0.0" is a re-solve,
+    // which lands on the same versions anyway.
+    let maps_match = |locked: &HashMap<String, String>, declared: &HashMap<String, String>| {
+        locked.len() == declared.len()
+            && declared.iter().all(|(name, range)| {
+                get_ci(locked, name).map_or(false, |l| l.trim() == range.trim())
+            })
+    };
+    if !maps_match(&lockfile.overrides, overrides) || !maps_match(&lockfile.excludes, excludes) {
+        return false;
+    }
+
     for (name, spec) in roots {
         let Ok(req) = semver::VersionReq::parse(&spec.version) else {
             return false;
@@ -146,10 +170,47 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
     // Platforms may widen the roots beyond the invoking manifest (UEFN
     // resolves the whole workspace: project manifest + authored packages).
     let roots = Platform::parse(&platform)?.resolution_roots(roots)?;
+    let overrides = normalize_forest_overrides(forest_json);
+    let excludes = normalize_forest_excludes(forest_json);
 
     msg.update("Resolving dependencies...");
-    let (lockfile_packages, license_warnings, root_renames) = get_lockfile_packages(roots.clone(), platform.clone(), msg).await
+    let (lockfile_packages, license_warnings, root_renames, solve_report) = get_lockfile_packages(roots.clone(), &overrides, &excludes, platform.clone(), msg).await
         .context("Failed to resolve lockfile packages")?;
+
+    if solve_report.override_edges > 0 {
+        msg.emit(
+            MessageType::Info,
+            &format!(
+                "Declared overrides modified {} edge{}. Run `forest tree` to view.",
+                solve_report.override_edges,
+                if solve_report.override_edges == 1 { "" } else { "s" }
+            ),
+        );
+    }
+    for key in &solve_report.override_unused {
+        msg.emit(
+            MessageType::Warn,
+            &format!("Override for {} matched no dependency in the tree; remove it with `forest override {} --remove`.", key, key),
+        );
+    }
+    for key in &solve_report.override_unnecessary {
+        msg.emit(
+            MessageType::Info,
+            &format!("Override for {} is no longer needed — dependencies already resolve inside it. Remove it with `forest override {} --remove`.", key, key),
+        );
+    }
+    for key in &solve_report.exclude_unused {
+        msg.emit(
+            MessageType::Warn,
+            &format!("Exclusion for {} matched no dependency in the tree; remove it with `forest exclude {} --remove`.", key, key),
+        );
+    }
+    for key in &solve_report.exclude_inert {
+        msg.emit(
+            MessageType::Info,
+            &format!("Exclusion for {} no longer affects resolution — every range now picks an allowed version. Safe to remove with `forest exclude {} --remove`.", key, key),
+        );
+    }
 
     // A claimed/renamed scope resolves under its old name but the lockfile is keyed by the canonical one. re-key the roots to match
     let mut roots = roots;
@@ -209,6 +270,8 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
 
     let lockfile : LockFile = LockFile {
         file_version: 2,
+        overrides,
+        excludes,
         packages: lockfile_packages
     };
 
@@ -320,7 +383,11 @@ mod tests {
                 dependencies: HashMap::new(),
             });
         }
-        LockFile { file_version: 2, packages }
+        LockFile { file_version: 2, overrides: HashMap::new(), excludes: HashMap::new(), packages }
+    }
+
+    fn overrides(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
 
     fn roots(pairs: &[(&str, &str)]) -> HashMap<String, DepSpec> {
@@ -335,7 +402,7 @@ mod tests {
     #[test]
     fn satisfied_lockfile_is_trusted() {
         let lf = lockfile(&[("a/b", "1.5.2", "~"), ("c/d", "0.3.0", "b")]);
-        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")])));
+        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")]), &overrides(&[]), &overrides(&[])));
     }
 
     #[test]
@@ -343,7 +410,7 @@ mod tests {
         // The reported bug: ^1.5.0 was installed, the manifest now says
         // ^2.0.0, and install kept saying "already up to date".
         let lf = lockfile(&[("a/b", "1.5.2", "~")]);
-        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^2.0.0")])));
+        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^2.0.0")]), &overrides(&[]), &overrides(&[])));
     }
 
     #[test]
@@ -352,13 +419,15 @@ mod tests {
         assert!(!lockfile_satisfies_manifest(
             &lf,
             &roots(&[("a/b", "^1.5.0"), ("c/d", "^0.3.0")]),
+            &overrides(&[]),
+            &overrides(&[]),
         ));
     }
 
     #[test]
     fn removed_dep_with_lingering_root_pin_invalidates_the_lockfile() {
         let lf = lockfile(&[("a/b", "1.5.2", "~"), ("c/d", "0.3.0", "~")]);
-        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")])));
+        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")]), &overrides(&[]), &overrides(&[])));
     }
 
     #[test]
@@ -366,20 +435,94 @@ mod tests {
         // c/d lives inside a/b's subtree, not at the root - it's a/b's
         // dependency, not a removed manifest entry.
         let lf = lockfile(&[("a/b", "1.5.2", "~"), ("c/d", "0.3.0", "b")]);
-        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")])));
+        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")]), &overrides(&[]), &overrides(&[])));
     }
 
     #[test]
     fn key_casing_differences_still_match() {
         let lf = lockfile(&[("Scope/Pkg", "1.5.2", "~")]);
-        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("scope/pkg", "^1.5.0")])));
+        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("scope/pkg", "^1.5.0")]), &overrides(&[]), &overrides(&[])));
     }
 
     #[test]
     fn unparseable_range_forces_reresolution() {
         // The solver owns range errors; the check just refuses the fast path.
         let lf = lockfile(&[("a/b", "1.5.2", "~")]);
-        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "not-a-range")])));
+        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "not-a-range")]), &overrides(&[]), &overrides(&[])));
+    }
+
+    #[test]
+    fn added_override_invalidates_the_lockfile() {
+        let lf = lockfile(&[("a/b", "1.5.2", "~")]);
+        assert!(!lockfile_satisfies_manifest(
+            &lf,
+            &roots(&[("a/b", "^1.5.0")]),
+            &overrides(&[("c/d", "^2.0.0")]),
+            &overrides(&[]),
+        ));
+    }
+
+    #[test]
+    fn matching_override_keeps_the_lockfile_trusted() {
+        let mut lf = lockfile(&[("a/b", "1.5.2", "~")]);
+        lf.overrides = overrides(&[("c/d", "^2.0.0")]);
+        assert!(lockfile_satisfies_manifest(
+            &lf,
+            &roots(&[("a/b", "^1.5.0")]),
+            &overrides(&[("c/d", "^2.0.0")]),
+            &overrides(&[]),
+        ));
+        // Case-insensitive keys, like every other package-name map.
+        assert!(lockfile_satisfies_manifest(
+            &lf,
+            &roots(&[("a/b", "^1.5.0")]),
+            &overrides(&[("C/D", "^2.0.0")]),
+            &overrides(&[]),
+        ));
+    }
+
+    #[test]
+    fn changed_or_removed_override_invalidates_the_lockfile() {
+        let mut lf = lockfile(&[("a/b", "1.5.2", "~")]);
+        lf.overrides = overrides(&[("c/d", "^2.0.0")]);
+        assert!(!lockfile_satisfies_manifest(
+            &lf,
+            &roots(&[("a/b", "^1.5.0")]),
+            &overrides(&[("c/d", "^3.0.0")]),
+            &overrides(&[]),
+        ));
+        assert!(!lockfile_satisfies_manifest(
+            &lf,
+            &roots(&[("a/b", "^1.5.0")]),
+            &overrides(&[]),
+            &overrides(&[]),
+        ));
+    }
+
+    #[test]
+    fn exclude_drift_invalidates_the_lockfile() {
+        let mut lf = lockfile(&[("a/b", "1.5.2", "~")]);
+        lf.excludes = overrides(&[("c/d", "=1.6.0")]);
+        // Matching excludes keep the fast path.
+        assert!(lockfile_satisfies_manifest(
+            &lf,
+            &roots(&[("a/b", "^1.5.0")]),
+            &overrides(&[]),
+            &overrides(&[("C/D", "=1.6.0")]),
+        ));
+        // Changed or removed excludes re-resolve.
+        assert!(!lockfile_satisfies_manifest(
+            &lf,
+            &roots(&[("a/b", "^1.5.0")]),
+            &overrides(&[]),
+            &overrides(&[("c/d", "=1.6.1")]),
+        ));
+        assert!(!lockfile_satisfies_manifest(
+            &lf,
+            &roots(&[("a/b", "^1.5.0")]),
+            &overrides(&[]),
+            &overrides(&[]),
+        ));
     }
 
     #[test]

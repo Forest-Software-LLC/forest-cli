@@ -13,13 +13,9 @@ pub struct PackageName {
 }
 
 pub fn digest_package_name(name : &str) -> PackageName {
-    let mut parts: Vec<&str> = name.split('/').collect();
+    let parts: Vec<&str> = name.split('/').collect();
     if parts.len() == 1 {
         panic!("Invalid package name format");
-    }
-    if parts[0].starts_with('@') {
-        parts[0] = &parts[0][1..];
-        return PackageName { name: parts[1].to_string(), scope: parts[0].to_string(), full_name: name.to_string() };
     }
     PackageName { name: parts[1].to_string(), scope: parts[0].to_string(), full_name: name.to_string() }
 }
@@ -59,16 +55,14 @@ pub enum DepRef {
 
 /// Resolve a package reference against the declared dependencies. Accepts the
 /// full `scope/name` key, the install alias, or the bare package name - all
-/// case-insensitive, leading `@` ignored. Alias matches win over name-part
-/// matches (the alias is the name code requires by); the name part is only
-/// consulted when no declared alias claims the reference.
+/// case-insensitive. Alias matches win over name-part matches (the alias is
+/// the name code requires by); the name part is only consulted when no
+/// declared alias claims the reference.
 pub fn resolve_dep_ref(roots: &HashMap<String, DepSpec>, reference: &str) -> DepRef {
-    let reference = reference.trim_start_matches('@');
-
     if reference.contains('/') {
         return match roots
             .keys()
-            .find(|k| k.trim_start_matches('@').eq_ignore_ascii_case(reference))
+            .find(|k| k.eq_ignore_ascii_case(reference))
         {
             Some(key) => DepRef::Match(key.clone()),
             None => DepRef::NotFound,
@@ -133,6 +127,43 @@ pub fn normalize_forest_deps(forest_json : &Value) -> HashMap<String, DepSpec> {
 
 }
 
+/// Read the manifest's `overrides` map: `scope/name` -> semver range. An
+/// override forces every transitive edge to that package onto the given
+/// range, replacing whatever range the parent declared. Keys without a
+/// scope and non-string values are skipped; the solver reports overrides
+/// that never matched anything.
+pub fn normalize_forest_overrides(forest_json: &Value) -> HashMap<String, String> {
+    string_map_field(forest_json, "overrides")
+}
+
+/// Read the manifest's `excludes` map: `scope/name` -> semver range of
+/// versions that must never be installed. Unlike overrides, exclusions
+/// apply uniformly to direct and transitive deps: the solver just removes
+/// the banned versions from the candidate set, so every declared range is
+/// still honored — or resolution fails loudly when a range has no
+/// non-excluded version left.
+pub fn normalize_forest_excludes(forest_json: &Value) -> HashMap<String, String> {
+    string_map_field(forest_json, "excludes")
+}
+
+fn string_map_field(forest_json: &Value, field: &str) -> HashMap<String, String> {
+    forest_json
+        .get(field)
+        .and_then(|o| o.as_object())
+        .map_or_else(HashMap::new, |entries| {
+            entries
+                .iter()
+                .filter(|(k, _)| k.contains('/'))
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+}
+
+/// Package-name equality: case-insensitive.
+pub fn same_package(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,7 +186,6 @@ mod tests {
     fn full_key_matches_case_insensitively() {
         let r = roots(&[("Scope/Pkg", "")]);
         assert_eq!(resolve_dep_ref(&r, "scope/pkg"), DepRef::Match("Scope/Pkg".into()));
-        assert_eq!(resolve_dep_ref(&r, "@scope/pkg"), DepRef::Match("Scope/Pkg".into()));
         assert_eq!(resolve_dep_ref(&r, "other/pkg"), DepRef::NotFound);
     }
 
@@ -189,6 +219,41 @@ mod tests {
             DepRef::Ambiguous(keys) => assert_eq!(keys, vec!["a/Signal".to_string(), "b/Signal".to_string()]),
             other => panic!("expected Ambiguous, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn overrides_parse_and_skip_malformed_entries() {
+        let manifest = serde_json::json!({
+            "overrides": {
+                "scope/pkg": "^2.0.0",
+                "noscope": "^1.0.0",
+                "scope/other": { "version": "^1.0.0" }
+            }
+        });
+        let overrides = normalize_forest_overrides(&manifest);
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides["scope/pkg"], "^2.0.0");
+    }
+
+    #[test]
+    fn missing_overrides_field_is_empty() {
+        assert!(normalize_forest_overrides(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn excludes_parse_like_overrides() {
+        let manifest = serde_json::json!({
+            "excludes": { "scope/pkg": ">=1.6.0, <1.7.0", "noscope": "1.0.0" }
+        });
+        let excludes = normalize_forest_excludes(&manifest);
+        assert_eq!(excludes.len(), 1);
+        assert_eq!(excludes["scope/pkg"], ">=1.6.0, <1.7.0");
+    }
+
+    #[test]
+    fn same_package_ignores_case() {
+        assert!(same_package("Scope/Pkg", "scope/pkg"));
+        assert!(!same_package("a/pkg", "b/pkg"));
     }
 
     #[test]

@@ -174,7 +174,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
                 // Not a declared dep - maybe transitive, so try the
                 // lockfile's resolved tree (full key or bare name; lockfile
                 // entries carry no aliases).
-                let name = raw.trim_start_matches('@');
+                let name = raw.as_str();
                 let candidates: Vec<&String> = lock_packages
                     .map(|pkgs| {
                         pkgs.keys()
@@ -458,6 +458,53 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
         }
         println!("  {}", "Automated license review, not legal advice.".dimmed());
         println!();
+    }
+
+    // ---- Overrides & excludes ----
+    // Presence + resolved versions come straight from the lockfile; the
+    // deeper "no longer needed"/"inert" analysis runs at resolve time
+    // (install).
+    if matches!(target, AuditTarget::All) {
+        let installed_of = |name: &str| -> Vec<String> {
+            let mut versions: Vec<String> = lock_packages
+                .and_then(|pkgs| {
+                    pkgs.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                        .and_then(|(_, entries)| entries.as_array())
+                })
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|e| e.get("version").and_then(Value::as_str))
+                        .map(|v| v.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            versions.sort();
+            versions.dedup();
+            versions
+        };
+        let report_map = |label: &str, command: &str, entries: &HashMap<String, String>| {
+            if entries.is_empty() {
+                return;
+            }
+            message::info(&format!("{} {}(s) declared in forest.json:", entries.len(), label));
+            let mut sorted: Vec<(&String, &String)> = entries.iter().collect();
+            sorted.sort_by_key(|(k, _)| k.to_lowercase());
+            for (name, range) in sorted {
+                let installed = installed_of(name);
+                if installed.is_empty() {
+                    message::warn(&format!(
+                        "  {} -> {} (matched nothing; remove with `forest {} {} --remove`)",
+                        name, range, command, name
+                    ));
+                } else {
+                    message::info(&format!("  {} -> {} (installed {})", name, range, installed.join(", ")));
+                }
+            }
+        };
+        report_map("override", "override", &crate::utils::normalize_forest_overrides(&info));
+        report_map("exclusion", "exclude", &crate::utils::normalize_forest_excludes(&info));
     }
 
     if outdated.is_empty() {
