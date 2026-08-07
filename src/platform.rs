@@ -70,6 +70,12 @@ impl Platform {
         }
     }
 
+    /// Whether installs materialize hoisted deps as pointer modules (Roblox).
+    /// UEFN installs every package physically once in the flat mount.
+    pub fn uses_pointer_files(&self) -> bool {
+        matches!(self, Platform::Roblox)
+    }
+
     /// Interactive platform picker (shared by `forest init` and the
     /// create-on-install offer). Errors in non-interactive terminals.
     pub fn prompt() -> Result<Platform> {

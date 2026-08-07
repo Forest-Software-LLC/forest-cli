@@ -84,13 +84,13 @@ pub fn tree_command(target_package: Option<String>) -> Result<()> {
             ));
         }
     }
-    let resolution_roots = crate::platform::Platform::from_manifest(&manifest)?
-        .resolution_roots(roots)?;
+    let platform = crate::platform::Platform::from_manifest(&manifest)?;
+    let resolution_roots = platform.resolution_roots(roots)?;
     if !lockfile_satisfies_manifest(&lockfile, &resolution_roots, &overrides, &excludes) {
         warn("forest.json changed since the last install; run `forest install` to refresh the tree.");
     }
 
-    print!("{}", render_tree(&project_label(&manifest), &display_roots, &lockfile, &overrides, &excludes));
+    print!("{}", render_tree(&project_label(&manifest), &display_roots, &lockfile, &overrides, &excludes, platform.uses_pointer_files()));
     Ok(())
 }
 
@@ -107,16 +107,20 @@ fn project_label(manifest: &Value) -> String {
     label
 }
 
-fn render_tree(label: &str, roots: &HashMap<String, DepSpec>, lockfile: &LockFile, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>) -> String {
+fn render_tree(label: &str, roots: &HashMap<String, DepSpec>, lockfile: &LockFile, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, mark_pointers: bool) -> String {
     let mut out = format!("{}\n", label.bold());
     let mut sorted: Vec<(&String, &DepSpec)> = roots.iter().collect();
     sorted.sort_by_key(|(k, _)| k.to_lowercase());
 
     let mut stack = Vec::new();
+    let mut saw_pointer = false;
     for (i, (name, spec)) in sorted.iter().enumerate() {
         let last = i + 1 == sorted.len();
         let entry = find_root_entry(lockfile, name, &spec.version);
-        render_dep(lockfile, overrides, excludes, name, spec, entry, "", last, true, &mut stack, &mut out);
+        render_dep(lockfile, overrides, excludes, name, spec, entry, "", "~", last, true, mark_pointers, &mut saw_pointer, &mut stack, &mut out);
+    }
+    if saw_pointer {
+        out.push_str(&format!("{}\n", "↪ pointer to the physical copy elsewhere in the tree".dimmed()));
     }
     out
 }
@@ -141,8 +145,11 @@ fn render_dep(
     spec: &DepSpec,
     entry: Option<&LockfileEntry>,
     prefix: &str,
+    loc: &str,
     last: bool,
     is_root: bool,
+    mark_pointers: bool,
+    saw_pointer: &mut bool,
     stack: &mut Vec<(String, String)>,
     out: &mut String,
 ) {
@@ -157,6 +164,16 @@ fn render_dep(
             "(not installed)".red()
         ),
     };
+    // An occurrence away from its entry's recorded location is materialized
+    // as a pointer module, not a physical copy (Roblox hoisting).
+    if mark_pointers {
+        if let Some(e) = entry {
+            if !e.location.eq_ignore_ascii_case(loc) {
+                label.push_str(&format!(" {}", "↪"));
+                *saw_pointer = true;
+            }
+        }
+    }
     // Call out deps installed under a different folder name than their own.
     if spec.alias != digest_package_name(name).name {
         label.push_str(&format!(" {}", format!("(as {})", spec.alias).dimmed()));
@@ -191,12 +208,15 @@ fn render_dep(
 
     stack.push(key);
     let child_prefix = format!("{}{}", prefix, if last { "    " } else { "│   " });
+    // Children's location = this node's location + this node's alias, same
+    // construction as the solver's build_tree.
+    let child_loc = format!("{}/{}", loc, spec.alias);
     for (i, (dep_name, dep_spec)) in children.iter().enumerate() {
         let dep_last = i + 1 == children.len();
         // Dep versions in the lockfile are exact, so match them verbatim.
         let dep_entry = get_ci(&lockfile.packages, dep_name)
             .and_then(|entries| entries.iter().find(|e| e.version == dep_spec.version));
-        render_dep(lockfile, overrides, excludes, dep_name, dep_spec, dep_entry, &child_prefix, dep_last, false, stack, out);
+        render_dep(lockfile, overrides, excludes, dep_name, dep_spec, dep_entry, &child_prefix, &child_loc, dep_last, false, mark_pointers, saw_pointer, stack, out);
     }
     stack.pop();
 }
@@ -238,7 +258,7 @@ mod tests {
 
     fn render_plain(label: &str, roots: &HashMap<String, DepSpec>, lf: &LockFile) -> String {
         colored::control::set_override(false);
-        render_tree(label, roots, lf, &HashMap::new(), &HashMap::new())
+        render_tree(label, roots, lf, &HashMap::new(), &HashMap::new(), false)
     }
 
     fn map(entries: &[(&str, &str)]) -> HashMap<String, String> {
@@ -263,7 +283,7 @@ mod tests {
         let r = roots(&[("sleitnick/comm", "^1.0.0"), ("sleitnick/signal", "^2.0.0")]);
         let overrides = map(&[("sleitnick/signal", "^1.0.0")]);
         assert_eq!(
-            render_tree("proj", &r, &lf, &overrides, &HashMap::new()),
+            render_tree("proj", &r, &lf, &overrides, &HashMap::new(), false),
             "proj\n\
              ├── sleitnick/comm@1.0.1\n\
              │   └── sleitnick/signal@1.5.0 (overridden: ^1.0.0)\n\
@@ -285,7 +305,7 @@ mod tests {
         let r = roots(&[("a/x", "^1.0.0"), ("b/y", "^1.0.0")]);
         let excludes = map(&[("b/y", "=1.6.0")]);
         assert_eq!(
-            render_tree("proj", &r, &lf, &HashMap::new(), &excludes),
+            render_tree("proj", &r, &lf, &HashMap::new(), &excludes, false),
             "proj\n\
              ├── a/x@1.0.0\n\
              │   └── b/y@1.5.2 (excluding =1.6.0)\n\
@@ -303,7 +323,7 @@ mod tests {
         let r = roots(&[("a/x", "^1.0.0")]);
         let overrides = map(&[("b/y", "^2.0.0")]);
         assert_eq!(
-            render_tree("proj", &r, &lf, &overrides, &HashMap::new()),
+            render_tree("proj", &r, &lf, &overrides, &HashMap::new(), false),
             "proj\n\
              └── a/x@1.0.0\n    \
                  └── b/y@2.1.2 (overridden: ^2.0.0)\n"
@@ -370,6 +390,49 @@ mod tests {
                  └── b/y@1.0.0\n        \
                      └── a/x@1.0.0 (circular)\n"
         );
+    }
+
+    #[test]
+    fn pointer_occurrences_are_marked_and_physical_ones_are_not() {
+        // signal is physically installed at "~/knit" (hoisted); comm's own
+        // occurrence of it is a pointer module. Roots and the physical
+        // occurrence stay unmarked; a legend explains the arrow.
+        colored::control::set_override(false);
+        let lf = lockfile(vec![
+            ("sleitnick/knit", vec![
+                entry("1.7.0", "~", &[("sleitnick/comm", "1.0.1"), ("sleitnick/signal", "2.0.3")]),
+            ]),
+            ("sleitnick/comm", vec![
+                entry("1.0.1", "~/knit", &[("sleitnick/signal", "2.0.3")]),
+            ]),
+            ("sleitnick/signal", vec![
+                entry("2.0.3", "~/knit", &[]),
+            ]),
+        ]);
+        let r = roots(&[("sleitnick/knit", "^1.7.0")]);
+        assert_eq!(
+            render_tree("proj", &r, &lf, &HashMap::new(), &HashMap::new(), true),
+            "proj\n\
+             └── sleitnick/knit@1.7.0\n    \
+                 ├── sleitnick/comm@1.0.1\n    \
+                 │   └── sleitnick/signal@2.0.3 ↪\n    \
+                 └── sleitnick/signal@2.0.3\n\
+             ↪ pointer to the physical copy elsewhere in the tree\n"
+        );
+    }
+
+    #[test]
+    fn uefn_trees_never_mark_pointers() {
+        // Same lockfile shape, flag off (UEFN installs everything physically
+        // once): no arrows, no legend.
+        colored::control::set_override(false);
+        let lf = lockfile(vec![
+            ("a/x", vec![entry("1.0.0", "~", &[("b/y", "1.0.0")])]),
+            ("b/y", vec![entry("1.0.0", "~/other", &[])]),
+        ]);
+        let r = roots(&[("a/x", "^1.0.0")]);
+        let out = render_tree("proj", &r, &lf, &HashMap::new(), &HashMap::new(), false);
+        assert!(!out.contains('↪'));
     }
 
     #[test]
