@@ -144,6 +144,23 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
         return Ok(());
     }
 
+    // Declared excludes filter every candidate list below, so the report
+    // never shows a version the solver would refuse and -u never bumps to
+    // one. A bad exclude range only degrades the report; install fails
+    // loudly on it.
+    let mut excludes: HashMap<String, VersionReq> = HashMap::new();
+    for (pkg, range) in crate::utils::normalize_forest_excludes(&info) {
+        match VersionReq::parse(&range) {
+            Ok(req) => {
+                excludes.insert(pkg.to_lowercase(), req);
+            }
+            Err(_) => msg.emit(
+                MessageType::Warn,
+                &format!("Invalid exclude range {} for {} in forest.json; ignoring it for this report.", range, pkg),
+            ),
+        }
+    }
+
     // Parse the lockfile once: root versions feed the updates table, and the
     // full resolved tree (direct + transitive) feeds the license report.
     let lock: Option<Value> = fs::read_to_string("forest-lock.json")
@@ -250,6 +267,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
             continue;
         }
 
+        let exclude_req = excludes.get(&name.to_lowercase());
         let mut versions: Vec<Version> = data
             .get("versions")
             .and_then(Value::as_array)
@@ -260,10 +278,19 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
                     .collect()
             })
             .unwrap_or_default();
+        let published = versions.len();
+        versions.retain(|v| exclude_req.map_or(true, |req| !req.matches(v)));
         versions.sort();
 
         if versions.is_empty() {
-            msg.emit(MessageType::Warn, &format!("No versions found for {}", name));
+            if published > 0 {
+                msg.emit(
+                    MessageType::Warn,
+                    &format!("Every published version of {} is excluded by forest.json; remove or narrow the exclusion with `forest exclude {} --remove`.", name, name),
+                );
+            } else {
+                msg.emit(MessageType::Warn, &format!("No versions found for {}", name));
+            }
             continue;
         }
 
@@ -517,7 +544,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
             _ => String::new(),
         };
         message::info(&format!(
-            "Run `forest audit {}--update` to update forest.json to the latest versions.",
+            "Run `forest audit {}--update` to bump forest.json to the latest versions, or `forest update` to stay within your declared ranges.",
             target_arg
         ));
         return Ok(());
@@ -540,7 +567,9 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
                 Some(slot) => {
                     *slot = new_range;
                 }
-                None => {}
+                // Rows come from the manifest's own keys, so a miss means
+                // the file changed under us.
+                None => message::warn(&format!("{} not found in forest.json; skipped.", row.name)),
             }
         }
     }

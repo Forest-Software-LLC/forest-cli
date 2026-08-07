@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
 use crate::cache::TarballCache;
 use crate::lockfile_gen::{cdn_base, fetch_signed_url, InstallSummary, LockFile, DOWNLOAD_WORKERS};
@@ -22,7 +22,6 @@ use crate::roblox::plan::plan_install;
 use crate::roblox::PACKAGES_DIR;
 
 /// One tarball to download + extract, queued to the bounded worker pool.
-/// No bar here: the worker that picks the job up creates its progress line.
 struct DownloadJob {
     url: String,
     name: String,
@@ -166,22 +165,24 @@ pub async fn make_directories_roblox(
     }
 
     // Download + extract only what reconciliation says is missing or changed.
-    // The no-op path skips the MultiProgress entirely (no bar flash).
+    // The no-op path skips the bar entirely (no bar flash).
     if !to_install.is_empty() {
-        // Overall bar on top; each worker adds a byte-accurate line below it
-        // for the download it is actively running (created on pick-up,
-        // cleared on completion) — a big tree shows at most DOWNLOAD_WORKERS
-        // in-flight lines instead of one mostly-idle bar per package.
-        let mp = MultiProgress::new();
-        let total_bar = mp.add(ProgressBar::new(to_install.len() as u64));
+        // One line for the whole phase: package count plus a downloaded-bytes
+        // counter. The old per-download bars rendered as empty rails on
+        // cache-heavy installs; the counter still proves liveness while a
+        // big tarball holds the count still, and stays absent when
+        // everything comes from cache.
+        let total_bar = ProgressBar::new(to_install.len() as u64);
         total_bar.set_style(
-            ProgressStyle::with_template("{spinner:.green} Installing packages {bar:30.cyan/blue} {pos}/{len}")?
-                .progress_chars("=> ")
+            ProgressStyle::with_template("{spinner:.green} Installing packages {bar:30.cyan/blue} {pos}/{len} {msg}")?
+                .progress_chars("=>-")
                 .tick_strings(crate::message::TICK_STRINGS),
         );
         total_bar.enable_steady_tick(std::time::Duration::from_millis(70));
-        let job_style = ProgressStyle::with_template("  {bar:30.cyan/blue} {bytes:>10} {wide_msg}")?
-            .progress_chars("=> ");
+        // Byte counter shown in the bar message. A mutex, not an atomic:
+        // update and display must be one critical section or out-of-order
+        // set_message calls make the counter run backwards.
+        let downloaded = Arc::new(Mutex::new(0u64));
 
         let mut jobs: Vec<DownloadJob> = Vec::new();
         for &i in &to_install {
@@ -226,18 +227,18 @@ pub async fn make_directories_roblox(
             let queue = Arc::clone(&queue);
             let first_err = Arc::clone(&first_err);
             let tarball_cache = tarball_cache.clone();
-            let mp = mp.clone();
             let total_bar = total_bar.clone();
-            let job_style = job_style.clone();
+            let downloaded = Arc::clone(&downloaded);
             workers.push(std::thread::spawn(move || {
+                // indicatif throttles redraws, so per-chunk set_message is cheap.
+                let on_bytes = |delta: u64| {
+                    let mut total = downloaded.lock().expect("byte counter poisoned");
+                    *total += delta;
+                    total_bar.set_message(format!("{}", HumanBytes(*total)));
+                };
                 loop {
                     let job = queue.lock().expect("job queue poisoned").pop();
                     let Some(job) = job else { break };
-                    // Length 1 renders empty until download_bytes learns the
-                    // real size from Content-Length; cache hits never draw.
-                    let bar = mp.add(ProgressBar::new(1));
-                    bar.set_style(job_style.clone());
-                    bar.set_message(format!("{} @ {}", job.name, job.version));
                     // The receipt is written only after ITS dir extracted
                     // successfully — per-package atomicity: a dir without a
                     // receipt (crash, partial extract) is never trusted.
@@ -246,7 +247,7 @@ pub async fn make_directories_roblox(
                         &job.integrity,
                         &job.dir,
                         &job.root,
-                        bar.clone(),
+                        &on_bytes,
                         tarball_cache.as_ref(),
                     )
                     .and_then(|_| {
@@ -257,10 +258,6 @@ pub async fn make_directories_roblox(
                             root: job.root.clone(),
                         })
                     });
-                    // Clear the bar even on failure, or its line sticks around
-                    // garbling everything printed after it.
-                    bar.finish_and_clear();
-                    mp.remove(&bar);
                     total_bar.inc(1);
                     if let Err(e) = result {
                         first_err.lock().expect("error slot poisoned").get_or_insert(e);

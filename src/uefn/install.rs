@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
 use crate::cache::TarballCache;
 use crate::fetch_and_extract::fetch_and_extract_verbatim;
@@ -27,7 +27,6 @@ use crate::receipts;
 
 use super::plan::plan_install_uefn;
 
-/// No bar here: the worker that picks the job up creates its progress line.
 struct DownloadJob {
     url: String,
     name: String,
@@ -195,19 +194,18 @@ pub async fn make_directories_uefn(
 
     // Download + extract (verbatim - the folder IS the package on UEFN).
     if !rec.to_install.is_empty() {
-        // Overall bar on top; each worker adds a byte-accurate line below it
-        // for the download it is actively running (created on pick-up,
-        // cleared on completion) — mirror of the Roblox executor's display.
-        let mp = MultiProgress::new();
-        let total_bar = mp.add(ProgressBar::new(rec.to_install.len() as u64));
+        // One line: package count plus a downloaded-bytes counter, mirroring
+        // the Roblox executor (rationale there).
+        let total_bar = ProgressBar::new(rec.to_install.len() as u64);
         total_bar.set_style(
-            ProgressStyle::with_template("{spinner:.green} Installing packages {bar:30.cyan/blue} {pos}/{len}")?
-                .progress_chars("=> ")
+            ProgressStyle::with_template("{spinner:.green} Installing packages {bar:30.cyan/blue} {pos}/{len} {msg}")?
+                .progress_chars("=>-")
                 .tick_strings(crate::message::TICK_STRINGS),
         );
         total_bar.enable_steady_tick(std::time::Duration::from_millis(70));
-        let job_style = ProgressStyle::with_template("  {bar:30.cyan/blue} {bytes:>10} {wide_msg}")?
-            .progress_chars("=> ");
+        // Mutex-held byte counter, one critical section for update + display
+        // (see the Roblox executor).
+        let downloaded = Arc::new(Mutex::new(0u64));
 
         let mut jobs: Vec<DownloadJob> = Vec::new();
         for &i in &rec.to_install {
@@ -245,42 +243,41 @@ pub async fn make_directories_uefn(
             let queue = Arc::clone(&queue);
             let first_err = Arc::clone(&first_err);
             let tarball_cache = tarball_cache.clone();
-            let mp = mp.clone();
             let total_bar = total_bar.clone();
-            let job_style = job_style.clone();
-            workers.push(std::thread::spawn(move || loop {
-                let job = queue.lock().expect("job queue poisoned").pop();
-                let Some(job) = job else { break };
-                // Length 1 renders empty until download_bytes learns the
-                // real size from Content-Length; cache hits never draw.
-                let bar = mp.add(ProgressBar::new(1));
-                bar.set_style(job_style.clone());
-                bar.set_message(format!("{} @ {}", job.name, job.version));
-                // Receipt only after ITS dir extracted - per-package atomicity.
-                let result = fetch_and_extract_verbatim(
-                    &job.url,
-                    &job.integrity,
-                    &job.dir,
-                    bar.clone(),
-                    tarball_cache.as_ref(),
-                )
-                .and_then(|_| {
-                    receipts::write(
+            let downloaded = Arc::clone(&downloaded);
+            workers.push(std::thread::spawn(move || {
+                let on_bytes = |delta: u64| {
+                    let mut total = downloaded.lock().expect("byte counter poisoned");
+                    *total += delta;
+                    total_bar.set_message(format!("{}", HumanBytes(*total)));
+                };
+                loop {
+                    let job = queue.lock().expect("job queue poisoned").pop();
+                    let Some(job) = job else { break };
+                    // Receipt only after ITS dir extracted - per-package atomicity.
+                    let result = fetch_and_extract_verbatim(
+                        &job.url,
+                        &job.integrity,
                         &job.dir,
-                        &receipts::Receipt {
-                            name: job.name.clone(),
-                            version: job.version.clone(),
-                            integrity: job.integrity.clone(),
-                            // No entry point on UEFN - the folder is the package.
-                            root: String::new(),
-                        },
+                        &on_bytes,
+                        tarball_cache.as_ref(),
                     )
-                });
-                bar.finish_and_clear();
-                mp.remove(&bar);
-                total_bar.inc(1);
-                if let Err(e) = result {
-                    first_err.lock().expect("error slot poisoned").get_or_insert(e);
+                    .and_then(|_| {
+                        receipts::write(
+                            &job.dir,
+                            &receipts::Receipt {
+                                name: job.name.clone(),
+                                version: job.version.clone(),
+                                integrity: job.integrity.clone(),
+                                // No entry point on UEFN - the folder is the package.
+                                root: String::new(),
+                            },
+                        )
+                    });
+                    total_bar.inc(1);
+                    if let Err(e) = result {
+                        first_err.lock().expect("error slot poisoned").get_or_insert(e);
+                    }
                 }
             }));
         }

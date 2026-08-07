@@ -111,11 +111,16 @@ pub(crate) async fn fetch_signed_url(
     platform: String,
 ) -> Result<((String, String), String)> {
     let name = digest_package_name(&pkg_name);
+    // Lowercased like every package URL. Only the legacy-public fallback
+    // benefits at the edge cache (private responses are never cached), but
+    // one URL convention keeps the key space enumerable for purging.
+    let scope_lc = name.scope.to_lowercase();
+    let name_lc = name.name.to_lowercase();
     let path = format!(
         "v1/package/{}/{}/{}/{}",
-        encode(&name.scope),
+        encode(&scope_lc),
         encode(&platform),
-        encode(&name.name),
+        encode(&name_lc),
         encode(&version)
     );
     let (info, status) = packages_api_request(&path, Method::GET, None, None).await
@@ -174,7 +179,8 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
     let excludes = normalize_forest_excludes(forest_json);
 
     msg.update("Resolving dependencies...");
-    let (lockfile_packages, license_warnings, root_renames, solve_report) = get_lockfile_packages(roots.clone(), &overrides, &excludes, platform.clone(), msg).await
+    // --force also bypasses the metadata disk cache, like receipts at install.
+    let (lockfile_packages, license_warnings, root_renames, solve_report) = get_lockfile_packages(roots.clone(), &overrides, &excludes, platform.clone(), msg, !force).await
         .context("Failed to resolve lockfile packages")?;
 
     if solve_report.override_edges > 0 {

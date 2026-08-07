@@ -10,11 +10,10 @@ use std::io::{self, Cursor};
 use std::path::Path;
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
-use indicatif::ProgressBar;
 use tar::Archive;
 
 use crate::cache::TarballCache;
-use crate::fetch_and_extract::obtain_verified_bytes;
+use crate::fetch_and_extract::{obtain_verified_bytes, OnBytes};
 
 /// Suffixes Rojo syncs as Script/LocalScript instances.
 const RUNNABLE_SUFFIXES: [&str; 4] = [
@@ -33,13 +32,11 @@ pub fn fetch_and_extract(
     expected_sha256: &str,
     out_dir: &Path,
     archive_root: &str,
-    bar: ProgressBar,
+    on_bytes: OnBytes<'_>,
     cache: Option<&TarballCache>,
 ) -> Result<()> {
-    let bytes = obtain_verified_bytes(url, expected_sha256, out_dir, &bar, cache)?;
+    let bytes = obtain_verified_bytes(url, expected_sha256, out_dir, on_bytes, cache)?;
     extract_tgz(bytes, out_dir, archive_root)?;
-
-    bar.finish();
 
     Ok(())
 }
@@ -210,7 +207,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("ok");
 
-        fetch_and_extract(&url, &hash, &out, "src/init.luau", ProgressBar::hidden(), None).unwrap();
+        fetch_and_extract(&url, &hash, &out, "src/init.luau", &|_| {}, None).unwrap();
 
         let extracted = fs::read_to_string(out.join("init.luau")).unwrap();
         assert_eq!(extracted, "return {}");
@@ -225,7 +222,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("rename-top");
 
-        fetch_and_extract(&url, &hash, &out, "ProfileStore.luau", ProgressBar::hidden(), None).unwrap();
+        fetch_and_extract(&url, &hash, &out, "ProfileStore.luau", &|_| {}, None).unwrap();
 
         let extracted = fs::read_to_string(out.join("init.luau")).unwrap();
         assert_eq!(extracted, "return {} -- ps");
@@ -243,7 +240,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("rename-nested");
 
-        fetch_and_extract(&url, &hash, &out, "src/Module.lua", ProgressBar::hidden(), None).unwrap();
+        fetch_and_extract(&url, &hash, &out, "src/Module.lua", &|_| {}, None).unwrap();
 
         // Root renamed with its extension preserved; siblings keep their names.
         assert_eq!(fs::read_to_string(out.join("init.lua")).unwrap(), "return {} -- root");
@@ -267,7 +264,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("top-level-siblings");
 
-        fetch_and_extract(&url, &hash, &out, "init.luau", ProgressBar::hidden(), None).unwrap();
+        fetch_and_extract(&url, &hash, &out, "init.luau", &|_| {}, None).unwrap();
 
         assert_eq!(fs::read_to_string(out.join("init.luau")).unwrap(), "return {} -- root");
         assert_eq!(fs::read_to_string(out.join("Event.luau")).unwrap(), "return {} -- event");
@@ -293,7 +290,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("drop-metadata");
 
-        fetch_and_extract(&url, &hash, &out, "init.luau", ProgressBar::hidden(), None).unwrap();
+        fetch_and_extract(&url, &hash, &out, "init.luau", &|_| {}, None).unwrap();
 
         assert!(out.join("init.luau").exists());
         assert!(out.join("Nested").join("Deep.luau").exists());
@@ -315,7 +312,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("drop-metadata-nested");
 
-        fetch_and_extract(&url, &hash, &out, "src/init.luau", ProgressBar::hidden(), None).unwrap();
+        fetch_and_extract(&url, &hash, &out, "src/init.luau", &|_| {}, None).unwrap();
 
         assert!(out.join("init.luau").exists());
         assert!(!out.join("forest.json").exists());
@@ -341,7 +338,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("scrub-scripts");
 
-        fetch_and_extract(&url, &hash, &out, "src/init.luau", ProgressBar::hidden(), None).unwrap();
+        fetch_and_extract(&url, &hash, &out, "src/init.luau", &|_| {}, None).unwrap();
 
         assert!(out.join("init.luau").exists());
         assert!(out.join("Helper.luau").exists());
@@ -365,7 +362,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("scrub-top-level");
 
-        fetch_and_extract(&url, &hash, &out, "init.luau", ProgressBar::hidden(), None).unwrap();
+        fetch_and_extract(&url, &hash, &out, "init.luau", &|_| {}, None).unwrap();
 
         assert!(out.join("init.luau").exists());
         assert!(!out.join("Runner.server.luau").exists());
@@ -379,7 +376,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("scrub-root-exempt");
 
-        fetch_and_extract(&url, &hash, &out, "Main.server.luau", ProgressBar::hidden(), None).unwrap();
+        fetch_and_extract(&url, &hash, &out, "Main.server.luau", &|_| {}, None).unwrap();
 
         assert_eq!(fs::read_to_string(out.join("init.luau")).unwrap(), "return {} -- root");
         assert!(!out.join("Main.server.luau").exists());
@@ -393,7 +390,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("tampered");
 
-        let err = fetch_and_extract(&url, &wrong_hash, &out, "src/init.luau", ProgressBar::hidden(), None)
+        let err = fetch_and_extract(&url, &wrong_hash, &out, "src/init.luau", &|_| {}, None)
             .unwrap_err();
 
         assert!(err.to_string().contains("Integrity check failed"), "unexpected error: {err}");
@@ -405,7 +402,7 @@ mod tests {
     fn rejects_empty_integrity_before_downloading() {
         let out = temp_out_dir("empty");
         // URL is never contacted - an unaddressable entry must fail fast.
-        let err = fetch_and_extract("http://127.0.0.1:1/never.tgz", "  ", &out, "src/init.luau", ProgressBar::hidden(), None)
+        let err = fetch_and_extract("http://127.0.0.1:1/never.tgz", "  ", &out, "src/init.luau", &|_| {}, None)
             .unwrap_err();
         assert!(err.to_string().contains("no integrity hash"), "unexpected error: {err}");
     }
@@ -425,7 +422,7 @@ mod tests {
             &hash,
             &out,
             "src/init.luau",
-            ProgressBar::hidden(),
+            &|_| {},
             Some(&cache),
         )
         .unwrap();
@@ -442,7 +439,7 @@ mod tests {
         let cache = TarballCache::open_at(temp_out_dir("cache-warm")).unwrap();
         let out = temp_out_dir("cache-warm-out");
 
-        fetch_and_extract(&url, &hash, &out, "src/init.luau", ProgressBar::hidden(), Some(&cache)).unwrap();
+        fetch_and_extract(&url, &hash, &out, "src/init.luau", &|_| {}, Some(&cache)).unwrap();
 
         assert_eq!(cache.lookup(&hash).as_deref(), Some(tgz.as_slice()));
         let _ = fs::remove_dir_all(&out);
@@ -459,7 +456,7 @@ mod tests {
         fs::write(cache_dir.join(format!("{hash}.tgz")), b"garbage").unwrap();
         let out = temp_out_dir("cache-heal-out");
 
-        fetch_and_extract(&url, &hash, &out, "src/init.luau", ProgressBar::hidden(), Some(&cache)).unwrap();
+        fetch_and_extract(&url, &hash, &out, "src/init.luau", &|_| {}, Some(&cache)).unwrap();
 
         assert_eq!(fs::read_to_string(out.join("init.luau")).unwrap(), "return {} -- fresh");
         // The rotten entry was replaced by the verified download.

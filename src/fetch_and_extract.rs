@@ -9,40 +9,13 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
 use tar::Archive;
-use indicatif::ProgressBar;
 
 use crate::cache::TarballCache;
 use crate::utils::sha256_hex;
 
-/// Reader wrapper that reports bytes transferred to an indicatif ProgressBar.
-/// Positions are raw byte counts (`{bytes}`/`{total_bytes}` in templates);
-/// the bar's length is set from Content-Length in `download_bytes`.
-struct ProgressReader<R> {
-    inner: R,
-    bar: ProgressBar,
-    transferred: u64,
-}
-
-impl<R: Read> ProgressReader<R> {
-    fn new(inner: R, bar: ProgressBar) -> Self {
-        ProgressReader {
-            inner,
-            bar,
-            transferred: 0,
-        }
-    }
-}
-
-impl<R: Read> Read for ProgressReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.transferred += n as u64;
-            self.bar.set_position(self.transferred);
-        }
-        Ok(n)
-    }
-}
+/// Byte-progress callback for downloads, called with each chunk's size as
+/// it arrives. Cache hits never call it.
+pub type OnBytes<'a> = &'a (dyn Fn(u64) + Sync);
 
 /// Verbatim variant: same trusted acquisition (cache/download + hash gate),
 /// but the archive is unpacked exactly as archived. No init rename, no
@@ -52,13 +25,11 @@ pub fn fetch_and_extract_verbatim(
     url: &str,
     expected_sha256: &str,
     out_dir: &Path,
-    bar: ProgressBar,
+    on_bytes: OnBytes<'_>,
     cache: Option<&TarballCache>,
 ) -> Result<()> {
-    let bytes = obtain_verified_bytes(url, expected_sha256, out_dir, &bar, cache)?;
+    let bytes = obtain_verified_bytes(url, expected_sha256, out_dir, on_bytes, cache)?;
     extract_tgz_verbatim(bytes, out_dir)?;
-
-    bar.finish();
 
     Ok(())
 }
@@ -74,7 +45,7 @@ pub(crate) fn obtain_verified_bytes(
     url: &str,
     expected_sha256: &str,
     out_dir: &Path,
-    bar: &ProgressBar,
+    on_bytes: OnBytes<'_>,
     cache: Option<&TarballCache>,
 ) -> Result<Vec<u8>> {
     if expected_sha256.trim().is_empty() {
@@ -90,7 +61,7 @@ pub(crate) fn obtain_verified_bytes(
     match cache.and_then(|c| c.lookup(expected_sha256)) {
         Some(bytes) => Ok(bytes),
         None => {
-            let bytes = download_bytes(url, bar)?;
+            let bytes = download_bytes(url, on_bytes)?;
             verify_integrity(&bytes, expected_sha256)?;
             if let Some(c) = cache {
                 c.store(expected_sha256, &bytes);
@@ -100,32 +71,27 @@ pub(crate) fn obtain_verified_bytes(
     }
 }
 
-/// HTTP GET the tarball, updating `bar` as bytes arrive.
-fn download_bytes(url: &str, bar: &ProgressBar) -> Result<Vec<u8>> {
+/// HTTP GET the tarball, reporting each chunk to `on_bytes` as it arrives.
+fn download_bytes(url: &str, on_bytes: OnBytes<'_>) -> Result<Vec<u8>> {
     // Shared client: connection reuse across the download workers.
-    let client = crate::http::blocking_client();
-    let resp = client
+    let mut resp = crate::http::blocking_client()
         .get(url)
         .send()
         .context("HTTP request failed")?
         .error_for_status()
         .context("Non-success HTTP status code")?;
 
-    // Determine total size (if provided)
-    let total = resp
-        .content_length()
-        .unwrap_or(0);
-    if total > 0 {
-        bar.set_length(total);
-    }
-
-    // Wrap response reader with progress
-    let mut reader = ProgressReader::new(resp, bar.clone());
-
+    let total = resp.content_length().unwrap_or(0);
     let mut bytes = Vec::with_capacity(total as usize);
-    reader
-        .read_to_end(&mut bytes)
-        .context("Failed to download archive")?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = resp.read(&mut buf).context("Failed to download archive")?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..n]);
+        on_bytes(n as u64);
+    }
     Ok(bytes)
 }
 
@@ -285,7 +251,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("verbatim");
 
-        fetch_and_extract_verbatim(&url, &hash, &out, ProgressBar::hidden(), None).unwrap();
+        fetch_and_extract_verbatim(&url, &hash, &out, &|_| {}, None).unwrap();
 
         assert_eq!(fs::read_to_string(out.join("Calc.verse")).unwrap(), "Double<public>(X:int):int = X + X");
         assert!(out.join("forest.json").exists());
@@ -306,7 +272,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("verbatim-traversal");
 
-        fetch_and_extract_verbatim(&url, &hash, &out, ProgressBar::hidden(), None).unwrap();
+        fetch_and_extract_verbatim(&url, &hash, &out, &|_| {}, None).unwrap();
 
         assert!(out.join("ok.verse").exists());
         assert!(!out.parent().unwrap().join("evil.verse").exists(), "traversal entry must be skipped");
@@ -320,7 +286,7 @@ mod tests {
         let url = serve_once(tgz);
         let out = temp_out_dir("verbatim-tampered");
 
-        let err = fetch_and_extract_verbatim(&url, &wrong_hash, &out, ProgressBar::hidden(), None).unwrap_err();
+        let err = fetch_and_extract_verbatim(&url, &wrong_hash, &out, &|_| {}, None).unwrap_err();
         assert!(err.to_string().contains("Integrity check failed"));
         assert!(!out.join("X.verse").exists());
         let _ = fs::remove_dir_all(&out);
@@ -334,7 +300,7 @@ mod tests {
         cache.store(&hash, &tgz);
         let out = temp_out_dir("verbatim-cache-out");
 
-        fetch_and_extract_verbatim("http://127.0.0.1:1/never.tgz", &hash, &out, ProgressBar::hidden(), Some(&cache)).unwrap();
+        fetch_and_extract_verbatim("http://127.0.0.1:1/never.tgz", &hash, &out, &|_| {}, Some(&cache)).unwrap();
         assert!(out.join("Y.verse").exists());
         let _ = fs::remove_dir_all(&out);
     }

@@ -7,6 +7,7 @@ mod contracts;
 mod message;
 mod lockfile_gen;
 mod lockfile_solver;
+mod meta_cache;
 mod roblox;
 mod receipts;
 mod fetch_and_extract;
@@ -16,7 +17,7 @@ mod platform;
 mod release_verify;
 mod uefn;
 mod utils;
-use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, audit_command, tree_command, override_command, exclude_command, maybe_notify_update};
+use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, upgrade_command, audit_command, tree_command, override_command, exclude_command, maybe_notify_update};
 
 use std::env;
 
@@ -89,9 +90,15 @@ enum Commands {
         package: String,
     },
 
-    /// Update forest to the latest release
-    #[command(alias = "upgrade")]
+    /// Update dependencies to the newest versions your declared ranges allow
     Update {
+        /// Moved: CLI self-update is now `forest upgrade --check`
+        #[arg(long = "check", hide = true)]
+        check: bool,
+    },
+
+    /// Update forest itself to the latest release
+    Upgrade {
         /// Only report whether an update is available; don't install it
         #[arg(long = "check")]
         check: bool,
@@ -176,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cli = Cli::parse();
-    let is_update = matches!(cli.command, Commands::Update { .. });
+    let is_upgrade = matches!(cli.command, Commands::Upgrade { .. });
 
     match cli.command {
         Commands::Login => {
@@ -201,7 +208,15 @@ async fn main() -> anyhow::Result<()> {
             remove_command(package).await?;
         }
         Commands::Update { check } => {
-            update_command(check).await?;
+            if check {
+                // `forest update --check` was the self-update probe before v1.11.
+                crate::message::info("`forest update` now updates dependencies. For the CLI itself, run `forest upgrade --check`.");
+            } else {
+                update_command().await?;
+            }
+        }
+        Commands::Upgrade { check } => {
+            upgrade_command(check).await?;
         }
         Commands::Audit { package, update } => {
             audit_command(package, update).await?;
@@ -218,8 +233,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Best-effort, throttled nudge if a newer forest exists (skipped during an
-    // explicit update, in CI, and in non-interactive shells).
-    if !is_update {
+    // explicit upgrade, in CI, and in non-interactive shells).
+    if !is_upgrade {
         maybe_notify_update().await;
     }
 

@@ -14,7 +14,7 @@
 
 // src/main.rs
 // ---------------------
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use anyhow::{Result, Context};
 use reqwest::{Method};
@@ -22,13 +22,28 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use crate::http::{api_request, packages_api_request};
 use crate::license_helper::LicenseInfo;
-use crate::message::Message;
+use crate::message::{Message, MessageType};
+use crate::meta_cache::{trim_install_meta, MetaCache};
 use crate::utils::{digest_package_name, PackageName };
 
 /// Concurrent version-list prefetches in flight at once.
 const PREFETCH_CONCURRENCY: usize = 8;
 
 type VersionListHandle = tokio::task::JoinHandle<Result<(serde_json::Value, reqwest::StatusCode)>>;
+
+/// Version-list URL. Scope and name are lowercased so every casing shares
+/// one edge cache entry (the backend resolves them case-insensitively and
+/// purges only the lowercase URL); the response carries canonical casing
+/// back. `?detail=install` asks for the fat response with per-version
+/// install metadata inlined.
+fn version_list_path(scope: &str, pkg_name: &str, platform: &str) -> String {
+    format!(
+        "v1/package/{}/{}/{}?detail=install",
+        scope.to_lowercase(),
+        platform,
+        pkg_name.to_lowercase()
+    )
+}
 
 /// Fire the version-list request for a package the moment its name is known,
 /// instead of when the BFS gets around to it. The BFS awaits the memoized
@@ -45,7 +60,7 @@ fn spawn_version_list_fetch(
     let limiter = Arc::clone(limiter);
     tokio::spawn(async move {
         let _permit = limiter.acquire_owned().await.expect("semaphore closed");
-        let path = format!("v1/package/{}/{}/{}", scope, platform, pkg_name);
+        let path = version_list_path(&scope, &pkg_name, &platform);
         api_request(&path, Method::GET, None, None).await
             .with_context(|| format!("Failed to fetch package info for {}", full_name))
     })
@@ -55,6 +70,10 @@ fn spawn_version_list_fetch(
 #[derive(Debug)]
 struct VersionState {
     resolved: bool,
+    /// Install metadata inlined by the fat version-list response, taken at
+    /// the resolve point so no per-version request is needed. Always
+    /// network-fresh, so it skips the disk-cache confirmation pass.
+    prefetched: Option<serde_json::Value>,
     dependencies: HashMap<String, DepSpec>,
     integrity: String,
     public: bool,
@@ -67,6 +86,67 @@ struct PackageState {
     canonical: String,
     buckets: HashMap<String, Vec<String>>,
     versions: HashMap<String, VersionState>,
+}
+
+/// A disk-cached metadata entry the resolve used, queued for the post-BFS
+/// confirmation pass.
+struct CacheSourced {
+    scope: String,
+    pkg_name: String,
+    full_name: String,
+    version: String,
+    cached: serde_json::Value,
+}
+
+/// Disk-cached metadata failed its registry confirmation (republished
+/// version or local tampering). The public wrapper catches this and
+/// re-resolves with the cache disabled.
+#[derive(Debug)]
+struct MetaCacheMismatch {
+    packages: Vec<String>,
+}
+
+impl std::fmt::Display for MetaCacheMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Locally cached metadata for {} no longer matches the registry.",
+            self.packages.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for MetaCacheMismatch {}
+
+/// Merge a __fresh version-list response into an existing package state:
+/// unseen versions are added, existing entries stay untouched.
+fn merge_fresh_version_list(state: &mut PackageState, version_data: &serde_json::Value) {
+    let Some(versions) = version_data.get("versions").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let pkg_public = version_data.get("public").and_then(|v| v.as_bool());
+    for ver_info in versions {
+        let Some(ver) = ver_info.get("version").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if state.versions.contains_key(ver) {
+            continue;
+        }
+        let prefetched = ver_info.get("install")
+            .filter(|block| block.is_object())
+            .map(|block| trim_install_meta(block, pkg_public));
+        state.versions.insert(
+            ver.to_string(),
+            VersionState {
+                resolved: false,
+                prefetched,
+                dependencies: HashMap::new(),
+                integrity: String::new(),
+                public: false,
+                archive_root: String::new(),
+            },
+        );
+    }
 }
 
 /// Keyed by the LOWERCASED full name
@@ -121,9 +201,36 @@ pub struct SolveReport {
 /// root manifest keys whose registry identity is a different package name
 /// entirely (claimed/renamed scopes, e.g. a wally scope claimed under a new
 /// username) — casing-only differences are not renames.
-pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, platform : String, msg: &mut Message) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>, SolveReport)> {
+///
+/// `use_meta_cache: false` (install --force) resolves everything from the
+/// network. When the cache IS used and its confirmation pass finds a stale
+/// or tampered entry, resolution transparently re-runs without the cache.
+pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, platform : String, msg: &mut Message, use_meta_cache: bool) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>, SolveReport)> {
+    match resolve_lockfile_packages(root_deps.clone(), overrides, excludes, platform.clone(), msg, use_meta_cache).await {
+        Err(err) if err.downcast_ref::<MetaCacheMismatch>().is_some() => {
+            msg.emit(
+                MessageType::Warn,
+                &format!("{} Re-resolving from the registry.", err),
+            );
+            resolve_lockfile_packages(root_deps, overrides, excludes, platform, msg, false).await
+        }
+        result => result,
+    }
+}
+
+async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, platform : String, msg: &mut Message, use_meta_cache: bool) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>, SolveReport)> {
     let mut resolved: ResolvedVersions = HashMap::new();
     let mut license_warnings: Vec<LicenseInfo> = Vec::new();
+
+    // Disk metadata cache. Entries only ever save round trips (threat model
+    // in meta_cache.rs): everything consumed this run is re-fetched in the
+    // confirmation pass after the BFS, and a mismatch aborts with
+    // MetaCacheMismatch so the wrapper retries without the cache.
+    let meta_cache = if use_meta_cache { MetaCache::open_default() } else { None };
+    let mut confirm_queue: Vec<CacheSourced> = Vec::new();
+    // One __fresh version-list retry per package, for ranges a stale edge
+    // cache can't satisfy (publish then install).
+    let mut fresh_retried: HashSet<String> = HashSet::new();
 
     // Overrides force every transitive edge to a package onto one range,
     // replacing the parent's declared range. Root deps are never rewritten:
@@ -193,7 +300,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
                 Some(handle) => handle.await
                     .map_err(|e| anyhow::anyhow!("Version-list task panicked: {e}"))??,
                 None => {
-                    let path = format!("v1/package/{}/{}/{}", name.scope, platform, name.name);
+                    let path = version_list_path(&name.scope, &name.name, &platform);
                     api_request(&path, Method::GET, None, None).await
                         .with_context(|| format!("Failed to fetch package info for {}", name.full_name))?
                 }
@@ -221,6 +328,12 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| anyhow::anyhow!("Invalid versions data for {}", name.full_name))?;
 
+            // Fat responses carry `public` at package level; inject it into
+            // each version's trimmed block so every metadata source shares
+            // one shape. Slim responses (old backend, stale cache) have no
+            // install blocks and those versions fall back per-version.
+            let pkg_public = version_data.get("public").and_then(|v| v.as_bool());
+
             let pkg_state = resolved.entry(key.clone())
                 .or_insert_with(|| PackageState {
                     canonical,
@@ -234,11 +347,14 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("Invalid version field for {}", name.full_name))?.to_string();
 
+                let prefetched = ver_info.get("install")
+                    .filter(|block| block.is_object())
+                    .map(|block| crate::meta_cache::trim_install_meta(block, pkg_public));
 
                 //println!("Found version {} for package {}", ver, name.full_name);
                 pkg_state.versions.insert(
                     ver,
-                    VersionState { resolved: false, dependencies: HashMap::new(), integrity: String::new(), public: false, archive_root: String::new() }
+                    VersionState { resolved: false, prefetched, dependencies: HashMap::new(), integrity: String::new(), public: false, archive_root: String::new() }
                 );
             }
         }
@@ -263,6 +379,31 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
             .cloned()
             .collect();
         if matches.is_empty() {
+            // The edge cache may be serving a pre-publish version list.
+            // Refetch once with a __fresh cache-buster (the shim skips its
+            // cache for it) and retry this queue item, so installing a
+            // just-published version works even before the purge lands.
+            // insert() makes this once per package.
+            if raw_matches.is_empty() && fresh_retried.insert(key.clone()) {
+                let buster = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let path = format!(
+                    "{}&__fresh={}",
+                    version_list_path(&name.scope, &name.name, &platform),
+                    buster
+                );
+                if let Ok((fresh_data, fresh_status)) = api_request(&path, Method::GET, None, None).await {
+                    if fresh_status.is_success() {
+                        if let Some(state) = resolved.get_mut(&key) {
+                            merge_fresh_version_list(state, &fresh_data);
+                        }
+                    }
+                }
+                queue.push_front((name, version_range, depth));
+                continue;
+            }
             if !raw_matches.is_empty() {
                 anyhow::bail!(
                     "Every version of {} matching {} is excluded by forest.json; remove or narrow the exclusion with `forest exclude {} --remove`",
@@ -299,17 +440,44 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
         // fetch dependencies if not resolved
         let vs = pkg_state.versions.get_mut(&agreed).unwrap();
         if vs.resolved { continue; }
-        let path = format!("v1/package/{}/{}/{}/{}", name.scope, platform, name.name, agreed);
 
-        let (package_info, status) = packages_api_request(&path, Method::GET, None, None).await
-            .with_context(|| format!("Failed to fetch package info for {}@{}", name.full_name, agreed))?;
+        // Metadata source: fat list block (network-fresh), else disk cache
+        // (queued for confirmation), else per-version request (network-fresh
+        // and stored into the disk cache). All three share the trimmed
+        // shape, so the code below is source-agnostic.
+        let package_info = if let Some(block) = vs.prefetched.take() {
+            block
+        } else if let Some(cached) = meta_cache.as_ref()
+            .and_then(|cache| cache.lookup(&platform, &name.full_name, &agreed))
+        {
+            confirm_queue.push(CacheSourced {
+                scope: name.scope.clone(),
+                pkg_name: name.name.clone(),
+                full_name: name.full_name.clone(),
+                version: agreed.clone(),
+                cached: cached.clone(),
+            });
+            cached
+        } else {
+            let path = format!(
+                "v1/package/{}/{}/{}/{}",
+                name.scope.to_lowercase(), platform, name.name.to_lowercase(), agreed
+            );
+            let (response, status) = packages_api_request(&path, Method::GET, None, None).await
+                .with_context(|| format!("Failed to fetch package info for {}@{}", name.full_name, agreed))?;
 
-        if !status.is_success() {
-            return Err(anyhow::anyhow!(
-                "Failed to fetch package info for {}@{}: HTTP {}",
-                name.full_name, agreed, status
-            ));
-        }
+            if !status.is_success() {
+                return Err(anyhow::anyhow!(
+                    "Failed to fetch package info for {}@{}: HTTP {}",
+                    name.full_name, agreed, status
+                ));
+            }
+            let trimmed = trim_install_meta(&response, None);
+            if let Some(cache) = meta_cache.as_ref() {
+                cache.store(&platform, &name.full_name, &agreed, &trimmed);
+            }
+            trimmed
+        };
 
         vs.resolved = true;
         resolved_count += 1;
@@ -416,6 +584,56 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
                 list_prefetch.insert(dep_key, handle);
             }
             queue.push_front((dep_pkg, dep_spec.version, depth + 1));
+        }
+    }
+
+    // 1.5) Confirm disk-cached entries against the registry before anything
+    // derived from them reaches a lockfile. One concurrent wave, so the
+    // serial latency this file exists to avoid does not come back. After
+    // this, every hash in the lockfile came from the registry this session.
+    if !confirm_queue.is_empty() {
+        msg.update(&format!(
+            "Confirming {} cached package version{}...",
+            confirm_queue.len(),
+            if confirm_queue.len() == 1 { "" } else { "s" }
+        ));
+        let limiter = Arc::new(tokio::sync::Semaphore::new(PREFETCH_CONCURRENCY));
+        let mut handles = Vec::new();
+        for CacheSourced { scope, pkg_name, full_name, version, cached } in confirm_queue.drain(..) {
+            let limiter = Arc::clone(&limiter);
+            let platform = platform.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = limiter.acquire_owned().await.expect("semaphore closed");
+                let path = format!(
+                    "v1/package/{}/{}/{}/{}",
+                    scope.to_lowercase(), platform, pkg_name.to_lowercase(), version
+                );
+                let (response, status) = packages_api_request(&path, Method::GET, None, None).await
+                    .with_context(|| format!("Failed to confirm cached metadata for {}@{}", full_name, version))?;
+                if !status.is_success() {
+                    return Err(anyhow::anyhow!(
+                        "Failed to confirm cached metadata for {}@{}: HTTP {}",
+                        full_name, version, status
+                    ));
+                }
+                let fresh = trim_install_meta(&response, None);
+                Ok::<_, anyhow::Error>((full_name, version, cached, fresh))
+            }));
+        }
+        let mut mismatched: Vec<String> = Vec::new();
+        for handle in handles {
+            let (full_name, version, cached, fresh) = handle.await
+                .map_err(|e| anyhow::anyhow!("Metadata confirmation task panicked: {e}"))??;
+            if cached != fresh {
+                if let Some(cache) = meta_cache.as_ref() {
+                    cache.evict(&platform, &full_name, &version);
+                }
+                mismatched.push(format!("{}@{}", full_name, version));
+            }
+        }
+        if !mismatched.is_empty() {
+            mismatched.sort();
+            return Err(anyhow::Error::new(MetaCacheMismatch { packages: mismatched }));
         }
     }
 
@@ -751,5 +969,65 @@ mod tests {
         assert!(!version_excluded(Some(&req("=1.6.0")), "1.6.1"));
         assert!(!version_excluded(None, "1.6.0"));
         assert!(!version_excluded(Some(&req("=1.6.0")), "not-a-version"));
+    }
+
+    fn state_with(versions: &[(&str, bool)]) -> PackageState {
+        let mut vs = HashMap::new();
+        for (ver, resolved) in versions {
+            vs.insert(ver.to_string(), VersionState {
+                resolved: *resolved,
+                prefetched: None,
+                dependencies: HashMap::new(),
+                integrity: if *resolved { "kept".into() } else { String::new() },
+                public: false,
+                archive_root: String::new(),
+            });
+        }
+        PackageState { canonical: "Scope/Pkg".into(), buckets: HashMap::new(), versions: vs }
+    }
+
+    #[test]
+    fn fresh_merge_adds_unseen_versions_with_their_install_blocks() {
+        let mut state = state_with(&[("1.0.0", true)]);
+        merge_fresh_version_list(&mut state, &serde_json::json!({
+            "public": true,
+            "versions": [
+                { "version": "1.0.0", "install": { "dependencies": {}, "integrity": "would-clobber" } },
+                { "version": "1.0.1", "install": { "dependencies": {}, "integrity": "abc" } },
+                { "version": "1.0.2" }
+            ]
+        }));
+
+        // The already-resolved entry is untouched — a fresh list must never
+        // rewrite state the BFS already consumed.
+        assert_eq!(state.versions["1.0.0"].integrity, "kept");
+        assert!(state.versions["1.0.0"].prefetched.is_none());
+
+        // New version with an install block: prefetched, package-level
+        // public injected. Without a block: listed, resolves per-version.
+        let added = &state.versions["1.0.1"];
+        let block = added.prefetched.as_ref().expect("install block prefetched");
+        assert_eq!(block["integrity"], "abc");
+        assert_eq!(block["public"], true);
+        assert!(state.versions["1.0.2"].prefetched.is_none());
+    }
+
+    #[test]
+    fn fresh_merge_tolerates_slim_or_malformed_responses() {
+        let mut state = state_with(&[("1.0.0", false)]);
+        merge_fresh_version_list(&mut state, &serde_json::json!({ "error": "whoops" }));
+        merge_fresh_version_list(&mut state, &serde_json::json!({
+            "versions": [{ "notVersion": true }, { "version": "2.0.0" }]
+        }));
+        assert_eq!(state.versions.len(), 2);
+        assert!(state.versions.contains_key("2.0.0"));
+    }
+
+    #[test]
+    fn version_list_urls_are_lowercased_and_ask_for_install_detail() {
+        assert_eq!(
+            version_list_path("ChiefWildin", "AnimNation", "roblox"),
+            "v1/package/chiefwildin/roblox/animnation?detail=install"
+        );
     }
 }
