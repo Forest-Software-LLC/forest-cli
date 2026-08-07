@@ -101,7 +101,7 @@ pub fn init(cwd: &Path, mode: InitMode) -> Result<()> {
 
             let root: String = Input::with_theme(&ColorfulTheme::default())
                 .with_prompt("Path to the package's root file (created if missing)")
-                .default("src/init.luau".to_string())
+                .default(default_root(cwd))
                 .validate_with(|input: &String| {
                     validate_root(input).map_err(|reason| anyhow::anyhow!(reason))
                 })
@@ -185,6 +185,17 @@ fn scaffold_package(
 
     fs::write(cwd.join("forest.json"), serde_json::to_string_pretty(&manifest)?)?;
     Ok(manifest)
+}
+
+/// Root-prompt default: an existing top-level init.luau/init.lua wins over
+/// the src/init.luau convention.
+fn default_root(cwd: &Path) -> String {
+    for candidate in ["init.luau", "init.lua"] {
+        if cwd.join(candidate).is_file() {
+            return candidate.to_string();
+        }
+    }
+    "src/init.luau".to_string()
 }
 
 /// Forward slashes, no leading `./` — the form `root` is stored in.
@@ -301,6 +312,19 @@ mod tests {
         assert!(validate_root("../outside/init.luau").is_err());
         assert!(validate_root("C:/abs/init.luau").is_err());
         assert!(validate_root("/abs/init.luau").is_err());
+    }
+
+    #[test]
+    fn default_root_prefers_an_existing_top_level_init() {
+        let base = fixture("default-root");
+        assert_eq!(default_root(&base), "src/init.luau");
+
+        fs::write(base.join("init.lua"), "return {}").unwrap();
+        assert_eq!(default_root(&base), "init.lua");
+
+        fs::write(base.join("init.luau"), "return {}").unwrap();
+        assert_eq!(default_root(&base), "init.luau", "luau wins over lua");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
