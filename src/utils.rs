@@ -20,7 +20,7 @@ pub fn digest_package_name(name : &str) -> PackageName {
     PackageName { name: parts[1].to_string(), scope: parts[0].to_string(), full_name: name.to_string() }
 }
 
-/// Lowercase hex SHA-256 — the format lockfile integrity hashes use.
+/// Lowercase hex SHA-256, the format lockfile integrity hashes use.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -140,7 +140,7 @@ pub fn normalize_forest_overrides(forest_json: &Value) -> HashMap<String, String
 /// versions that must never be installed. Unlike overrides, exclusions
 /// apply uniformly to direct and transitive deps: the solver just removes
 /// the banned versions from the candidate set, so every declared range is
-/// still honored — or resolution fails loudly when a range has no
+/// still honored; or resolution fails loudly when a range has no
 /// non-excluded version left.
 pub fn normalize_forest_excludes(forest_json: &Value) -> HashMap<String, String> {
     string_map_field(forest_json, "excludes")
@@ -162,6 +162,40 @@ fn string_map_field(forest_json: &Value, field: &str) -> HashMap<String, String>
 /// Package-name equality: case-insensitive.
 pub fn same_package(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
+}
+
+/// Parent dir of a manifest `root` ("src/init.luau" -> Some("src")), with
+/// backslash and leading "./" normalization. None for top-level or empty
+/// roots. Shared by the mount derivation and the link overlay, which must
+/// agree on where a root's directory is.
+pub fn manifest_root_parent(root: &str) -> Option<String> {
+    let root = root.replace('\\', "/");
+    let root = root.strip_prefix("./").unwrap_or(&root);
+    match root.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => Some(parent.to_string()),
+        _ => None,
+    }
+}
+
+/// Declared dependency ranges from a manifest: name -> range. Handles both
+/// the plain string form and the { version, alias } object form; malformed
+/// entries are skipped.
+pub fn manifest_dep_ranges(forest_json: &Value) -> HashMap<String, String> {
+    forest_json
+        .get("dependencies")
+        .and_then(Value::as_object)
+        .map_or_else(HashMap::new, |deps| {
+            deps.iter()
+                .filter_map(|(k, v)| {
+                    let range = match v {
+                        Value::String(s) => s.clone(),
+                        Value::Object(o) => o.get("version")?.as_str()?.to_string(),
+                        _ => return None,
+                    };
+                    Some((k.clone(), range))
+                })
+                .collect()
+        })
 }
 
 #[cfg(test)]
@@ -254,6 +288,34 @@ mod tests {
     fn same_package_ignores_case() {
         assert!(same_package("Scope/Pkg", "scope/pkg"));
         assert!(!same_package("a/pkg", "b/pkg"));
+    }
+
+    #[test]
+    fn root_parent_normalizes_and_handles_top_level_roots() {
+        assert_eq!(manifest_root_parent("src/init.luau"), Some("src".to_string()));
+        assert_eq!(manifest_root_parent("a/b/init.lua"), Some("a/b".to_string()));
+        assert_eq!(manifest_root_parent("src\\init.luau"), Some("src".to_string()));
+        assert_eq!(manifest_root_parent("./src/init.luau"), Some("src".to_string()));
+        assert_eq!(manifest_root_parent("./init.luau"), None);
+        assert_eq!(manifest_root_parent("init.luau"), None);
+        assert_eq!(manifest_root_parent(""), None);
+    }
+
+    #[test]
+    fn dep_ranges_parse_both_forms_and_skip_malformed() {
+        let manifest = serde_json::json!({
+            "dependencies": {
+                "a/plain": "^1.0.0",
+                "b/aliased": { "version": "^2.0.0", "alias": "B" },
+                "c/broken": 42,
+                "d/no-version": { "alias": "D" }
+            }
+        });
+        let ranges = manifest_dep_ranges(&manifest);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges["a/plain"], "^1.0.0");
+        assert_eq!(ranges["b/aliased"], "^2.0.0");
+        assert!(manifest_dep_ranges(&serde_json::json!({})).is_empty());
     }
 
     #[test]

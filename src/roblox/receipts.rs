@@ -37,6 +37,13 @@ fn walk(container: &Path, container_str: &str, tree: &mut TreeScan) {
         if name.starts_with('_') || name.starts_with('.') {
             continue;
         }
+        // Symlinked dirs (a `forest link` slot, or anything a user linked
+        // in) are not forest's to manage: descending would record the LINKED
+        // tree's receipts as this mount's, and the stale deletes computed
+        // from them would reach through the link into real source files.
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+            continue;
+        }
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -69,7 +76,7 @@ fn walk(container: &Path, container_str: &str, tree: &mut TreeScan) {
 
 /// A pointer dir is recognized by the generated header in its init.lua. A
 /// package that impersonates one could at worst get itself deleted and
-/// reinstalled on the next run — never kept wrongly.
+/// reinstalled on the next run; never kept wrongly.
 fn is_pointer_dir(dir: &Path) -> bool {
     fs::read_to_string(dir.join("init.lua"))
         .map(|s| s.starts_with(POINTER_HEADER))
@@ -90,9 +97,9 @@ pub struct Reconciliation {
 ///
 /// A planned package is KEPT (skipped entirely) only when:
 ///   1. its dir carries a receipt with the same (integrity, root,
-///      container) — receipt presence implies the dir existed at scan time,
+///      container); receipt presence implies the dir existed at scan time,
 ///      and
-///   2. every planned ancestor package is also kept — a nested package
+///   2. every planned ancestor package is also kept; a nested package
 ///      physically lives INSIDE its parent's directory, so a re-extracted
 ///      parent wipes the child no matter what the child's receipt says.
 pub fn reconcile(plan: &InstallPlan, tree: &TreeScan) -> Reconciliation {
@@ -252,7 +259,7 @@ mod tests {
     #[test]
     fn child_of_reinstalled_parent_cannot_be_kept() {
         // Parent A changes integrity; nested child B is untouched in the
-        // lockfile but physically lives inside A — it must reinstall too.
+        // lockfile but physically lives inside A; it must reinstall too.
         let old = plan_of(
             vec![pkg("./Packages/A", "aa"), pkg("./Packages/A/Packages/B", "bb")],
             &[],
@@ -428,6 +435,32 @@ mod tests {
             tree.receipts.keys().collect::<Vec<_>>()
         );
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_never_descends_a_linked_slot() {
+        // A `forest link` slot is a junction/symlink into the developer's
+        // real working tree. Recording ITS receipts as this mount's would
+        // let reconcile compute stale deletes that reach through the link.
+        let base = std::env::temp_dir().join(format!("forest-receipts-linked-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dev_tree = base.join("dev").join("src");
+        let dev_dep = dev_tree.join("Packages").join("Comm");
+        fs::create_dir_all(&dev_dep).unwrap();
+        write(&dev_dep, &Receipt { name: "acme/comm".into(), version: "1.0.0".into(), integrity: "cc".into(), root: "init.luau".into(), container: "Packages".into() }).unwrap();
+
+        let mount = base.join("Packages");
+        fs::create_dir_all(&mount).unwrap();
+        #[cfg(windows)]
+        junction::create(&dev_tree, mount.join("Knit")).unwrap();
+        #[cfg(not(windows))]
+        std::os::unix::fs::symlink(&dev_tree, mount.join("Knit")).unwrap();
+
+        let tree = scan(&mount, "Packages");
+
+        assert!(tree.receipts.is_empty(), "nothing behind the link may be recorded: {:?}", tree.receipts.keys().collect::<Vec<_>>());
+        assert!(tree.pointer_dirs.is_empty());
         let _ = fs::remove_dir_all(&base);
     }
 

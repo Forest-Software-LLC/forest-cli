@@ -7,7 +7,7 @@ use crate::utils::sha256_hex;
 /// Best-effort by design: a cache problem must never fail an install, so
 /// `store` swallows errors and `lookup` treats anything unexpected as a miss.
 /// Every read is re-hashed against its key, so a corrupt or tampered entry
-/// can never be extracted — it is deleted and re-downloaded instead.
+/// can never be extracted; it is deleted and re-downloaded instead.
 ///
 /// Private packages are cached too: the hash addresses the *bytes*, the
 /// signed URL only authorizes the fetch, and a user with a cache entry
@@ -68,7 +68,7 @@ impl TarballCache {
     }
 
     /// Best-effort store via temp file + rename, so concurrent installs never
-    /// observe a half-written entry. Losing a rename race is fine — the
+    /// observe a half-written entry. Losing a rename race is fine; the
     /// winner wrote identical content (the name IS the content hash).
     pub fn store(&self, integrity: &str, bytes: &[u8]) {
         let Some(key) = normalize_key(integrity) else { return };

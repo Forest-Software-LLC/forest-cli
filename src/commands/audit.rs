@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs};
 use anyhow::Result;
 use colored::Colorize;
 use reqwest::Method;
@@ -22,7 +22,7 @@ struct AuditRow {
 
 /// How the optional package argument resolved against the project.
 enum AuditTarget {
-    /// No package argument — audit everything.
+    /// No package argument: audit everything.
     All,
     /// A direct dependency (manifest key).
     Root(String),
@@ -56,7 +56,7 @@ fn locked_versions(packages: Option<&Map<String, Value>>) -> HashMap<String, Ver
     locked
 }
 
-/// Render one flagged package. Color only the accents — caveat text stays in
+/// Render one flagged package. Color only the accents; caveat text stays in
 /// the terminal's default color so long lists remain readable.
 fn render_license_block(info: &LicenseInfo) -> String {
     let severity = match info.rating.as_str() {
@@ -118,24 +118,20 @@ mod tests {
 /// `target_package`, limit the audit to that dependency. With `update`, bump
 /// forest.json to the latest versions and reinstall.
 pub async fn audit_command(target_package: Option<String>, update: bool) -> Result<()> {
+    // Discovery included: audit historically read forest.json from the cwd
+    // only, so it failed where install worked (UEFN keeps the manifest in
+    // Content/).
+    let Some(project) = super::context::load_project()? else {
+        crate::message::fail("No forest.json found. Run `forest init` to create a new package.");
+        return Ok(());
+    };
     let mut msg = Message::new("Checking for updates...");
 
-    // Ensure forest.json exists
-    if !Path::new("forest.json").exists() {
-        msg.finish(
-            MessageType::Fail,
-            "No forest.json found. Run `forest init` to create a new package.",
-        );
-        return Ok(());
-    }
-
-    // Read and parse forest.json
-    let mut info: Value = serde_json::from_str(&fs::read_to_string("forest.json")?)?;
-
+    let mut info = project.manifest;
     let platform = info
         .get("platform")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing platform in forest.json"))?
+        .unwrap_or_default()
         .to_string();
 
     let roots = normalize_forest_deps(&info);
@@ -335,7 +331,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
             key
         ));
     } else if outdated.is_empty() {
-        // Skip the all-clear when every fetch failed — the warnings above tell
+        // Skip the all-clear when every fetch failed; the warnings above tell
         // the real story.
         if !rows.is_empty() {
             match &target {
@@ -344,7 +340,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
             }
         }
     } else {
-        // Render the table (pad before coloring — ANSI codes break width padding)
+        // Render the table (pad before coloring; ANSI codes break width padding)
         let fmt_opt = |v: &Option<Version>| v.as_ref().map_or("-".to_string(), |v| v.to_string());
         let name_w = outdated.iter().map(|r| r.name.len()).max().unwrap().max("Package".len());
         let cur_w = outdated.iter().map(|r| fmt_opt(&r.current).len()).max().unwrap().max("Current".len());
@@ -415,7 +411,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
     let mut license_infos: Vec<LicenseInfo> = Vec::new();
     if !pairs.is_empty() {
         // Metadata only, so this goes to the main API rather than the package
-        // gateway — no download URLs are needed for a license check.
+        // gateway; no download URLs are needed for a license check.
         let mut msg = Message::new(&format!("Checking licenses for {} package(s)...", pairs.len()));
         for (name, version) in &pairs {
             let pkg = digest_package_name(name);
@@ -451,7 +447,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
     let flagged: Vec<&LicenseInfo> = license_infos.iter().filter(|i| i.is_flagged()).collect();
 
     if matches!(target, AuditTarget::All) {
-        // Stay quiet when every license fetch failed — the warnings above
+        // Stay quiet when every license fetch failed; the warnings above
         // already explain the gap.
         if flagged.is_empty() && !license_infos.is_empty() {
             message::success("No license considerations found in the dependency tree.");

@@ -96,7 +96,7 @@ pub fn publish_preflight(cwd: &Path, forest_json: &mut Value) -> Result<Prefligh
 
 /// Ignore patterns forced onto the publish matcher: when the manifest
 /// declares dependencies, the hoisted install mount and the lockfile are
-/// install artifacts, not package content — consumers regenerate both from
+/// install artifacts, not package content; consumers regenerate both from
 /// the manifest, and packing them would ship every resolved dependency
 /// inside the tarball. The mount lives wherever the manifest's `root` puts
 /// it (e.g. `src/Packages/`), so the pattern is derived, not hardcoded.

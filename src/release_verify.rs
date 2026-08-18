@@ -125,7 +125,7 @@ mod tests {
 
     /// End-to-end proof of the production chain: this signature was produced by
     /// the actual release YubiKey (`ssh-keygen -Y sign` + touch) and must verify
-    /// against the pinned production key list — not a test key.
+    /// against the pinned production key list; not a test key.
     #[test]
     fn accepts_real_hardware_signature_from_pinned_release_key() {
         let manifest = include_bytes!("../tests/fixtures-manifest.json");

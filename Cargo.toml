@@ -30,6 +30,9 @@ sha2 = "0.10"         # verify downloaded binaries against the release manifest
 ssh-key = { version = "0.6", default-features = false, features = ["std", "alloc", "p256", "ed25519"] }  # verify offline-signed release manifests (sshsig)
 toml = "0.8"          # parse wally.toml for the wally-to-forest import offer
 
+[target.'cfg(windows)'.dependencies]
+junction = "1"        # directory junctions for `forest link` (no developer mode needed)
+
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["std"] }  # throwaway keys for signature tests
 

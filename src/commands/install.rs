@@ -4,9 +4,7 @@ use serde_json::{Value, Map};
 use urlencoding::encode;
 use reqwest::Method;
 
-use std::collections::{HashMap};
 use crate::http::packages_api_request;
-use crate::lockfile_solver::DepSpec;
 use crate::message::{Message, MessageType};
 use crate::lockfile_gen::{lockfile_gen, lockfile_satisfies_manifest, make_directories, LockFile};
 use crate::utils::{normalize_forest_deps, normalize_forest_excludes, normalize_forest_overrides};
@@ -18,19 +16,38 @@ pub async fn install_command(
     alias: Option<String>,
     force: bool,
     init_platform: Option<String>,
+    links_mode: Option<crate::links::LinksMode>,
 ) -> Result<()> {
+    match links_mode {
+        Some(crate::links::LinksMode::Apply) => {
+            crate::links::set_policy(crate::links::LinkPolicy::Apply);
+        }
+        Some(crate::links::LinksMode::Ignore) => {
+            crate::links::set_policy(crate::links::LinkPolicy::Ignore("--links=ignore".to_string()));
+        }
+        // Forbid is enforced below (after manifest discovery, where the
+        // links file lives); None keeps the default: ignore under CI,
+        // apply otherwise.
+        Some(crate::links::LinksMode::Forbid) | None => {}
+    }
+    let mut project = super::context::load_project()?;
     let mut msg = Message::new("Installing...");
 
-    // Some platforms keep the manifest away from the project root (UEFN:
-    // inside Content/). When there's no forest.json here, ask the platform
-    // seam whether one lives nearby; a local forest.json always wins.
-    if !Path::new("forest.json").exists() {
-        if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
-            std::env::set_current_dir(&manifest_dir)?;
-            msg.emit(
-                MessageType::Info,
-                &format!("Using manifest at {}", manifest_dir.join("forest.json").display()),
-            );
+    // Strict mode for CI: a links file with entries is a hard failure, so a
+    // leaked .forest/links.json can never produce a non-lockfile install
+    // silently. (Without the flag, links are ignored by default under CI;
+    // see links::policy.)
+    if links_mode == Some(crate::links::LinksMode::Forbid) {
+        let stored = crate::links::stored_links();
+        if !stored.is_empty() {
+            msg.destroy();
+            return Err(anyhow::anyhow!(
+                "--links=forbid: {} local link{} configured in {} ({}). Unlink them or remove the file.",
+                stored.len(),
+                if stored.len() == 1 { " is" } else { "s are" },
+                crate::links::LINKS_FILE,
+                stored.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", ")
+            ));
         }
     }
 
@@ -39,7 +56,7 @@ pub async fn install_command(
     // non-interactive path; otherwise offer interactively. The platform
     // scaffold writes a minimal manifest (dependencies + platform, no name)
     // and knows where it belongs (UEFN: the project's Content folder).
-    if !Path::new("forest.json").exists() {
+    if project.is_none() {
         msg.pause();
         let chosen_platform = if let Some(p) = &init_platform {
             Some(crate::platform::Platform::parse(p)?)
@@ -58,15 +75,11 @@ pub async fn install_command(
         if let Some(plat) = chosen_platform {
             plat.init(&std::env::current_dir()?, crate::platform::InitMode::Project { from_install: true }, None).await?;
             // The scaffold may have placed the manifest elsewhere
-            // (UEFN: Content/) - re-run discovery to land on it.
-            if !Path::new("forest.json").exists() {
-                if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
-                    std::env::set_current_dir(&manifest_dir)?;
-                }
-            }
+            // (UEFN: Content/); re-run discovery to land on it.
+            project = super::context::load_project()?;
         }
         msg.resume();
-        if !Path::new("forest.json").exists() {
+        if project.is_none() {
             msg.emit(
                 MessageType::Fail,
                 "No forest.json found. Run `forest init` to create a new package, or pass --init <platform>.",
@@ -80,20 +93,21 @@ pub async fn install_command(
         );
     }
 
-    // Read and parse forest.json
-    let mut info: Value = serde_json::from_str(&fs::read_to_string("forest.json")?)?;
+    let project = project.expect("checked above");
+    let mut info = project.manifest;
     // Ensure dependencies object exists
     if !info.get("dependencies").map_or(false, |v| v.is_object()) {
         info["dependencies"] = Value::Object(Map::new());
     }
 
+    // The raw manifest value, for registry endpoints.
     let platform = info
         .get("platform")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing platform in forest.json"))?
-        .to_string(); // clone the value so we don't hold a borrow
+        .unwrap_or_default()
+        .to_string();
 
-    let plat = crate::platform::Platform::parse(&platform)?;
+    let plat = project.platform;
 
     // Some platforms reject aliases outright (UEFN: Verse has no cheap
     // re-export shims). Fail before any network work; the planner backstops
@@ -107,6 +121,7 @@ pub async fn install_command(
 
     // Read before `deps` takes its mutable borrow of the manifest.
     let manifest_overrides = normalize_forest_overrides(&info);
+    let normalized_root_deps = normalize_forest_deps(&info);
     let deps = info.get_mut("dependencies").unwrap().as_object_mut().unwrap();
 
     if let Some(pkg) = target_package {
@@ -136,7 +151,7 @@ pub async fn install_command(
                 return Ok(());
             }
 
-            // Aliases become folder names (and `require` identifiers) — path
+            // Aliases become folder names (and `require` identifiers); path
             // separators would nest directories and break pointer files.
             if a.contains('/') || a.contains('\\') {
                 msg.finish(
@@ -201,8 +216,8 @@ pub async fn install_command(
             );
         }
 
-        // The override command refuses direct deps, but the reverse path —
-        // installing a package that is already overridden — lands in a
+        // The override command refuses direct deps, but the reverse path
+        // (installing a package that is already overridden) lands in a
         // split: transitive edges follow the override, this new direct dep
         // follows its own range. Legal, but never silently. (Exclusions
         // need no warning: they filter this new direct dep too.)
@@ -234,26 +249,8 @@ pub async fn install_command(
             return Ok(());
         }
 
-        // Check for alias conflicts
-        let normalized_root_deps: HashMap<String, DepSpec> = deps.iter()
-            .map(|(name, val)| {
-                let default_alias = name.split('/').last().unwrap_or(name).to_string();
-                let spec = if let Some(vstr) = val.as_str() {
-                    DepSpec { alias: default_alias.clone(), version: vstr.to_string() }
-                } else if let Some(obj) = val.as_object() {
-                    let version = obj.get("version").and_then(Value::as_str).unwrap_or("").to_string();
-                    let alias = obj.get("alias").and_then(Value::as_str).map(|s| s.to_string()).unwrap_or(default_alias.clone());
-                    DepSpec { alias, version }
-                } else {
-                    DepSpec { alias: default_alias.clone(), version: String::new() }
-                };
-                (name.clone(), spec)
-            })
-            .collect();
-
-
-        // Case-insensitive: aliases become folder names under packages/, and
-        // Windows/macOS filesystems case-fold — `DataStream` and `datastream`
+        // Alias conflicts. Case-insensitive: aliases become folder names under packages/, and
+        // Windows/macOS filesystems case-fold; `DataStream` and `datastream`
         // would silently merge into one directory.
         if normalized_root_deps.values().any(|spec| spec.alias.eq_ignore_ascii_case(&resolved_name)) {
             //TODO: Prompt for a new alias.

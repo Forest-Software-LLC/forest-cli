@@ -1,3 +1,4 @@
+pub mod context;
 pub mod login;
 pub mod logout;
 pub mod whoami;
@@ -11,6 +12,7 @@ pub mod audit;
 pub mod tree;
 pub mod overrides;
 pub mod excludes;
+pub mod link;
 
 pub use login::login_command;
 pub use logout::logout_command;
@@ -25,4 +27,5 @@ pub use audit::audit_command;
 pub use tree::tree_command;
 pub use overrides::override_command;
 pub use excludes::exclude_command;
+pub use link::{link_command, unlink_command};
 // …etc

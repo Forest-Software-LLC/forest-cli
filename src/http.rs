@@ -31,7 +31,7 @@ fn async_client() -> &'static Client {
 }
 
 /// Shared blocking client for tarball downloads. Only call this from the
-/// download worker threads — reqwest's blocking client must not be created
+/// download worker threads; reqwest's blocking client must not be created
 /// on an async runtime thread.
 ///
 /// gzip is explicitly OFF: tarball bytes are hashed against the lockfile
@@ -58,7 +58,7 @@ pub enum RequestBody {
     Multipart(Arc<dyn Fn() -> Form + Send + Sync>),
 }
 
-/// Request WITHOUT auth or refresh handling — for pre-auth endpoints (login,
+/// Request WITHOUT auth or refresh handling, for pre-auth endpoints (login,
 /// 2FA verify) where a 401 is a real answer (wrong password / wrong code),
 /// not a stale-token signal to retry on.
 pub async fn api_request_public(
@@ -91,7 +91,7 @@ pub async fn api_request_public(
 }
 
 /// Generic API request against the main API (FOREST_API_URL): auth, account,
-/// package listings — everything except upload/download.
+/// package listings: everything except upload/download.
 pub async fn api_request(
     endpoint: &str,
     method: Method,
@@ -101,7 +101,7 @@ pub async fn api_request(
     api_request_with_base("FOREST_API_URL", endpoint, method, body, headers).await
 }
 
-/// Request against the package gateway (FOREST_PACKAGES_URL) — the public,
+/// Request against the package gateway (FOREST_PACKAGES_URL): the public,
 /// independently auditable service that owns package upload and download.
 /// Same auth/refresh behavior; the session refresh itself always goes to the
 /// main API, which is the only service that handles credentials.
@@ -171,7 +171,7 @@ async fn api_request_with_base(
         .context("Network error on first attempt")?;
 
     // On 401, refresh token and retry once. The refresh always goes to the
-    // main API regardless of which base this request used — auth is
+    // main API regardless of which base this request used; auth is
     // centralized there and nowhere else.
     if resp.status() == StatusCode::UNAUTHORIZED {
         let auth_url = env::var("FOREST_API_URL").context("FOREST_API_URL must be set")?;

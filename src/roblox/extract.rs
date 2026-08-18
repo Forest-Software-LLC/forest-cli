@@ -47,14 +47,14 @@ fn extract_tgz(bytes: Vec<u8>, out_dir: &Path, archive_root: &str) -> Result<()>
 
     // Tar entry paths are always forward-slashed, but versions published
     // from Windows before the gateway normalized `root` carry backslash
-    // archiveRoots (e.g. `AnimNation\init.luau`) — on mac/linux that parses
+    // archiveRoots (e.g. `AnimNation\init.luau`); on mac/linux that parses
     // as a single component and the prefix matching below never fires.
     let archive_root = archive_root.replace('\\', "/");
     let root_path = Path::new(&archive_root).to_path_buf();
 
     // `archive_root` is the package's init file (e.g. `src/init.luau`). In Roblox a
     // folder module is `init.luau` plus its sibling files/subfolders, so the real
-    // source root is the DIRECTORY that contains the init file — we must extract
+    // source root is the DIRECTORY that contains the init file; we must extract
     // everything in it, not just the init file itself. A top-level root file (no
     // parent directory) means the archive root IS the source root (e.g. Wally
     // packages like ambergracesoftware/remote ship `init.luau` plus sibling

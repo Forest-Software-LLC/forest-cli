@@ -16,19 +16,11 @@ use crate::utils::{digest_package_name, get_ci, normalize_forest_deps, normalize
 /// registry calls are needed. With a package reference, only that root
 /// dependency's subtree is shown.
 pub fn tree_command(target_package: Option<String>) -> Result<()> {
-    // Same manifest discovery as install: some platforms keep forest.json
-    // away from the project root (UEFN: inside Content/).
-    if !Path::new("forest.json").exists() {
-        if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
-            std::env::set_current_dir(&manifest_dir)?;
-        }
-    }
-    if !Path::new("forest.json").exists() {
+    let Some(project) = super::context::load_project()? else {
         info("No forest.json found, nothing to show.");
         return Ok(());
-    }
-
-    let manifest: Value = serde_json::from_str(&fs::read_to_string("forest.json")?)?;
+    };
+    let manifest = project.manifest;
     let roots = normalize_forest_deps(&manifest);
     if roots.is_empty() {
         info("No dependencies declared in forest.json.");
@@ -67,6 +59,16 @@ pub fn tree_command(target_package: Option<String>) -> Result<()> {
         return Ok(());
     }
     let lockfile: LockFile = serde_json::from_value(lock_content)?;
+
+    // Active local links change what's really on disk without touching the
+    // lockfile this tree renders from; surface them before the tree.
+    let link_res = crate::links::resolve_active(&roots);
+    for warning in &link_res.warnings {
+        warn(warning);
+    }
+    crate::links::print_banner(&link_res.active, |name| {
+        lockfile.pinned_version(name).map(str::to_string)
+    });
 
     // Same trust check install uses (UEFN widens the roots to the whole
     // workspace). A stale lockfile still prints since it's what is on disk.
@@ -128,10 +130,9 @@ fn render_tree(label: &str, roots: &HashMap<String, DepSpec>, lockfile: &LockFil
 /// Root deps pin their resolved version at location "~". Fall back to a
 /// range match so a hand-edited or stale lockfile still renders something.
 fn find_root_entry<'a>(lockfile: &'a LockFile, name: &str, range: &str) -> Option<&'a LockfileEntry> {
-    let entries = get_ci(&lockfile.packages, name)?;
-    entries.iter().find(|e| e.location == "~").or_else(|| {
+    lockfile.root_entry(name).or_else(|| {
         let req = semver::VersionReq::parse(range).ok()?;
-        entries
+        get_ci(&lockfile.packages, name)?
             .iter()
             .find(|e| semver::Version::parse(&e.version).map_or(false, |v| req.matches(&v)))
     })
@@ -178,7 +179,7 @@ fn render_dep(
     if spec.alias != digest_package_name(name).name {
         label.push_str(&format!(" {}", format!("(as {})", spec.alias).dimmed()));
     }
-    // Overrides rewrite transitive edges only — a root occurrence keeps its
+    // Overrides rewrite transitive edges only; a root occurrence keeps its
     // declared range, so tagging it would claim a pin that isn't applied.
     if !is_root {
         if let Some(range) = get_ci(overrides, name) {

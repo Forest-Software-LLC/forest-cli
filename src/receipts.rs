@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// already places in package dirs do. Extension-less, so Rojo ignores it
 /// (exactly like LICENSE) and it never materializes in the DataModel.
 ///
-/// A receipt lives and dies with its directory — deleting a package dir by
+/// A receipt lives and dies with its directory; deleting a package dir by
 /// hand deletes its receipt, so the record can never claim more than what
 /// is physically present. A dir without a receipt (half-extracted install,
 /// user junk, pre-receipt tree) is simply never trusted.
@@ -28,12 +28,12 @@ pub const RECEIPT_FILE: &str = ".forest-receipt";
 pub struct Receipt {
     pub name: String,
     pub version: String,
-    /// Lockfile sha256 of the source tarball — the content identity that an
+    /// Lockfile sha256 of the source tarball: the content identity that an
     /// extracted tree cannot otherwise prove about itself (extraction renames
     /// the root module and strips the archive prefix, so re-hashing the dir
     /// can never reproduce the tarball hash).
     pub integrity: String,
-    /// archiveRoot — layout-affecting on extraction, so part of the match key.
+    /// archiveRoot: layout-affecting on extraction, so part of the match key.
     /// Empty for platforms with verbatim extraction (UEFN).
     pub root: String,
     /// The package's own nested dep container name (its published
@@ -55,7 +55,7 @@ pub fn write(dir: &Path, receipt: &Receipt) -> Result<()> {
         .with_context(|| format!("Failed to write receipt in {}", dir.display()))
 }
 
-/// Corrupt JSON reads as `None` — an untrusted dir, never an error.
+/// Corrupt JSON reads as `None`: an untrusted dir, never an error.
 pub(crate) fn read_receipt(dir: &Path) -> Option<Receipt> {
     serde_json::from_str(&fs::read_to_string(dir.join(RECEIPT_FILE)).ok()?).ok()
 }

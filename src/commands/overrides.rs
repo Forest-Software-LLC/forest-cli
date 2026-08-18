@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs};
 
 use anyhow::Result;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input};
@@ -18,7 +18,7 @@ use crate::utils::{
 /// Manage dependency overrides: force every transitive occurrence of a
 /// package onto one semver range, recorded under `overrides` in forest.json.
 /// With no package argument, lists the declared overrides. Direct
-/// dependencies are rejected — their range already lives in `dependencies`.
+/// dependencies are rejected; their range already lives in `dependencies`.
 /// For banning specific bad versions without forcing a range, see
 /// `forest exclude`.
 pub async fn override_command(
@@ -27,19 +27,11 @@ pub async fn override_command(
     yes: bool,
     remove: bool,
 ) -> Result<()> {
-    // Same manifest discovery as install/tree (UEFN keeps forest.json in
-    // Content/).
-    if !Path::new("forest.json").exists() {
-        if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
-            std::env::set_current_dir(&manifest_dir)?;
-        }
-    }
-    if !Path::new("forest.json").exists() {
+    let Some(project) = super::context::load_project()? else {
         message::fail("No forest.json found. Run `forest init` to create a new package.");
         return Ok(());
-    }
-
-    let mut manifest: Value = serde_json::from_str(&fs::read_to_string("forest.json")?)?;
+    };
+    let mut manifest = project.manifest;
     let overrides = normalize_forest_overrides(&manifest);
 
     let Some(reference) = package else {
@@ -66,7 +58,7 @@ pub async fn override_command(
         .to_string();
     let roots = normalize_forest_deps(&manifest);
 
-    // Direct dependencies are not overridden — the manifest range IS the
+    // Direct dependencies are not overridden; the manifest range IS the
     // user's own constraint. But a reference that names an existing override
     // is an edit of that override, even if a root dep shares the bare name.
     let existing_key = match_override_key(&overrides, &reference);
@@ -169,7 +161,7 @@ pub async fn override_command(
         },
         None => {
             // The lockfile can hold several versions of one package at once
-            // (split buckets) — show them all, not one end of the list.
+            // (split buckets); show them all, not one end of the list.
             let current_note = current_override.clone().or_else(|| {
                 (!current_versions.is_empty())
                     .then(|| format!("installed {}", join_versions(&current_versions)))
@@ -318,7 +310,7 @@ pub(crate) fn remove_map_entry(manifest: &mut Value, field: &str, key: &str) -> 
     Ok(())
 }
 
-/// `Ok(best matching version)` or the user-facing rejection message —
+/// `Ok(best matching version)` or the user-facing rejection message,
 /// shared by the prompt loop and the --range path.
 fn validate_range(range: &str, versions: &[Version], pkg: &str) -> std::result::Result<Version, String> {
     let range = range.trim();
@@ -340,7 +332,7 @@ fn validate_range(range: &str, versions: &[Version], pkg: &str) -> std::result::
 /// Remove versions banned by a declared exclusion for `canonical`, so the
 /// override wizard only offers what resolution could actually install.
 /// Returns the remaining pool plus the applied exclude range and how many
-/// versions it removed. An unparseable exclude range filters nothing — the
+/// versions it removed. An unparseable exclude range filters nothing; the
 /// solver rejects it with a proper error on reinstall.
 fn drop_excluded_versions(
     versions: Vec<Version>,

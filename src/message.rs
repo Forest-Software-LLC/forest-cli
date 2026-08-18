@@ -66,7 +66,7 @@ impl Message {
     }
 
     /// Hide the spinner while something else (e.g. download progress bars)
-    /// owns the terminal — two live draw systems fight over the cursor and
+    /// owns the terminal; two live draw systems fight over the cursor and
     /// leave orphaned spinner lines behind. Pair with `resume`.
     pub fn pause(&self) {
         self.spinner.finish_and_clear();

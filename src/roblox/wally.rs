@@ -52,7 +52,7 @@ fn parse_dep_group(
             out.skipped_malformed.push(format!("{}: non-string entry", alias));
             continue;
         };
-        // "scope/name@req" — split at the LAST '@' (scopes/names can't
+        // "scope/name@req"; split at the LAST '@' (scopes/names can't
         // contain '@', but be defensive).
         let Some((full_name, req)) = spec.rsplit_once('@') else {
             out.skipped_malformed.push(format!("{} = \"{}\": missing @version", alias, spec));

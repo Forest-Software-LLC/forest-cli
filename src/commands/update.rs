@@ -8,13 +8,13 @@
 //! first-ever install would put them.
 
 use std::collections::BTreeMap;
-use std::{fs, path::Path};
+use std::fs;
 
 use anyhow::Result;
 use serde_json::Value;
 
 use crate::lockfile_gen::lockfile_gen;
-use crate::message::{self, Message, MessageType};
+use crate::message::{self, Message};
 
 /// Package name -> sorted resolved versions (usually one; conflict buckets
 /// can hold several), taken from a lockfile's `packages` map.
@@ -67,28 +67,12 @@ fn diff_locked(
 }
 
 pub async fn update_command() -> Result<()> {
-    let mut msg = Message::new("Updating dependencies...");
-
-    // Same manifest discovery as install: a local forest.json wins, else the
-    // platform seam may find one nearby (UEFN keeps it inside Content/).
-    if !Path::new("forest.json").exists() {
-        if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
-            std::env::set_current_dir(&manifest_dir)?;
-            msg.emit(
-                MessageType::Info,
-                &format!("Using manifest at {}", manifest_dir.join("forest.json").display()),
-            );
-        }
-    }
-    if !Path::new("forest.json").exists() {
-        msg.finish(
-            MessageType::Fail,
-            "No forest.json found. Run `forest init` to create a new package.",
-        );
+    let Some(project) = super::context::load_project()? else {
+        crate::message::fail("No forest.json found. Run `forest init` to create a new package.");
         return Ok(());
-    }
-
-    let info: Value = serde_json::from_str(&fs::read_to_string("forest.json")?)?;
+    };
+    let mut msg = Message::new("Updating dependencies...");
+    let info = project.manifest;
 
     // Read only for the before/after report.
     let old_versions = fs::read_to_string("forest-lock.json")

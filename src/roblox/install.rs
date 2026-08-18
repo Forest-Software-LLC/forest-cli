@@ -1,33 +1,25 @@
 //! Roblox install executor: the hoisted `Packages/` tree with pointer
 //! `init.lua` shims. Moved verbatim from lockfile_gen.rs when the platform
-//! seam was introduced; reached only via `Platform::install`.
-//!
-//! NOTE: the download worker pool below is mirrored in uefn/install.rs
-//! (search: DOWNLOAD_WORKERS). Fixes to either pool likely apply to both.
+//! seam was introduced; reached only via `Platform::install`. Downloads go
+//! through the shared pool (src/download_pool.rs).
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
-use crate::cache::TarballCache;
-use crate::lockfile_gen::{cdn_base, fetch_signed_url, InstallSummary, LockFile, DOWNLOAD_WORKERS};
+use crate::download_pool::DownloadJob;
+use crate::lockfile_gen::{InstallSummary, LockFile};
 use crate::lockfile_solver::DepSpec;
 use crate::receipts;
 use crate::roblox::extract::fetch_and_extract;
 use crate::roblox::plan::plan_install;
 use crate::roblox::PACKAGES_DIR;
 
-/// One tarball to download + extract, queued to the bounded worker pool.
-struct DownloadJob {
-    url: String,
-    name: String,
-    version: String,
-    integrity: String,
-    dir: PathBuf,
+/// What the installer needs per job beyond the pool's shared fields.
+struct RobloxExtra {
+    /// archiveRoot: picks the extraction layout, recorded in the receipt.
     root: String,
     /// The package's own nested container name, recorded in its receipt.
     container: String,
@@ -92,7 +84,7 @@ pub async fn make_directories_roblox(
 
     // The tree describes itself: every installed dir carries a
     // `.forest-receipt` (written after its extraction succeeded) and pointer
-    // dirs are recognized by their generated header — no bookkeeping outside
+    // dirs are recognized by their generated header; no bookkeeping outside
     // the mount. `--force` simply refuses to trust any of it, and a tree from
     // an older forest (no receipts) reinstalls everything the same way.
     let tree = if force {
@@ -101,7 +93,37 @@ pub async fn make_directories_roblox(
         crate::roblox::receipts::scan(Path::new(&base), &container)
     };
     let rec = crate::roblox::receipts::reconcile(&plan, &tree);
-    let (to_install, kept, stale_dirs) = (rec.to_install, rec.kept, rec.stale_dirs);
+    let (mut to_install, kept, mut stale_dirs) = (rec.to_install, rec.kept, rec.stale_dirs);
+
+    // Local link overrides (`forest link`). The plan above is pure registry
+    // graph; from here on each linked slot is opaque: nothing at or under it
+    // is installed, deleted, or pointer-written, since writes there would
+    // reach the developer's working tree through the junction. The overlay
+    // itself is applied after extraction, below.
+    let link_res = crate::links::resolve_active(&root_deps);
+    for warning in &link_res.warnings {
+        crate::message::warn(warning);
+    }
+    if let Some((count, reason)) = &link_res.ignored {
+        crate::message::info(&format!(
+            "Ignoring {} local link{}: {}.",
+            count,
+            if *count == 1 { "" } else { "s" },
+            reason
+        ));
+    }
+    let linked_slots: Vec<String> = link_res
+        .active
+        .iter()
+        .map(|l| crate::roblox::link_overlay::slot_plan_path(&container, &l.alias))
+        .collect();
+    let under_link = |path: &str| {
+        linked_slots
+            .iter()
+            .any(|slot| path == slot || path.starts_with(&format!("{}/", slot)))
+    };
+    to_install.retain(|&i| !under_link(&plan.packages[i].path));
+    stale_dirs.retain(|dir| !under_link(dir));
 
     // Stale dirs go FIRST: on case-insensitive filesystems (Windows/macOS) a
     // renamed alias's old dir would otherwise delete the freshly extracted
@@ -118,196 +140,91 @@ pub async fn make_directories_roblox(
     // also what clears old trees on --force and first-run-after-upgrade.)
     prune_top_level(&plan, &base, &container)?;
 
-    // A reinstall target may hold old content (integrity/root changed) —
-    // clear it before extraction.
+    // A reinstall target may hold old content (integrity/root changed);
+    // clear it before extraction. Link-aware: when links are being ignored
+    // (CI), the target can still BE a junction from an earlier run, which
+    // must be removed as a link, never recursed into.
     for &i in &to_install {
         let target = crate::roblox::physical_path(&base, &container, &plan.packages[i].path);
-        if target.exists() {
-            fs::remove_dir_all(&target)
-                .with_context(|| format!("Failed to clear {}", plan.packages[i].path))?;
-        }
+        crate::roblox::link_overlay::remove_slot(&target)
+            .with_context(|| format!("Failed to clear {}", plan.packages[i].path))?;
     }
 
-    let tarball_cache = TarballCache::open_default();
-
-    // Private tarballs sit behind the CDN worker's HMAC gate and their signed
-    // URLs expire in minutes, so they are never stored in the lockfile. Fetch a
-    // fresh signed URL per private entry now (integrity cross-check inside
-    // fetch_signed_url). The first request runs alone so a stale access token
-    // refreshes exactly once through http.rs's 401 path — N concurrent
-    // requests would race N refreshes against a rotating refresh token — then
-    // the rest fetch concurrently, bounded like the downloads.
-    // Only entries that actually download need a URL: kept packages make no
-    // gateway calls at all, and cache-satisfied ones skip the round-trip too
-    // (the lockfile hash is the trust anchor; cached bytes are re-verified
-    // against it on read).
-    let mut private_urls: HashMap<(String, String), String> = HashMap::new();
-    let private_entries: Vec<(String, String, String)> = to_install.iter()
-        .map(|&i| &plan.packages[i])
-        .filter(|p| !p.public)
-        .filter(|p| tarball_cache.as_ref().map_or(true, |c| c.lookup(&p.integrity).is_none()))
-        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
-        .collect();
-    let mut private_iter = private_entries.into_iter();
-    if let Some((pkg, ver, integrity)) = private_iter.next() {
-        // These round-trips run with the install spinner paused; a counter
-        // keeps the terminal alive while a tree of private packages authorizes.
-        let auth_bar = ProgressBar::new((private_iter.len() + 1) as u64);
-        auth_bar.set_style(
-            ProgressStyle::with_template("{spinner:.green} Authorizing private packages {pos}/{len}")?
-                .tick_strings(crate::message::TICK_STRINGS),
-        );
-        auth_bar.enable_steady_tick(std::time::Duration::from_millis(70));
-
-        // Collected (not `?`-propagated) so the bar's line is cleared before
-        // any error message prints under it.
-        let prefetch: Result<()> = async {
-            let (key, url) = fetch_signed_url(pkg, ver, integrity, "roblox".to_string()).await?;
-            private_urls.insert(key, url);
-            auth_bar.inc(1);
-
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_WORKERS));
-            let mut tasks = tokio::task::JoinSet::new();
-            for (pkg, ver, integrity) in private_iter {
-                let semaphore = Arc::clone(&semaphore);
-                tasks.spawn(async move {
-                    let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
-                    fetch_signed_url(pkg, ver, integrity, "roblox".to_string()).await
-                });
-            }
-            while let Some(joined) = tasks.join_next().await {
-                let (key, url) = joined.map_err(|e| anyhow!("Signed-URL task panicked: {e}"))??;
-                private_urls.insert(key, url);
-                auth_bar.inc(1);
-            }
-            Ok(())
-        }.await;
-        auth_bar.finish_and_clear();
-        prefetch?;
-    }
-
-    // Download + extract only what reconciliation says is missing or changed.
-    // The no-op path skips the bar entirely (no bar flash).
-    if !to_install.is_empty() {
-        // One line for the whole phase: package count plus a downloaded-bytes
-        // counter. The old per-download bars rendered as empty rails on
-        // cache-heavy installs; the counter still proves liveness while a
-        // big tarball holds the count still, and stays absent when
-        // everything comes from cache.
-        let total_bar = ProgressBar::new(to_install.len() as u64);
-        total_bar.set_style(
-            ProgressStyle::with_template("{spinner:.green} Installing packages {bar:30.cyan/blue} {pos}/{len} {msg}")?
-                .progress_chars("=>-")
-                .tick_strings(crate::message::TICK_STRINGS),
-        );
-        total_bar.enable_steady_tick(std::time::Duration::from_millis(70));
-        // Byte counter shown in the bar message. A mutex, not an atomic:
-        // update and display must be one critical section or out-of-order
-        // set_message calls make the counter run backwards.
-        let downloaded = Arc::new(Mutex::new(0u64));
-
-        let mut jobs: Vec<DownloadJob> = Vec::new();
-        for &i in &to_install {
+    // Download + extract only what reconciliation says is missing or
+    // changed; the shared pool owns prefetch, bars, and error draining.
+    let jobs: Vec<DownloadJob<RobloxExtra>> = to_install
+        .iter()
+        .map(|&i| {
             let pkg = &plan.packages[i];
-            let dir_path = crate::roblox::physical_path(&base, &container, &pkg.path);
-            if !dir_path.exists() {
-                fs::create_dir_all(&dir_path)?;
-            }
-
-            // Public tarballs are content-addressed: the integrity hash IS the
-            // path, so a lockfile can't point the CLI anywhere else.
-            let url = if pkg.public {
-                format!("{}/public/{}.tgz", cdn_base(), pkg.integrity.trim())
-            } else {
-                // Cache-satisfied private entries have no signed URL; the
-                // sentinel only surfaces if the entry vanishes between the
-                // probe and the worker, failing that download loudly.
-                private_urls
-                    .get(&(pkg.name.clone(), pkg.version.clone()))
-                    .cloned()
-                    .unwrap_or_else(|| format!("forest-cache://{}", pkg.integrity.trim()))
-            };
-            jobs.push(DownloadJob {
-                url,
+            DownloadJob {
                 name: pkg.name.clone(),
                 version: pkg.version.clone(),
                 integrity: pkg.integrity.clone(),
-                dir: dir_path,
-                root: pkg.root.clone(),
-                container: pkg.packages_dir.clone(),
-            });
-        }
-
-        // Drain the queue with a small worker pool instead of one OS thread per
-        // package. Workers keep draining after a failure so every bar is cleared
-        // and all downloads run to completion before the FIRST error is reported
-        // (same semantics as the old join-all loop).
-        let n_workers = jobs.len().min(DOWNLOAD_WORKERS);
-        let queue = Arc::new(Mutex::new(jobs));
-        let first_err: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
-        let mut workers = Vec::new();
-        for _ in 0..n_workers {
-            let queue = Arc::clone(&queue);
-            let first_err = Arc::clone(&first_err);
-            let tarball_cache = tarball_cache.clone();
-            let total_bar = total_bar.clone();
-            let downloaded = Arc::clone(&downloaded);
-            workers.push(std::thread::spawn(move || {
-                // indicatif throttles redraws, so per-chunk set_message is cheap.
-                let on_bytes = |delta: u64| {
-                    let mut total = downloaded.lock().expect("byte counter poisoned");
-                    *total += delta;
-                    total_bar.set_message(format!("{}", HumanBytes(*total)));
-                };
-                loop {
-                    let job = queue.lock().expect("job queue poisoned").pop();
-                    let Some(job) = job else { break };
-                    // The receipt is written only after ITS dir extracted
-                    // successfully — per-package atomicity: a dir without a
-                    // receipt (crash, partial extract) is never trusted.
-                    let result = fetch_and_extract(
-                        &job.url,
-                        &job.integrity,
-                        &job.dir,
-                        &job.root,
-                        &on_bytes,
-                        tarball_cache.as_ref(),
-                    )
-                    .and_then(|_| {
-                        receipts::write(&job.dir, &receipts::Receipt {
-                            name: job.name.clone(),
-                            version: job.version.clone(),
-                            integrity: job.integrity.clone(),
-                            root: job.root.clone(),
-                            container: job.container.clone(),
-                        })
-                    });
-                    total_bar.inc(1);
-                    if let Err(e) = result {
-                        first_err.lock().expect("error slot poisoned").get_or_insert(e);
-                    }
-                }
-            }));
-        }
-        for handle in workers {
-            if let Err(e) = handle.join() {
-                let mut slot = first_err.lock().expect("error slot poisoned");
-                if slot.is_none() {
-                    *slot = Some(anyhow!("Fetch thread panicked: {:?}", e));
-                }
+                dir: crate::roblox::physical_path(&base, &container, &pkg.path),
+                public: pkg.public,
+                extra: RobloxExtra { root: pkg.root.clone(), container: pkg.packages_dir.clone() },
             }
-        }
-        total_bar.finish_and_clear();
-        let pool_err = first_err.lock().expect("error slot poisoned").take();
-        if let Some(e) = pool_err {
-            return Err(e);
-        }
-    }
+        })
+        .collect();
+    crate::download_pool::download_all(jobs, "roblox", |job, url, on_bytes, cache| {
+        // The receipt is written only after ITS dir extracted successfully;
+        // per-package atomicity: a dir without a receipt (crash, partial
+        // extract) is never trusted.
+        fetch_and_extract(url, &job.integrity, &job.dir, &job.extra.root, on_bytes, cache).and_then(
+            |_| {
+                receipts::write(&job.dir, &receipts::Receipt {
+                    name: job.name.clone(),
+                    version: job.version.clone(),
+                    integrity: job.integrity.clone(),
+                    root: job.extra.root.clone(),
+                    container: job.extra.container.clone(),
+                })
+            },
+        )
+    })
+    .await?;
 
     // Pointer files are always regenerated: a few tiny idempotent writes,
-    // self-healing, and immune to hoist-layout drift.
+    // self-healing, and immune to hoist-layout drift. Pointer dirs inside a
+    // linked slot are skipped (the developer's own install provides them);
+    // pointers from other branches INTO a linked subtree keep their targets
+    // and resolve through the link.
     for pointer in &plan.pointers {
+        if under_link(&pointer.dir) {
+            continue;
+        }
         write_pointer(&crate::roblox::physical_path(&base, &container, &pointer.dir), &pointer.init_lua)?;
+    }
+
+    // Materialize the links before the type pass so pointers targeting a
+    // linked package pick up its live exports.
+    if !link_res.active.is_empty() {
+        for (name, mode) in crate::roblox::link_overlay::apply(&base, &container, &link_res.active)? {
+            match mode {
+                crate::roblox::link_overlay::AppliedMode::Copy(reason) => {
+                    crate::message::warn(&format!("{} linked in copy mode: {}", name, reason));
+                }
+                crate::roblox::link_overlay::AppliedMode::Junction
+                | crate::roblox::link_overlay::AppliedMode::AlreadyLinked => {}
+            }
+        }
+        // Deps the linked working tree declares beyond the pinned registry
+        // version come from ITS OWN tree; surface the drift explicitly.
+        for link in &link_res.active {
+            let pinned_deps = lockfile
+                .root_entry(&link.name)
+                .map(|e| e.dependencies.clone())
+                .unwrap_or_default();
+            for diff in crate::links::dep_divergences(link, &pinned_deps) {
+                crate::message::info(&format!(
+                    "{} (linked) {}; satisfied by its own working tree. Run `forest install` in {} if requires fail.",
+                    link.name, diff, link.path_display
+                ));
+            }
+        }
+        crate::links::print_banner(&link_res.active, |name| {
+            lockfile.pinned_version(name).map(str::to_string)
+        });
     }
 
     // Luau doesn't carry `export type` through `return require(...)`, so we re-export the types
@@ -349,7 +266,7 @@ fn write_pointer(target_dir: &Path, init_lua: &str) -> Result<()> {
 
 /// Keep the top level of the mount fully managed even when installing
 /// incrementally: any non-exempt dir that isn't a desired root alias is junk
-/// or a pre-receipt leftover and gets removed. `_`/`.` entries are exempt —
+/// or a pre-receipt leftover and gets removed. `_`/`.` entries are exempt:
 /// a project mid-migration may share this directory with Wally's own
 /// `Packages`, whose `_Index` must survive (only DIRS are removed, so
 /// wally's root link scripts survive too). Case-insensitive membership
@@ -373,7 +290,15 @@ fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, containe
         if name.starts_with('_') || name.starts_with('.') {
             continue;
         }
-        if entry.file_type()?.is_dir() && !desired.contains(&name.to_ascii_lowercase()) {
+        if desired.contains(&name.to_ascii_lowercase()) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            // An orphaned link slot (dep removed while still linked): delete
+            // the link itself, never through it.
+            crate::roblox::link_overlay::remove_link_path(&entry.path())?;
+        } else if file_type.is_dir() {
             fs::remove_dir_all(entry.path())?;
         }
     }
@@ -439,6 +364,7 @@ fn has_receipt_child(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use crate::roblox::plan::{InstallPlan, PlannedPackage};
 
     #[test]
