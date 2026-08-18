@@ -10,6 +10,7 @@ pub mod link_overlay;
 pub mod plan;
 pub mod publish;
 pub mod receipts;
+pub mod scratch;
 pub mod type_link;
 pub mod wally;
 

@@ -5,7 +5,7 @@ param(
 # Emulates a connected Studio client for rojo-bench.ps1. Rojo 7.x streams
 # patches over a msgpack WebSocket at /api/socket/{cursor}; holding the socket
 # open makes the serve session compute and deliver patches like it would for
-# Studio. The frames aren't decoded - consuming them is what matters.
+# Studio. The frames aren't decoded, consuming them is what matters.
 "subscriber starting against ws://localhost:$Port/api/socket/0" | Out-File $LogPath -Encoding utf8
 while ($true) {
     $ws = New-Object System.Net.WebSockets.ClientWebSocket

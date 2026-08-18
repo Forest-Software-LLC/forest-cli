@@ -48,7 +48,7 @@ pub fn relink_types(mount: &Path) {
 
 /// Same pass over a STAGED install unit before it renames into the mount, so
 /// those link writes never become watcher events (see install.rs). Links
-/// whose chains leave the unit can't resolve yet and are skipped silently —
+/// whose chains leave the unit can't resolve yet and are skipped silently;
 /// the in-mount pass after placement picks them up.
 pub fn relink_types_staged(unit: &Path) {
     let mut cache: HashMap<PathBuf, Option<Vec<ExportedType>>> = HashMap::new();

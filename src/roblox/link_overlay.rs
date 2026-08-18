@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::links::ActiveLink;
+use crate::roblox::scratch::TrashBin;
 
 /// The plan-format path of a linked dependency's slot. Direct deps always
 /// install at the top level of the mount.
@@ -40,23 +41,23 @@ pub enum AppliedMode {
 
 /// Materialize every active link. Runs after extraction/pointers so a
 /// pre-existing registry copy in the slot is simply replaced.
-pub fn apply(base: &str, container: &str, active: &[ActiveLink]) -> Result<Vec<(String, AppliedMode)>> {
+pub fn apply(base: &str, container: &str, active: &[ActiveLink], trash: &mut TrashBin) -> Result<Vec<(String, AppliedMode)>> {
     let mut applied = Vec::new();
     for link in active {
         let slot = crate::roblox::physical_path(base, container, &slot_plan_path(container, &link.alias));
-        let mode = apply_one(&slot, link)
+        let mode = apply_one(&slot, link, trash)
             .with_context(|| format!("Failed to apply link for {}", link.name))?;
         applied.push((link.name.clone(), mode));
     }
     Ok(applied)
 }
 
-fn apply_one(slot: &Path, link: &ActiveLink) -> Result<AppliedMode> {
+fn apply_one(slot: &Path, link: &ActiveLink, trash: &mut TrashBin) -> Result<AppliedMode> {
     // Idempotence: a slot already linking to this source is left untouched.
     if is_link_dir(slot) && resolves_to(slot, &link.source_dir) {
         return Ok(AppliedMode::AlreadyLinked);
     }
-    remove_slot(slot)?;
+    remove_slot(slot, trash)?;
 
     // Extraction renames a non-init root module to init.<ext>; a live link
     // cannot represent that rename, so those packages get a copy.
@@ -116,8 +117,9 @@ fn resolves_to(path: &Path, target: &Path) -> bool {
 
 /// Remove whatever occupies a slot: a junction/symlink is removed WITHOUT
 /// following it (the developer's source must never be touched), a real
-/// directory is deleted recursively.
-pub fn remove_slot(slot: &Path) -> Result<()> {
+/// directory goes through the trash bin (in-place deletion streams
+/// child-before-parent removal events, which crash a live rojo).
+pub fn remove_slot(slot: &Path, trash: &mut TrashBin) -> Result<()> {
     let Ok(meta) = fs::symlink_metadata(slot) else {
         return Ok(());
     };
@@ -125,7 +127,7 @@ pub fn remove_slot(slot: &Path) -> Result<()> {
         remove_link_path(slot)
             .with_context(|| format!("Failed to remove link at {}", slot.display()))?;
     } else if meta.is_dir() {
-        fs::remove_dir_all(slot)
+        trash.remove_dir_all(slot)
             .with_context(|| format!("Failed to clear {}", slot.display()))?;
     } else {
         fs::remove_file(slot)
@@ -217,6 +219,10 @@ mod tests {
         base
     }
 
+    fn test_trash(tag: &str) -> TrashBin {
+        TrashBin::new(std::env::temp_dir().join(format!("forest-overlay-trash-{}-{}", tag, std::process::id())))
+    }
+
     fn active(target: &Path, root: &str) -> ActiveLink {
         let source_dir = match root.rsplit_once('/') {
             Some((parent, _)) if !parent.is_empty() => target.join(parent),
@@ -236,6 +242,7 @@ mod tests {
     #[test]
     fn junction_mode_links_the_root_parent_and_is_idempotent() {
         let base = fixture("junction");
+        let mut trash = test_trash("junction");
         let pkg = base.join("pkg");
         fs::create_dir_all(pkg.join("src")).unwrap();
         fs::write(pkg.join("forest.json"), "{}").unwrap();
@@ -246,7 +253,7 @@ mod tests {
         let link = active(&pkg, "src/init.luau");
         let slot = mount.join("Knit");
 
-        let mode = apply_one(&slot, &link).unwrap();
+        let mode = apply_one(&slot, &link, &mut trash).unwrap();
         assert!(matches!(mode, AppliedMode::Junction), "expected a live link");
         assert!(is_link_dir(&slot));
         assert_eq!(fs::read_to_string(slot.join("init.luau")).unwrap(), "return 1");
@@ -256,11 +263,11 @@ mod tests {
         assert_eq!(fs::read_to_string(slot.join("init.luau")).unwrap(), "return 2");
 
         // Re-applying is a no-op.
-        let mode = apply_one(&slot, &link).unwrap();
+        let mode = apply_one(&slot, &link, &mut trash).unwrap();
         assert!(matches!(mode, AppliedMode::AlreadyLinked));
 
         // Removing the slot removes the link only, never the source.
-        remove_slot(&slot).unwrap();
+        remove_slot(&slot, &mut trash).unwrap();
         assert!(!slot.exists());
         assert_eq!(fs::read_to_string(pkg.join("src").join("init.luau")).unwrap(), "return 2");
         let _ = fs::remove_dir_all(&base);
@@ -269,6 +276,7 @@ mod tests {
     #[test]
     fn junction_replaces_a_registry_installed_dir() {
         let base = fixture("replace");
+        let mut trash = test_trash("replace");
         let pkg = base.join("pkg");
         fs::create_dir_all(pkg.join("src")).unwrap();
         fs::write(pkg.join("src").join("init.luau"), "return 'dev'").unwrap();
@@ -285,7 +293,7 @@ mod tests {
         })
         .unwrap();
 
-        apply_one(&slot, &active(&pkg, "src/init.luau")).unwrap();
+        apply_one(&slot, &active(&pkg, "src/init.luau"), &mut trash).unwrap();
         assert!(is_link_dir(&slot));
         assert_eq!(fs::read_to_string(slot.join("init.luau")).unwrap(), "return 'dev'");
         assert!(!slot.join(crate::receipts::RECEIPT_FILE).exists(), "registry receipt must not survive under the link");
@@ -295,6 +303,7 @@ mod tests {
     #[test]
     fn non_init_root_falls_back_to_a_renaming_copy() {
         let base = fixture("copy-rename");
+        let mut trash = test_trash("copy-rename");
         let pkg = base.join("pkg");
         fs::create_dir_all(pkg.join("src")).unwrap();
         fs::write(pkg.join("src").join("Module.lua"), "return 'root'").unwrap();
@@ -303,7 +312,7 @@ mod tests {
         fs::create_dir_all(&mount).unwrap();
         let slot = mount.join("Knit");
 
-        let mode = apply_one(&slot, &active(&pkg, "src/Module.lua")).unwrap();
+        let mode = apply_one(&slot, &active(&pkg, "src/Module.lua"), &mut trash).unwrap();
         assert!(matches!(mode, AppliedMode::Copy(_)));
         assert!(!is_link_dir(&slot), "copy mode is a real directory");
         assert_eq!(fs::read_to_string(slot.join("init.lua")).unwrap(), "return 'root'");
@@ -313,7 +322,7 @@ mod tests {
         // Edits are NOT live in copy mode until reapplied.
         fs::write(pkg.join("src").join("Module.lua"), "return 'edited'").unwrap();
         assert_eq!(fs::read_to_string(slot.join("init.lua")).unwrap(), "return 'root'");
-        apply_one(&slot, &active(&pkg, "src/Module.lua")).unwrap();
+        apply_one(&slot, &active(&pkg, "src/Module.lua"), &mut trash).unwrap();
         assert_eq!(fs::read_to_string(slot.join("init.lua")).unwrap(), "return 'edited'");
         let _ = fs::remove_dir_all(&base);
     }
@@ -321,6 +330,7 @@ mod tests {
     #[test]
     fn copy_skips_git_and_only_renames_the_top_level_root() {
         let base = fixture("copy-git");
+        let mut trash = test_trash("copy-git");
         let pkg = base.join("pkg");
         fs::create_dir_all(pkg.join(".git")).unwrap();
         fs::write(pkg.join(".git").join("HEAD"), "ref").unwrap();
@@ -331,7 +341,7 @@ mod tests {
         let slot = base.join("Packages").join("Knit");
         fs::create_dir_all(slot.parent().unwrap()).unwrap();
 
-        apply_one(&slot, &active(&pkg, "Module.lua")).unwrap();
+        apply_one(&slot, &active(&pkg, "Module.lua"), &mut trash).unwrap();
 
         assert!(!slot.join(".git").exists());
         assert_eq!(fs::read_to_string(slot.join("init.lua")).unwrap(), "return 'root'");
@@ -342,13 +352,14 @@ mod tests {
     #[test]
     fn find_slots_for_target_spots_the_orphaned_link() {
         let base = fixture("orphan");
+        let mut trash = test_trash("orphan");
         let pkg = base.join("pkg");
         fs::create_dir_all(pkg.join("src")).unwrap();
         fs::write(pkg.join("src").join("init.luau"), "return 1").unwrap();
         let mount = base.join("Packages");
         fs::create_dir_all(mount.join("Other")).unwrap();
         let slot = mount.join("Knit");
-        apply_one(&slot, &active(&pkg, "src/init.luau")).unwrap();
+        apply_one(&slot, &active(&pkg, "src/init.luau"), &mut trash).unwrap();
 
         let found = find_slots_for_target(&mount.to_string_lossy(), &pkg.join("src"));
         assert_eq!(found, vec![slot.clone()]);

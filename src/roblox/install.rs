@@ -15,170 +15,15 @@ use crate::lockfile_solver::DepSpec;
 use crate::receipts;
 use crate::roblox::extract::fetch_and_extract;
 use crate::roblox::plan::plan_install;
+use crate::roblox::scratch::{rename_with_retry, scratch_dirs, ScratchDirs, StagingArea, TrashBin};
 use crate::roblox::PACKAGES_DIR;
 
-/// Deleting dirs inside the mount crashes a live `rojo serve`:
-/// remove_dir_all deletes children before their parent, and Rojo's change
-/// processor canonicalizes each removed path's parent, so a child event
-/// processed after the parent is gone panics the server (rojo 7.7.0
-/// src/change_processor.rs:179). The bin renames each doomed dir out of the
-/// mount instead — one atomic event with a live parent — and the real
-/// deletion happens in `.forest-trash`, which no normal Rojo project watches.
-struct TrashBin {
-    dir: PathBuf,
-    counter: u64,
-    created: bool,
-}
-
-impl TrashBin {
-    /// `dir` should sit next to forest.json: same volume as the mount (so
-    /// rename never degrades to copy+delete) and outside the watched tree.
-    /// A leftover bin from a crashed run is swept here.
-    fn new(dir: PathBuf) -> Self {
-        if dir.exists() {
-            let _ = fs::remove_dir_all(&dir);
-        }
-        TrashBin { dir, counter: 0, created: false }
-    }
-
-    /// Move `path` into the bin. The rename is retried hard: a watcher
-    /// re-snapshotting the tree holds file handles inside it, and Windows
-    /// denies renaming a dir with open children. Only if it never succeeds
-    /// does this fall back to deleting in place — the old behavior, at the
-    /// cost of the Rojo-crash risk.
-    fn remove_dir_all(&mut self, path: &Path) -> std::io::Result<()> {
-        if !self.created {
-            fs::create_dir_all(&self.dir)?;
-            self.created = true;
-        }
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let target = self.dir.join(format!("{}-{}-{}", std::process::id(), self.counter, name));
-        self.counter += 1;
-        let mut result = Ok(());
-        for attempt in 0..20 {
-            if attempt > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            result = fs::rename(path, &target);
-            if result.is_ok() {
-                return result;
-            }
-        }
-        result.or_else(|_| fs::remove_dir_all(path))
-    }
-}
-
-impl Drop for TrashBin {
-    /// Best effort on every exit path; a failure is swept by the next run.
-    fn drop(&mut self) {
-        if self.created {
-            let _ = fs::remove_dir_all(&self.dir);
-        }
-    }
-}
-
-/// Staging ground for extraction: tarballs unpack OUTSIDE the mount, then
-/// each completed package dir is renamed into place as one atomic event.
-/// Extracting in place would stream hundreds of per-file create events to a
-/// live `rojo serve`; its processor canonicalizes each event path, so a path
-/// removed again before its event is processed (fast install-then-remove
-/// sequences) panics the server, and the flood itself lags the queue enough
-/// to widen that window (rojo 7.7.0 src/change_processor.rs:172).
-struct StagingArea {
-    dir: PathBuf,
-    created: bool,
-}
-
-impl StagingArea {
-    /// Same placement rules as TrashBin: next to forest.json, swept here.
-    fn new(dir: PathBuf) -> Self {
-        if dir.exists() {
-            let _ = fs::remove_dir_all(&dir);
-        }
-        StagingArea { dir, created: false }
-    }
-
-    /// Fresh unique dir for one package's extraction.
-    fn alloc(&mut self, idx: usize) -> std::io::Result<PathBuf> {
-        let p = self.dir.join(format!("{}-{}", std::process::id(), idx));
-        fs::create_dir_all(&p)?;
-        self.created = true;
-        Ok(p)
-    }
-}
-
-impl Drop for StagingArea {
-    /// Best effort on every exit path; a failure is swept by the next run.
-    fn drop(&mut self) {
-        if self.created {
-            let _ = fs::remove_dir_all(&self.dir);
-        }
-    }
-}
-
-/// Where the trash + staging dirs live. The system temp dir is preferred:
-/// rojo's project watch is recursive over the whole project root (notify
-/// re-keys pending staging events onto final mount paths when a staged unit
-/// renames in), so scratch space inside the project still leaks watcher
-/// events — temp space leaks none. Temp is only usable when it shares a
-/// volume with the project (renames must move, never copy); otherwise both
-/// dirs fall back to dot-named siblings of forest.json.
-struct ScratchDirs {
-    trash: PathBuf,
-    staging: PathBuf,
-}
-
-fn scratch_dirs() -> ScratchDirs {
-    let temp = std::env::temp_dir().join("forest-scratch");
-    if same_volume(Path::new("."), &std::env::temp_dir()) {
-        let pid = std::process::id();
-        ScratchDirs {
-            trash: temp.join(format!("{}-trash", pid)),
-            staging: temp.join(format!("{}-stage", pid)),
-        }
-    } else {
-        ScratchDirs {
-            trash: PathBuf::from(".forest-trash"),
-            staging: PathBuf::from(".forest-staging"),
-        }
-    }
-}
-
-/// Same-volume check WITHOUT writing anywhere: a rename probe inside the
-/// project would itself be a create-then-remove event for the watcher.
-#[cfg(windows)]
-fn same_volume(a: &Path, b: &Path) -> bool {
-    fn root(p: &Path) -> Option<std::ffi::OsString> {
-        let canon = fs::canonicalize(p).ok()?;
-        match canon.components().next()? {
-            std::path::Component::Prefix(pre) => {
-                Some(pre.as_os_str().to_ascii_uppercase())
-            }
-            _ => None,
-        }
-    }
-    matches!((root(a), root(b)), (Some(x), Some(y)) if x == y)
-}
-
-#[cfg(not(windows))]
-fn same_volume(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (fs::metadata(a), fs::metadata(b)) {
-        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev(),
-        _ => false,
-    }
-}
-
-/// A live `rojo serve` may still be draining events from a forest run that
-/// JUST finished: its watcher emits a rescan event per directory of a
-/// renamed-in tree, each costing a subtree re-snapshot, and its change
-/// processor resolves every queued path against the live filesystem —
-/// mutating the mount again before the queue drains crashes it. The
-/// lockfile's mtime marks the end of the last mutating run; when it is
-/// fresh AND a rojo is actually serving from this directory, hold off until
-/// it is comfortably old. Normal one-command usage never waits, and neither
-/// do chains with no rojo attached (the probe fails fast). FOREST_NO_SETTLE=1
-/// skips even the probe.
+/// A live rojo may still be draining events from a forest run that just
+/// finished, and mutating the mount again before its queue drains crashes
+/// it. The lockfile's mtime marks the end of the last mutating run; when it
+/// is fresh and a rojo answers from this directory, wait out the remainder.
+/// One-off commands never wait, and chains with no rojo attached fail the
+/// probe fast. FOREST_NO_SETTLE=1 skips even the probe.
 fn settle_watchers() {
     // Margin, not load-bearing: the rapid-cycle bench passes with the wait
     // disabled outright. A knit-sized tree takes a connected rojo ~2s to
@@ -235,11 +80,10 @@ fn probe_rojo_port(port: u16) -> bool {
     }
 }
 
-/// Clear a reinstall target rojo-safely AND link-safely: a junction/symlink
-/// (a slot left by an earlier run while links are ignored) is removed as a
-/// LINK — one watcher event, target tree untouched — while a real dir
-/// renames into the trash bin. A target already gone (its parent renamed out
-/// first) is a no-op.
+/// Clear a reinstall target. A junction/symlink (a slot left by an earlier
+/// run while links were ignored) is removed as a link so the target tree is
+/// never touched; a real dir renames into the trash bin. A target already
+/// gone (its parent renamed out first) is a no-op.
 fn clear_target(target: &Path, trash: &mut TrashBin) -> Result<()> {
     let Ok(meta) = fs::symlink_metadata(target) else {
         return Ok(());
@@ -253,22 +97,6 @@ fn clear_target(target: &Path, trash: &mut TrashBin) -> Result<()> {
         fs::remove_file(target)?;
     }
     Ok(())
-}
-
-/// Windows can transiently deny a dir rename (indexer or AV holding a child
-/// open); a few short retries ride that out.
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
-    let mut last = None;
-    for attempt in 0..5 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        match fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(e) => last = Some(e),
-        }
-    }
-    Err(last.expect("at least one rename attempt"))
 }
 
 /// What the installer needs per job beyond the pool's shared fields.
@@ -310,13 +138,7 @@ pub async fn make_directories_roblox(
     // `rojo serve` never sees a child removal under an already-gone parent.
     let ScratchDirs { trash: trash_dir, staging: staging_dir } = scratch_dirs();
     let mut trash = TrashBin::new(trash_dir);
-    // Leftover project-local dirs from an older run (or the fallback mode of
-    // a crashed one) are swept regardless of where this run's scratch lives.
-    for leftover in [".forest-trash", ".forest-staging"] {
-        if Path::new(leftover).exists() {
-            let _ = fs::remove_dir_all(leftover);
-        }
-    }
+    crate::roblox::scratch::sweep_leftovers();
 
     // A renamed `packagesDir` or a root move within the same parent leaves
     // the old tree behind. Receipts prove which leftovers are forest's and
@@ -410,14 +232,12 @@ pub async fn make_directories_roblox(
     // also what clears old trees on --force and first-run-after-upgrade.)
     prune_top_level(&plan, &base, &container, &mut trash)?;
 
-    // A reinstall target may hold old content (integrity/root changed) —
-    // clear it before extraction. Parents first: renaming a parent out takes
-    // its nested targets with it (the vanished-target check skips them), so
-    // each cleared unit emits ONE watcher event instead of one per nesting
-    // level (out-of-order delivery of the deep ones crashes a live rojo).
-    // Link-aware: when links are being ignored (CI), the target can still BE
-    // a junction from an earlier run, which is removed as a link, never
-    // recursed into or renamed away.
+    // A reinstall target may hold old content, clear it before extraction.
+    // Parents first: renaming a parent out takes its nested targets with it,
+    // so each cleared unit emits one watcher event (out-of-order delivery of
+    // the deep removals crashes a live rojo). The target can also be a
+    // junction from a run where links were ignored; clear_target removes
+    // those as links.
     let mut clear_order = to_install.clone();
     clear_order.sort_by_key(|&i| plan.packages[i].path.len());
     for &i in &clear_order {
@@ -476,8 +296,8 @@ pub async fn make_directories_roblox(
         // Assemble nested packages inside their installing ancestor's staged
         // dir, deepest first so a package's own children are in place before
         // it moves. Whatever has no installing ancestor renames into the
-        // mount afterwards — each such unit arrives complete (nested deps,
-        // pointers, receipts) in ONE atomic event.
+        // mount afterwards, arriving complete (nested deps, pointers,
+        // receipts) in one atomic event.
         placements.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
         let mut mount_moves: Vec<usize> = Vec::new();
         for i in 0..placements.len() {
@@ -545,7 +365,7 @@ pub async fn make_directories_roblox(
     // Materialize the links before the type pass so pointers targeting a
     // linked package pick up its live exports.
     if !link_res.active.is_empty() {
-        for (name, mode) in crate::roblox::link_overlay::apply(&base, &container, &link_res.active)? {
+        for (name, mode) in crate::roblox::link_overlay::apply(&base, &container, &link_res.active, &mut trash)? {
             match mode {
                 crate::roblox::link_overlay::AppliedMode::Copy(reason) => {
                     crate::message::warn(&format!("{} linked in copy mode: {}", name, reason));

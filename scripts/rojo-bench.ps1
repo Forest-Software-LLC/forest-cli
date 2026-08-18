@@ -8,7 +8,7 @@ install / incremental add / remove / force-reinstall / update / rapid
 zero-gap cycles, checking after each command that rojo is still alive and
 panic-free. Rojo 7.7.0's change processor unwraps canonicalize() on every
 watcher event path, so any transient state where an event's path no longer
-resolves kills the server - this bench is the regression net for forest's
+resolves kills the server. This bench is the regression net for forest's
 rename-based mount mutation strategy (see src/roblox/install.rs).
 
 .EXAMPLE

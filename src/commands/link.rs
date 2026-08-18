@@ -247,11 +247,13 @@ pub async fn unlink_command(reference: Option<String>, all: bool) -> Result<()> 
 
     // Clear each slot so the reinstall below restores the registry version
     // (re-extracted from the verified cache). Junctions are removed as
-    // links, never through them.
+    // links, never through them; copy-mode slots (real dirs) go through the
+    // trash bin so a live rojo never sees in-place child deletions.
     if Platform::from_manifest(&manifest)? == Platform::Roblox {
         let base = crate::roblox::packages_base(&manifest);
         let container = crate::roblox::packages_container(&manifest);
         let root_deps = normalize_forest_deps(&manifest);
+        let mut trash = crate::roblox::scratch::TrashBin::new(crate::roblox::scratch::scratch_dirs().trash);
         for link in &removed {
             if let Some(spec) = crate::utils::get_ci(&root_deps, &link.name) {
                 let slot = crate::roblox::physical_path(
@@ -259,7 +261,7 @@ pub async fn unlink_command(reference: Option<String>, all: bool) -> Result<()> 
                     &container,
                     &crate::roblox::link_overlay::slot_plan_path(&container, &spec.alias),
                 );
-                crate::roblox::link_overlay::remove_slot(&slot)?;
+                crate::roblox::link_overlay::remove_slot(&slot, &mut trash)?;
             } else if let Ok(target) = fs::canonicalize(Path::new(&link.path)) {
                 // Dep no longer declared: hunt down the orphaned link by its
                 // target instead (copy-mode orphans are pruned by install).
@@ -276,7 +278,7 @@ pub async fn unlink_command(reference: Option<String>, all: bool) -> Result<()> 
                 }
                 for candidate in candidates {
                     for slot in crate::roblox::link_overlay::find_slots_for_target(&base, &candidate) {
-                        crate::roblox::link_overlay::remove_slot(&slot)?;
+                        crate::roblox::link_overlay::remove_slot(&slot, &mut trash)?;
                     }
                 }
             }
