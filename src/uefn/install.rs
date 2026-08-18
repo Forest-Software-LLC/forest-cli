@@ -40,6 +40,12 @@ pub async fn make_directories_uefn(
     root_deps: HashMap<String, DepSpec>,
     force: bool,
 ) -> Result<InstallSummary> {
+    // `forest link` is Roblox-only for now; a links file here (hand-written
+    // or left over) must not silently change anything.
+    if !crate::links::stored_links().is_empty() {
+        warn("forest link is not supported on UEFN; ignoring .forest/links.json.");
+    }
+
     let cwd = std::env::current_dir().context("Failed to read current directory")?;
     let project = super::find_project(&cwd).ok_or_else(|| {
         anyhow!(

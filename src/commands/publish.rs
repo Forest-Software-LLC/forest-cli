@@ -223,8 +223,26 @@ pub async fn publish_command() -> Result<()> {
         ));
     }
 
+    // Publishing while a dependency resolves through a local link is refused
+    // outright: the tested tree is not the tree consumers will get, and the
+    // linked dev version may not even be published. No override flag.
+    {
+        let deps = crate::utils::normalize_forest_deps(&forest_json);
+        let linked: Vec<String> = crate::links::stored_links()
+            .into_iter()
+            .filter(|l| deps.keys().any(|k| crate::utils::same_package(k, &l.name)))
+            .map(|l| l.name)
+            .collect();
+        if !linked.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Cannot publish while dependencies are locally linked: {}. Run `forest unlink --all` (or unlink each) and re-test against the registry versions first.",
+                linked.join(", ")
+            ));
+        }
+    }
+
     // The platform owns every divergent step below (entry-point resolution,
-    // naming rules, extra metadata, pre-pack lints) — commands stay
+    // naming rules, extra metadata, pre-pack lints); commands stay
     // platform-blind. A missing/unknown platform is a hard error here: the
     // registry requires it and every later call embeds it.
     let platform = Platform::from_manifest(&forest_json)?;

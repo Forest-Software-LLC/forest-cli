@@ -92,7 +92,7 @@ pub async fn make_directories_roblox(
 
     // The tree describes itself: every installed dir carries a
     // `.forest-receipt` (written after its extraction succeeded) and pointer
-    // dirs are recognized by their generated header — no bookkeeping outside
+    // dirs are recognized by their generated header; no bookkeeping outside
     // the mount. `--force` simply refuses to trust any of it, and a tree from
     // an older forest (no receipts) reinstalls everything the same way.
     let tree = if force {
@@ -101,7 +101,37 @@ pub async fn make_directories_roblox(
         crate::roblox::receipts::scan(Path::new(&base), &container)
     };
     let rec = crate::roblox::receipts::reconcile(&plan, &tree);
-    let (to_install, kept, stale_dirs) = (rec.to_install, rec.kept, rec.stale_dirs);
+    let (mut to_install, kept, mut stale_dirs) = (rec.to_install, rec.kept, rec.stale_dirs);
+
+    // Local link overrides (`forest link`). The plan above is pure registry
+    // graph; from here on each linked slot is opaque: nothing at or under it
+    // is installed, deleted, or pointer-written, since writes there would
+    // reach the developer's working tree through the junction. The overlay
+    // itself is applied after extraction, below.
+    let link_res = crate::links::resolve_active(&root_deps);
+    for warning in &link_res.warnings {
+        crate::message::warn(warning);
+    }
+    if let Some((count, reason)) = &link_res.ignored {
+        crate::message::info(&format!(
+            "Ignoring {} local link{}: {}.",
+            count,
+            if *count == 1 { "" } else { "s" },
+            reason
+        ));
+    }
+    let linked_slots: Vec<String> = link_res
+        .active
+        .iter()
+        .map(|l| crate::roblox::link_overlay::slot_plan_path(&container, &l.alias))
+        .collect();
+    let under_link = |path: &str| {
+        linked_slots
+            .iter()
+            .any(|slot| path == slot || path.starts_with(&format!("{}/", slot)))
+    };
+    to_install.retain(|&i| !under_link(&plan.packages[i].path));
+    stale_dirs.retain(|dir| !under_link(dir));
 
     // Stale dirs go FIRST: on case-insensitive filesystems (Windows/macOS) a
     // renamed alias's old dir would otherwise delete the freshly extracted
@@ -118,14 +148,14 @@ pub async fn make_directories_roblox(
     // also what clears old trees on --force and first-run-after-upgrade.)
     prune_top_level(&plan, &base, &container)?;
 
-    // A reinstall target may hold old content (integrity/root changed) —
-    // clear it before extraction.
+    // A reinstall target may hold old content (integrity/root changed);
+    // clear it before extraction. Link-aware: when links are being ignored
+    // (CI), the target can still BE a junction from an earlier run, which
+    // must be removed as a link, never recursed into.
     for &i in &to_install {
         let target = crate::roblox::physical_path(&base, &container, &plan.packages[i].path);
-        if target.exists() {
-            fs::remove_dir_all(&target)
-                .with_context(|| format!("Failed to clear {}", plan.packages[i].path))?;
-        }
+        crate::roblox::link_overlay::remove_slot(&target)
+            .with_context(|| format!("Failed to clear {}", plan.packages[i].path))?;
     }
 
     let tarball_cache = TarballCache::open_default();
@@ -134,8 +164,8 @@ pub async fn make_directories_roblox(
     // URLs expire in minutes, so they are never stored in the lockfile. Fetch a
     // fresh signed URL per private entry now (integrity cross-check inside
     // fetch_signed_url). The first request runs alone so a stale access token
-    // refreshes exactly once through http.rs's 401 path — N concurrent
-    // requests would race N refreshes against a rotating refresh token — then
+    // refreshes exactly once through http.rs's 401 path; N concurrent
+    // requests would race N refreshes against a rotating refresh token; then
     // the rest fetch concurrently, bounded like the downloads.
     // Only entries that actually download need a URL: kept packages make no
     // gateway calls at all, and cache-satisfied ones skip the round-trip too
@@ -263,7 +293,7 @@ pub async fn make_directories_roblox(
                     let job = queue.lock().expect("job queue poisoned").pop();
                     let Some(job) = job else { break };
                     // The receipt is written only after ITS dir extracted
-                    // successfully — per-package atomicity: a dir without a
+                    // successfully; per-package atomicity: a dir without a
                     // receipt (crash, partial extract) is never trusted.
                     let result = fetch_and_extract(
                         &job.url,
@@ -305,9 +335,48 @@ pub async fn make_directories_roblox(
     }
 
     // Pointer files are always regenerated: a few tiny idempotent writes,
-    // self-healing, and immune to hoist-layout drift.
+    // self-healing, and immune to hoist-layout drift. Pointer dirs inside a
+    // linked slot are skipped (the developer's own install provides them);
+    // pointers from other branches INTO a linked subtree keep their targets
+    // and resolve through the link.
     for pointer in &plan.pointers {
+        if under_link(&pointer.dir) {
+            continue;
+        }
         write_pointer(&crate::roblox::physical_path(&base, &container, &pointer.dir), &pointer.init_lua)?;
+    }
+
+    // Materialize the links before the type pass so pointers targeting a
+    // linked package pick up its live exports.
+    if !link_res.active.is_empty() {
+        for (name, mode) in crate::roblox::link_overlay::apply(&base, &container, &link_res.active)? {
+            match mode {
+                crate::roblox::link_overlay::AppliedMode::Copy(reason) => {
+                    crate::message::warn(&format!("{} linked in copy mode: {}", name, reason));
+                }
+                crate::roblox::link_overlay::AppliedMode::Junction
+                | crate::roblox::link_overlay::AppliedMode::AlreadyLinked => {}
+            }
+        }
+        // Deps the linked working tree declares beyond the pinned registry
+        // version come from ITS OWN tree; surface the drift explicitly.
+        for link in &link_res.active {
+            let pinned_deps = crate::utils::get_ci(&lockfile.packages, &link.name)
+                .and_then(|entries| entries.iter().find(|e| e.location == "~"))
+                .map(|e| e.dependencies.clone())
+                .unwrap_or_default();
+            for diff in crate::links::dep_divergences(link, &pinned_deps) {
+                crate::message::info(&format!(
+                    "{} (linked) {}; satisfied by its own working tree. Run `forest install` in {} if requires fail.",
+                    link.name, diff, link.path_display
+                ));
+            }
+        }
+        crate::links::print_banner(&link_res.active, |name| {
+            crate::utils::get_ci(&lockfile.packages, name)
+                .and_then(|entries| entries.iter().find(|e| e.location == "~"))
+                .map(|e| e.version.clone())
+        });
     }
 
     // Luau doesn't carry `export type` through `return require(...)`, so we re-export the types
@@ -349,7 +418,7 @@ fn write_pointer(target_dir: &Path, init_lua: &str) -> Result<()> {
 
 /// Keep the top level of the mount fully managed even when installing
 /// incrementally: any non-exempt dir that isn't a desired root alias is junk
-/// or a pre-receipt leftover and gets removed. `_`/`.` entries are exempt —
+/// or a pre-receipt leftover and gets removed. `_`/`.` entries are exempt:
 /// a project mid-migration may share this directory with Wally's own
 /// `Packages`, whose `_Index` must survive (only DIRS are removed, so
 /// wally's root link scripts survive too). Case-insensitive membership
@@ -373,7 +442,15 @@ fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, containe
         if name.starts_with('_') || name.starts_with('.') {
             continue;
         }
-        if entry.file_type()?.is_dir() && !desired.contains(&name.to_ascii_lowercase()) {
+        if desired.contains(&name.to_ascii_lowercase()) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            // An orphaned link slot (dep removed while still linked): delete
+            // the link itself, never through it.
+            crate::roblox::link_overlay::remove_link_path(&entry.path())?;
+        } else if file_type.is_dir() {
             fs::remove_dir_all(entry.path())?;
         }
     }

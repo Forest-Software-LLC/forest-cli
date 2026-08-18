@@ -68,6 +68,18 @@ pub fn tree_command(target_package: Option<String>) -> Result<()> {
     }
     let lockfile: LockFile = serde_json::from_value(lock_content)?;
 
+    // Active local links change what's really on disk without touching the
+    // lockfile this tree renders from; surface them before the tree.
+    let link_res = crate::links::resolve_active(&roots);
+    for warning in &link_res.warnings {
+        warn(warning);
+    }
+    crate::links::print_banner(&link_res.active, |name| {
+        get_ci(&lockfile.packages, name)
+            .and_then(|entries| entries.iter().find(|e| e.location == "~"))
+            .map(|e| e.version.clone())
+    });
+
     // Same trust check install uses (UEFN widens the roots to the whole
     // workspace). A stale lockfile still prints since it's what is on disk.
     let overrides = normalize_forest_overrides(&manifest);
@@ -178,7 +190,7 @@ fn render_dep(
     if spec.alias != digest_package_name(name).name {
         label.push_str(&format!(" {}", format!("(as {})", spec.alias).dimmed()));
     }
-    // Overrides rewrite transitive edges only — a root occurrence keeps its
+    // Overrides rewrite transitive edges only; a root occurrence keeps its
     // declared range, so tagging it would claim a pin that isn't applied.
     if !is_root {
         if let Some(range) = get_ci(overrides, name) {

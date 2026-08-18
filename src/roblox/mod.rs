@@ -6,6 +6,7 @@
 pub mod extract;
 pub mod init;
 pub mod install;
+pub mod link_overlay;
 pub mod plan;
 pub mod publish;
 pub mod receipts;

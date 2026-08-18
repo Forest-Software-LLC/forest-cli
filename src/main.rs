@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod tokens;
 mod http;
 mod cache;
+mod links;
 mod contracts;
 mod message;
 mod lockfile_gen;
@@ -17,7 +18,7 @@ mod platform;
 mod release_verify;
 mod uefn;
 mod utils;
-use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, upgrade_command, audit_command, tree_command, override_command, exclude_command, maybe_notify_update};
+use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, upgrade_command, audit_command, tree_command, override_command, exclude_command, link_command, unlink_command, maybe_notify_update};
 
 use std::env;
 
@@ -85,6 +86,11 @@ enum Commands {
         /// already exists.
         #[arg(long = "init", value_name = "PLATFORM")]
         init: Option<String>,
+
+        /// How to treat local links (forest link): apply, ignore, or forbid.
+        /// Default: ignore under CI, apply otherwise.
+        #[arg(long = "links", value_name = "MODE")]
+        links: Option<links::LinksMode>,
     },
 
     /// Remove a package from the project
@@ -142,6 +148,26 @@ enum Commands {
         /// Remove the override for this package
         #[arg(long = "remove")]
         remove: bool,
+    },
+
+    /// Point a dependency at a local directory, machine-locally (lists links when no path is given)
+    Link {
+        /// Path to a local package directory containing forest.json
+        path: Option<String>,
+
+        /// Show active links and their divergence from the lockfile
+        #[arg(long = "list")]
+        list: bool,
+    },
+
+    /// Remove a local link and restore the registry version
+    Unlink {
+        /// Package (scope/name) or the linked path
+        reference: Option<String>,
+
+        /// Remove every active link
+        #[arg(long = "all")]
+        all: bool,
     },
 
     /// Ban versions of a package from ever being installed (lists exclusions when no package is given)
@@ -205,8 +231,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init { platform, project, packages_dir } => {
             init_command(platform, project, packages_dir).await?;
         }
-        Commands::Install { package, version, alias, force, init } => {
-            install_command(package, version, alias, force, init).await?;
+        Commands::Install { package, version, alias, force, init, links } => {
+            install_command(package, version, alias, force, init, links).await?;
         }
         Commands::Remove { package } => {
             remove_command(package).await?;
@@ -233,6 +259,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Exclude { package, range, yes, remove } => {
             exclude_command(package, range, yes, remove).await?;
+        }
+        Commands::Link { path, list } => {
+            link_command(path, list).await?;
+        }
+        Commands::Unlink { reference, all } => {
+            unlink_command(reference, all).await?;
         }
     }
 

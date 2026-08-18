@@ -18,7 +18,20 @@ pub async fn install_command(
     alias: Option<String>,
     force: bool,
     init_platform: Option<String>,
+    links_mode: Option<crate::links::LinksMode>,
 ) -> Result<()> {
+    match links_mode {
+        Some(crate::links::LinksMode::Apply) => {
+            crate::links::set_policy(crate::links::LinkPolicy::Apply);
+        }
+        Some(crate::links::LinksMode::Ignore) => {
+            crate::links::set_policy(crate::links::LinkPolicy::Ignore("--links=ignore".to_string()));
+        }
+        // Forbid is enforced below (after manifest discovery, where the
+        // links file lives); None keeps the default: ignore under CI,
+        // apply otherwise.
+        Some(crate::links::LinksMode::Forbid) | None => {}
+    }
     let mut msg = Message::new("Installing...");
 
     // Some platforms keep the manifest away from the project root (UEFN:
@@ -31,6 +44,24 @@ pub async fn install_command(
                 MessageType::Info,
                 &format!("Using manifest at {}", manifest_dir.join("forest.json").display()),
             );
+        }
+    }
+
+    // Strict mode for CI: a links file with entries is a hard failure, so a
+    // leaked .forest/links.json can never produce a non-lockfile install
+    // silently. (Without the flag, links are ignored by default under CI;
+    // see links::policy.)
+    if links_mode == Some(crate::links::LinksMode::Forbid) {
+        let stored = crate::links::stored_links();
+        if !stored.is_empty() {
+            msg.destroy();
+            return Err(anyhow::anyhow!(
+                "--links=forbid: {} local link{} configured in {} ({}). Unlink them or remove the file.",
+                stored.len(),
+                if stored.len() == 1 { " is" } else { "s are" },
+                crate::links::LINKS_FILE,
+                stored.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", ")
+            ));
         }
     }
 
@@ -136,7 +167,7 @@ pub async fn install_command(
                 return Ok(());
             }
 
-            // Aliases become folder names (and `require` identifiers) — path
+            // Aliases become folder names (and `require` identifiers); path
             // separators would nest directories and break pointer files.
             if a.contains('/') || a.contains('\\') {
                 msg.finish(
@@ -201,8 +232,8 @@ pub async fn install_command(
             );
         }
 
-        // The override command refuses direct deps, but the reverse path —
-        // installing a package that is already overridden — lands in a
+        // The override command refuses direct deps, but the reverse path
+        // (installing a package that is already overridden) lands in a
         // split: transitive edges follow the override, this new direct dep
         // follows its own range. Legal, but never silently. (Exclusions
         // need no warning: they filter this new direct dep too.)
@@ -253,7 +284,7 @@ pub async fn install_command(
 
 
         // Case-insensitive: aliases become folder names under packages/, and
-        // Windows/macOS filesystems case-fold — `DataStream` and `datastream`
+        // Windows/macOS filesystems case-fold; `DataStream` and `datastream`
         // would silently merge into one directory.
         if normalized_root_deps.values().any(|spec| spec.alias.eq_ignore_ascii_case(&resolved_name)) {
             //TODO: Prompt for a new alias.
