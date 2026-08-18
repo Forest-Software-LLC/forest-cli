@@ -29,6 +29,8 @@ struct DownloadJob {
     integrity: String,
     dir: PathBuf,
     root: String,
+    /// The package's own nested container name, recorded in its receipt.
+    container: String,
 }
 
 pub async fn make_directories_roblox(
@@ -49,17 +51,37 @@ pub async fn make_directories_roblox(
     }
 
     // All path/pointer computation is pure and lives in roblox/plan.rs; plan
-    // paths stay in the virtual `./Packages/...` format and are mapped onto
-    // the physical mount (derived from the manifest's `root`) only here.
-    let plan = plan_install(lockfile, &root_deps)?;
+    // paths stay in the virtual `./<container>/...` format and are mapped
+    // onto the physical mount (derived from the manifest's `root` and
+    // `packagesDir`) only here. One manifest read feeds the planner's root
+    // prefix, physical_path, the receipt scan, and prune_top_level, so their
+    // prefixes can never mismatch.
+    let container = crate::roblox::packages_container(manifest);
+    let plan = plan_install(lockfile, &root_deps, &container)?;
     let base = crate::roblox::packages_base(manifest);
 
-    // A manifest that gained a nested root (first publish / new init) can
-    // leave a top-level mount from earlier installs behind; it's outside this
-    // run's managed tree, so just point at it (it may also be Wally's).
-    if base != PACKAGES_DIR && Path::new(PACKAGES_DIR).is_dir() {
+    // A renamed `packagesDir` or a root move within the same parent leaves
+    // the old tree behind. Receipts prove which leftovers are forest's and
+    // those get a direct warning; a receipt-less literal `Packages/`
+    // (pre-receipt forest, or Wally's) keeps the softer legacy warning.
+    // Un-nesting the root moves the old mount out of the scanned parents,
+    // so that case stays silent.
+    let abandoned = find_abandoned_mounts(Path::new("."), &base);
+    if !abandoned.is_empty() {
+        let list = abandoned
+            .iter()
+            .map(|d| format!("{}/", d))
+            .collect::<Vec<_>>()
+            .join(", ");
         crate::message::warn(&format!(
-            "Dependencies now install to {}/; the old {}/ directory is no longer managed and can be deleted if Wally isn't using it.",
+            "Found old dependency folder(s) no longer managed by forest: {}. Dependencies now install to {}/. The old folder(s) can be deleted.",
+            list, base
+        ));
+    }
+    let legacy_already_flagged = abandoned.iter().any(|d| d.eq_ignore_ascii_case(PACKAGES_DIR));
+    if base != PACKAGES_DIR && !legacy_already_flagged && Path::new(PACKAGES_DIR).is_dir() {
+        crate::message::warn(&format!(
+            "Dependencies now install to {}/; the old {}/ directory is no longer managed and can be deleted if unused.",
             base, PACKAGES_DIR
         ));
     }
@@ -76,7 +98,7 @@ pub async fn make_directories_roblox(
     let tree = if force {
         crate::roblox::receipts::TreeScan::default()
     } else {
-        crate::roblox::receipts::scan(Path::new(&base))
+        crate::roblox::receipts::scan(Path::new(&base), &container)
     };
     let rec = crate::roblox::receipts::reconcile(&plan, &tree);
     let (to_install, kept, stale_dirs) = (rec.to_install, rec.kept, rec.stale_dirs);
@@ -85,7 +107,7 @@ pub async fn make_directories_roblox(
     // renamed alias's old dir would otherwise delete the freshly extracted
     // new one. exists() guard: children of already-deleted parents are gone.
     for dir in &stale_dirs {
-        let p = crate::roblox::physical_path(&base, dir);
+        let p = crate::roblox::physical_path(&base, &container, dir);
         if p.exists() {
             fs::remove_dir_all(&p).with_context(|| format!("Failed to remove stale {}", dir))?;
         }
@@ -94,12 +116,12 @@ pub async fn make_directories_roblox(
     // The top level of the mount stays fully managed: any non-exempt dir that
     // isn't a desired root alias is junk or a pre-receipt leftover. (This is
     // also what clears old trees on --force and first-run-after-upgrade.)
-    prune_top_level(&plan, &base)?;
+    prune_top_level(&plan, &base, &container)?;
 
     // A reinstall target may hold old content (integrity/root changed) —
     // clear it before extraction.
     for &i in &to_install {
-        let target = crate::roblox::physical_path(&base, &plan.packages[i].path);
+        let target = crate::roblox::physical_path(&base, &container, &plan.packages[i].path);
         if target.exists() {
             fs::remove_dir_all(&target)
                 .with_context(|| format!("Failed to clear {}", plan.packages[i].path))?;
@@ -187,7 +209,7 @@ pub async fn make_directories_roblox(
         let mut jobs: Vec<DownloadJob> = Vec::new();
         for &i in &to_install {
             let pkg = &plan.packages[i];
-            let dir_path = crate::roblox::physical_path(&base, &pkg.path);
+            let dir_path = crate::roblox::physical_path(&base, &container, &pkg.path);
             if !dir_path.exists() {
                 fs::create_dir_all(&dir_path)?;
             }
@@ -212,6 +234,7 @@ pub async fn make_directories_roblox(
                 integrity: pkg.integrity.clone(),
                 dir: dir_path,
                 root: pkg.root.clone(),
+                container: pkg.packages_dir.clone(),
             });
         }
 
@@ -256,6 +279,7 @@ pub async fn make_directories_roblox(
                             version: job.version.clone(),
                             integrity: job.integrity.clone(),
                             root: job.root.clone(),
+                            container: job.container.clone(),
                         })
                     });
                     total_bar.inc(1);
@@ -283,7 +307,7 @@ pub async fn make_directories_roblox(
     // Pointer files are always regenerated: a few tiny idempotent writes,
     // self-healing, and immune to hoist-layout drift.
     for pointer in &plan.pointers {
-        write_pointer(&crate::roblox::physical_path(&base, &pointer.dir), &pointer.init_lua)?;
+        write_pointer(&crate::roblox::physical_path(&base, &container, &pointer.dir), &pointer.init_lua)?;
     }
 
     // Luau doesn't carry `export type` through `return require(...)`, so we re-export the types
@@ -331,9 +355,11 @@ fn write_pointer(target_dir: &Path, init_lua: &str) -> Result<()> {
 /// wally's root link scripts survive too). Case-insensitive membership
 /// because Windows/macOS case-fold names (exact-case renames are handled by
 /// the stale/reinstall path, not here). `base` is the physical mount; plan
-/// paths stay in the virtual `./Packages/...` format.
-fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str) -> Result<()> {
-    let prefix = format!("./{}/", PACKAGES_DIR);
+/// paths stay in the virtual `./<container>/...` format. `container` must be
+/// the one the plan was built with, or every plan path gets stripped from
+/// `desired` and the whole mount is deleted.
+fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, container: &str) -> Result<()> {
+    let prefix = format!("./{}/", container);
     let desired: std::collections::HashSet<String> = plan.packages.iter()
         .filter_map(|p| {
             let rest = p.path.strip_prefix(&prefix)?;
@@ -354,6 +380,62 @@ fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str) -> Resul
     Ok(())
 }
 
+/// Find abandoned forest-managed mounts near the current one: an immediate
+/// subdirectory of the project top level or of the mount's parent, not the
+/// mount itself, whose immediate children carry receipts. Returns relative
+/// paths with forward slashes. Comparison against the mount is
+/// case-insensitive so the current mount is never listed on case-folding
+/// filesystems.
+fn find_abandoned_mounts(manifest_dir: &Path, base: &str) -> Vec<String> {
+    let base_norm = base.replace('\\', "/");
+    let mount = base_norm.to_ascii_lowercase();
+    let mut parents: Vec<String> = vec![String::new()];
+    if let Some((parent, _)) = base_norm.rsplit_once('/') {
+        if !parent.is_empty() {
+            parents.push(parent.to_string());
+        }
+    }
+
+    let mut found = Vec::new();
+    for parent in &parents {
+        let dir = if parent.is_empty() {
+            manifest_dir.to_path_buf()
+        } else {
+            manifest_dir.join(parent)
+        };
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if parent.is_empty() {
+                name
+            } else {
+                format!("{}/{}", parent, name)
+            };
+            if rel.to_ascii_lowercase() == mount {
+                continue;
+            }
+            if has_receipt_child(&entry.path()) {
+                found.push(rel);
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Does any immediate child of `dir` carry a receipt directly? One level
+/// only: receipts sit inside package dirs, one below their mount.
+fn has_receipt_child(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    entries
+        .flatten()
+        .any(|e| e.path().join(receipts::RECEIPT_FILE).is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +453,7 @@ mod tests {
             version: "1.0.0".into(),
             integrity: "xx".into(),
             root: "src/init.luau".into(),
+            container: "Packages".into(),
         })
         .unwrap();
         fs::write(dir.join("init.luau"), "return {}").unwrap();
@@ -444,17 +527,123 @@ mod tests {
                 version: "1.0.0".to_string(),
                 integrity: "aa".to_string(),
                 root: "init.luau".to_string(),
+                packages_dir: "Packages".to_string(),
                 public: true,
             }],
             pointers: vec![],
         };
 
-        prune_top_level(&plan, &mount.to_string_lossy()).unwrap();
+        prune_top_level(&plan, &mount.to_string_lossy(), "Packages").unwrap();
 
         assert!(mount.join("Knit").exists(), "desired alias survives");
         assert!(!mount.join("Junk").exists(), "junk under the nested mount is pruned");
         assert!(mount.join("_Index").exists(), "wally's _Index is exempt");
         assert!(mount.join(".cache").exists(), "dot entries are exempt");
         let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn prune_manages_a_renamed_mount() {
+        // Plan paths carry the renamed virtual prefix; prune must strip that
+        // prefix or every desired alias looks like junk.
+        let base_dir = std::env::temp_dir().join(format!("forest-prune-renamed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base_dir);
+        let mount = base_dir.join("roblox_packages");
+        fs::create_dir_all(mount.join("Knit")).unwrap();
+        fs::create_dir_all(mount.join("Junk")).unwrap();
+        fs::create_dir_all(mount.join("_Index")).unwrap();
+
+        let plan = InstallPlan {
+            packages: vec![PlannedPackage {
+                path: "./roblox_packages/Knit".to_string(),
+                name: "acme/knit".to_string(),
+                version: "1.0.0".to_string(),
+                integrity: "aa".to_string(),
+                root: "init.luau".to_string(),
+                packages_dir: "Packages".to_string(),
+                public: true,
+            }],
+            pointers: vec![],
+        };
+
+        prune_top_level(&plan, &mount.to_string_lossy(), "roblox_packages").unwrap();
+
+        assert!(mount.join("Knit").exists(), "desired alias survives under the renamed mount");
+        assert!(!mount.join("Junk").exists(), "junk is still pruned");
+        assert!(mount.join("_Index").exists(), "exempt entries still survive");
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    /// Fresh project dir with a receipt-bearing package at `mount/Pkg`.
+    fn abandoned_fixture(tag: &str, mount: &str) -> PathBuf {
+        let project = std::env::temp_dir().join(format!("forest-abandoned-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&project);
+        let pkg = project.join(mount).join("Pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        crate::receipts::write(&pkg, &crate::receipts::Receipt {
+            name: "acme/pkg".into(),
+            version: "1.0.0".into(),
+            integrity: "aa".into(),
+            root: "init.luau".into(),
+            container: "Packages".into(),
+        })
+        .unwrap();
+        project
+    }
+
+    #[test]
+    fn abandoned_detects_a_renamed_top_level_mount() {
+        let project = abandoned_fixture("rename", "OldName");
+        fs::create_dir_all(project.join("NewName")).unwrap();
+
+        let found = find_abandoned_mounts(&project, "NewName");
+
+        assert_eq!(found, vec!["OldName".to_string()]);
+        let _ = fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn abandoned_detects_a_nested_mount_left_behind() {
+        let project = abandoned_fixture("nested", "src/OldName");
+        fs::create_dir_all(project.join("src").join("NewName")).unwrap();
+
+        let found = find_abandoned_mounts(&project, "src/NewName");
+
+        assert_eq!(found, vec!["src/OldName".to_string()]);
+        let _ = fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn abandoned_skips_a_receipt_less_packages_dir() {
+        // Pre-receipt forest or Wally territory: the legacy warning owns it.
+        let project = abandoned_fixture("legacy", "NewName");
+        fs::create_dir_all(project.join("Packages").join("Knit")).unwrap();
+
+        let found = find_abandoned_mounts(&project, "NewName");
+
+        assert!(found.is_empty(), "no receipts means not provably forest's: {:?}", found);
+        let _ = fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn abandoned_never_lists_the_current_mount() {
+        let project = abandoned_fixture("current", "Packages");
+
+        assert!(find_abandoned_mounts(&project, "Packages").is_empty());
+        // Casing differences on a case-insensitive filesystem still match.
+        assert!(find_abandoned_mounts(&project, "packages").is_empty());
+        let _ = fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn abandoned_skips_junk_dirs_without_receipt_children() {
+        let project = abandoned_fixture("junk", "NewName");
+        fs::create_dir_all(project.join("assets").join("textures")).unwrap();
+        fs::write(project.join("assets").join("readme.txt"), "x").unwrap();
+
+        let found = find_abandoned_mounts(&project, "NewName");
+
+        assert!(found.is_empty(), "receipt-less dirs are not mounts: {:?}", found);
+        let _ = fs::remove_dir_all(&project);
     }
 }

@@ -14,6 +14,17 @@ use crate::platform::Preflight;
 /// forest.json value, auto-detect at the first or second directory level,
 /// or prompt. Always writes `forest_json["root"]`; never aborts.
 pub fn publish_preflight(cwd: &Path, forest_json: &mut Value) -> Result<Preflight> {
+    // Validate `packagesDir` first: it ships as registry metadata and
+    // becomes a folder name in every consumer's tree.
+    if let Some(value) = forest_json.get("packagesDir") {
+        let Some(dir) = value.as_str() else {
+            anyhow::bail!("Invalid packagesDir in forest.json: must be a string.");
+        };
+        if let Err(reason) = crate::roblox::validate_packages_dir(dir) {
+            anyhow::bail!("Invalid packagesDir in forest.json: {}", reason);
+        }
+    }
+
     // Roblox uses `.luau`, but `.lua` is still valid, so accept either.
     const INIT_FILES: [&str; 2] = ["init.luau", "init.lua"];
 
@@ -191,6 +202,57 @@ mod tests {
             publish_ignores(&top_level),
             vec!["/Packages/".to_string(), "/forest-lock.json".to_string()]
         );
+    }
+
+    #[test]
+    fn publish_ignores_follow_a_renamed_container() {
+        // A renamed container is still the install mount: it must be
+        // force-excluded (via packages_base) or the tarball ships every
+        // resolved dependency inside the package.
+        let renamed = serde_json::json!({
+            "dependencies": { "roads": "^1.0.0" },
+            "packagesDir": "roblox_packages"
+        });
+        assert_eq!(
+            publish_ignores(&renamed),
+            vec!["/roblox_packages/".to_string(), "/forest-lock.json".to_string()]
+        );
+
+        let nested = serde_json::json!({
+            "dependencies": { "roads": "^1.0.0" },
+            "root": "src/init.luau",
+            "packagesDir": "roblox_packages"
+        });
+        assert_eq!(
+            publish_ignores(&nested),
+            vec!["/src/roblox_packages/".to_string(), "/forest-lock.json".to_string()]
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_a_bad_packages_dir_early() {
+        let dir = std::env::temp_dir().join(format!("forest-preflight-pd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("init.luau"), "return {}").unwrap();
+
+        for bad in [serde_json::json!(".."), serde_json::json!("CON"), serde_json::json!(7)] {
+            let mut manifest = serde_json::json!({ "root": "init.luau", "packagesDir": bad });
+            // Preflight doesn't derive Debug, so match instead of unwrap_err.
+            let err = match publish_preflight(&dir, &mut manifest) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{:?} must be rejected", bad),
+            };
+            assert!(err.contains("packagesDir"), "{:?}: {}", bad, err);
+        }
+
+        // A valid rename and the absent default both pass.
+        let mut ok = serde_json::json!({ "root": "init.luau", "packagesDir": "roblox_packages" });
+        assert!(publish_preflight(&dir, &mut ok).is_ok());
+        let mut absent = serde_json::json!({ "root": "init.luau" });
+        assert!(publish_preflight(&dir, &mut absent).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

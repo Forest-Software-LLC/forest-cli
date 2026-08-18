@@ -4,7 +4,6 @@ use anyhow::{anyhow, Result};
 use urlencoding::encode;
 
 use crate::lockfile_gen::LockFile;
-use crate::roblox::PACKAGES_DIR;
 use crate::lockfile_solver::DepSpec;
 use crate::utils::get_ci;
 
@@ -20,6 +19,10 @@ pub struct PlannedPackage {
     pub integrity: String,
     /// The registry's archiveRoot (layout-affecting on extraction).
     pub root: String,
+    /// The package's own nested dep container name (its published
+    /// `packagesDir`), recorded in the install receipt so the scan can
+    /// descend and a republished rename forces a clean reinstall.
+    pub packages_dir: String,
     pub public: bool,
 }
 
@@ -45,7 +48,30 @@ pub struct InstallPlan {
 
 /// Compute the full install layout for a lockfile. Logic moved verbatim from
 /// `make_directories` — the behavior is pinned by the tests below.
-pub fn plan_install(lockfile: &LockFile, root_deps: &HashMap<String, DepSpec>) -> Result<InstallPlan> {
+/// `consumer_container` is the consuming project's container name
+/// (`packages_container(manifest)`): the root virtual prefix of every plan
+/// path, which must match what physical_path/scan/prune derive from the
+/// same manifest.
+pub fn plan_install(
+    lockfile: &LockFile,
+    root_deps: &HashMap<String, DepSpec>,
+    consumer_container: &str,
+) -> Result<InstallPlan> {
+    // Container names flow into filesystem paths. Lockfile entries come
+    // from the registry, so reject bad names before any path is built.
+    crate::roblox::validate_packages_dir(consumer_container)
+        .map_err(|reason| anyhow!("Invalid packagesDir in forest.json: {}", reason))?;
+    for (pkg_name, versions) in &lockfile.packages {
+        for version_data in versions {
+            crate::roblox::validate_packages_dir(&version_data.packages_dir).map_err(|reason| {
+                anyhow!(
+                    "Invalid packagesDir for {}@{} in forest-lock.json: {}",
+                    pkg_name, version_data.version, reason
+                )
+            })?;
+        }
+    }
+
     let mut plan = InstallPlan::default();
 
     // path_cache[pkg][version] = physical dir, needed by pointer planning.
@@ -60,6 +86,12 @@ pub fn plan_install(lockfile: &LockFile, root_deps: &HashMap<String, DepSpec>) -
             let mut dir_pkg_name = get_ci(root_deps, pkg_name)
                 .map(|d| d.alias.clone())
                 .unwrap_or_else(String::new);
+
+            // Ancestor hop chain from the mount down to this package's
+            // parent: (pkg, version) per hop, used to look up each hop's
+            // container name. Directory names keep the location string's
+            // segment casing.
+            let mut hops: Vec<(String, String)> = Vec::new();
 
             if !path_parts.is_empty() {
                 let target_root_dep_alias = path_parts[0];
@@ -79,13 +111,18 @@ pub fn plan_install(lockfile: &LockFile, root_deps: &HashMap<String, DepSpec>) -
                     .find(|v| v.location == "~")
                     .ok_or_else(|| anyhow!("Root Version not found for {}", root_dep_name))?;
 
-                dir_pkg_name = backtrack_name(
+                let mut chain = backtrack_chain(
                     lockfile,
                     &root_dep_name,
                     &root_dep_ver.version,
                     pkg_name,
                     &path_parts.clone()[1..],
                 )?;
+                let (_, _, end_alias) = chain.pop().expect("chain always ends at the goal package");
+                dir_pkg_name = end_alias;
+
+                hops.push((root_dep_name.clone(), root_dep_ver.version.clone()));
+                hops.extend(chain.into_iter().map(|(pkg, ver, _)| (pkg, ver)));
             } else if dir_pkg_name.is_empty() {
                 return Err(anyhow!(
                     "{} resolved to the root of the install tree but is not declared in forest.json. \
@@ -95,10 +132,14 @@ pub fn plan_install(lockfile: &LockFile, root_deps: &HashMap<String, DepSpec>) -
                 ));
             }
 
-            let nested_sep = format!("/{}/", PACKAGES_DIR);
-            let mut path: String = format!("./{}/{}/{}", PACKAGES_DIR, path_parts.join(&nested_sep), PACKAGES_DIR);
-            if path_parts.is_empty() {
-                path = format!("./{}", PACKAGES_DIR);
+            // Interleave: ./<consumer>/<hop alias>/<that hop's container>/...
+            // The trailing separator before the placed package belongs to
+            // the deepest parent's container, not to the package itself.
+            debug_assert_eq!(hops.len(), path_parts.len());
+            let mut path = format!("./{}", consumer_container);
+            for ((hop_pkg, hop_ver), segment) in hops.iter().zip(&path_parts) {
+                let hop_container = entry_packages_dir(lockfile, hop_pkg, hop_ver)?;
+                path.push_str(&format!("/{}/{}", segment, hop_container));
             }
 
             let full_path = format!("{}/{}", path, dir_pkg_name);
@@ -108,6 +149,7 @@ pub fn plan_install(lockfile: &LockFile, root_deps: &HashMap<String, DepSpec>) -
                 version: version_data.version.clone(),
                 integrity: version_data.integrity.clone(),
                 root: version_data.root.clone(),
+                packages_dir: version_data.packages_dir.clone(),
                 public: version_data.public,
             });
 
@@ -125,8 +167,9 @@ pub fn plan_install(lockfile: &LockFile, root_deps: &HashMap<String, DepSpec>) -
                 .and_then(|v| v.get(&version_data.version))
                 .ok_or_else(|| anyhow!("Path for {} @ {} not found in cache.", pkg_name, version_data.version))?;
 
+            // Pointer base: this package's own nested container.
             let mut true_path = cache_result.clone();
-            true_path.push_str(&format!("/{}", PACKAGES_DIR));
+            true_path.push_str(&format!("/{}", version_data.packages_dir));
 
             for (dep_name, dep_version) in &version_data.dependencies {
                 let dep_true_path = path_cache
@@ -147,19 +190,22 @@ pub fn plan_install(lockfile: &LockFile, root_deps: &HashMap<String, DepSpec>) -
     Ok(plan)
 }
 
-/// Resolve alias path for a package by backtracking through the dependency
-/// chain its location string describes.
+/// Resolve the full hop chain for a package by backtracking through the
+/// dependency chain its location string describes.
 ///
 /// ex: pkg loc /a/n/c/d — look for the root dep aliased "a", then follow
 /// aliases "n", "c" through each dependency's recorded deps until the end
-/// goal package is found; its recorded alias is the directory name.
-fn backtrack_name(
+/// goal package is found. Returns one `(pkg, version, alias)` per hop below
+/// the entry dep, ending with the goal package, whose recorded alias is the
+/// directory name. Never empty on success. The caller uses each hop's
+/// identity to look up that hop's container name for the interleaved path.
+fn backtrack_chain(
     lockfile: &LockFile,
     dep_name: &str,
     dep_version: &str,
     end_goal: &str,
     remaining_segments: &[&str],
-) -> Result<String> {
+) -> Result<Vec<(String, String, String)>> {
     // First call passes a manifest key; lockfile keys are canonical
     let deps = get_ci(&lockfile.packages, dep_name)
         .ok_or_else(|| anyhow!("Dependency {} not found", dep_name))?;
@@ -175,20 +221,42 @@ fn backtrack_name(
     for (sub_dep_name, sub_dep_spec) in &ver.dependencies {
         if is_empty {
             if sub_dep_name == end_goal {
-                return Ok(sub_dep_spec.alias.clone());
+                return Ok(vec![(
+                    sub_dep_name.clone(),
+                    sub_dep_spec.version.clone(),
+                    sub_dep_spec.alias.clone(),
+                )]);
             }
         } else if sub_dep_spec.alias.eq_ignore_ascii_case(remaining_segments[0]) {
-            return backtrack_name(
+            let mut chain = backtrack_chain(
                 lockfile,
                 sub_dep_name,
                 &sub_dep_spec.version,
                 end_goal,
                 &remaining_segments[1..],
-            );
+            )?;
+            chain.insert(0, (
+                sub_dep_name.clone(),
+                sub_dep_spec.version.clone(),
+                sub_dep_spec.alias.clone(),
+            ));
+            return Ok(chain);
         }
     }
 
     Err(anyhow!("Failed to backtrack package name"))
+}
+
+/// A lockfile entry's own container name (`packagesDir`), for interleaving
+/// per-hop containers into plan paths.
+fn entry_packages_dir<'a>(lockfile: &'a LockFile, pkg: &str, version: &str) -> Result<&'a str> {
+    let entries = get_ci(&lockfile.packages, pkg)
+        .ok_or_else(|| anyhow!("Dependency {} not found", pkg))?;
+    let entry = entries
+        .iter()
+        .find(|v| v.version == version)
+        .ok_or_else(|| anyhow!("Version {} for {} not found", version, pkg))?;
+    Ok(&entry.packages_dir)
 }
 
 /// First line of every generated pointer init.lua. Doubles as the on-disk
@@ -327,12 +395,23 @@ mod tests {
         integrity: &str,
         deps: Vec<(String, DepSpec)>,
     ) -> LockfileEntry {
+        entry_in(version, location, integrity, "Packages", deps)
+    }
+
+    fn entry_in(
+        version: &str,
+        location: &str,
+        integrity: &str,
+        packages_dir: &str,
+        deps: Vec<(String, DepSpec)>,
+    ) -> LockfileEntry {
         LockfileEntry {
             version: version.to_string(),
             integrity: integrity.to_string(),
             public: true,
             root: "src/init.luau".to_string(),
             location: location.to_string(),
+            packages_dir: packages_dir.to_string(),
             dependencies: deps.into_iter().collect(),
         }
     }
@@ -376,7 +455,7 @@ mod tests {
     #[test]
     fn plans_root_nested_and_hoisted_paths() {
         let (lockfile, root_deps) = synthetic_lockfile();
-        let plan = plan_install(&lockfile, &root_deps).unwrap();
+        let plan = plan_install(&lockfile, &root_deps, "Packages").unwrap();
 
         let mut paths: Vec<(String, String)> = plan
             .packages
@@ -402,7 +481,7 @@ mod tests {
     #[test]
     fn plans_pointers_only_for_hoisted_deps() {
         let (lockfile, root_deps) = synthetic_lockfile();
-        let plan = plan_install(&lockfile, &root_deps).unwrap();
+        let plan = plan_install(&lockfile, &root_deps, "Packages").unwrap();
 
         let mut dirs: Vec<String> = plan.pointers.iter().map(|p| p.dir.clone()).collect();
         dirs.sort();
@@ -428,7 +507,7 @@ mod tests {
         let (lockfile, _) = synthetic_lockfile();
         // Root deps that know nothing about the lockfile's tree.
         let bogus: HashMap<String, DepSpec> = HashMap::new();
-        assert!(plan_install(&lockfile, &bogus).is_err());
+        assert!(plan_install(&lockfile, &bogus, "Packages").is_err());
     }
 
     #[test]
@@ -454,7 +533,7 @@ mod tests {
             [dep("acme/a", "A", "^1.0.0"), dep("acme/c", "C", "^1.0.0")].into_iter().collect();
         let lockfile = LockFile { file_version: 2, overrides: HashMap::new(), excludes: HashMap::new(), packages };
 
-        let plan = plan_install(&lockfile, &root_deps).unwrap();
+        let plan = plan_install(&lockfile, &root_deps, "Packages").unwrap();
 
         let b = plan.packages.iter().find(|p| p.name == "acme/b").unwrap();
         assert_eq!(b.path, "./Packages/A/Packages/B", "B physically lives under A");
@@ -467,5 +546,159 @@ mod tests {
             "unexpected chain: {}",
             plan.pointers[0].init_lua
         );
+    }
+
+    // ---- per-hop containers (packagesDir) ----
+
+    /// Same shape as synthetic_lockfile, but the consumer renamed its mount
+    /// and Knit/Comm each publish their own container names.
+    fn renamed_lockfile() -> (LockFile, HashMap<String, DepSpec>) {
+        let mut packages = HashMap::new();
+        packages.insert(
+            "acme/knit".to_string(),
+            vec![entry_in(
+                "1.0.0",
+                "~",
+                "aa11",
+                "knit_deps",
+                vec![dep("acme/comm", "Comm", "1.0.0"), dep("acme/promise", "Promise", "2.0.0")],
+            )],
+        );
+        packages.insert(
+            "acme/comm".to_string(),
+            vec![entry_in(
+                "1.0.0",
+                "~/Knit",
+                "bb22",
+                "comm_deps",
+                vec![dep("acme/promise", "Promise", "2.0.0")],
+            )],
+        );
+        packages.insert(
+            "acme/promise".to_string(),
+            vec![entry("2.0.0", "~", "cc33", vec![])],
+        );
+
+        let root_deps: HashMap<String, DepSpec> = [
+            dep("acme/knit", "Knit", "^1.0.0"),
+            dep("acme/promise", "Promise", "^2.0.0"),
+        ]
+        .into_iter()
+        .collect();
+
+        (LockFile { file_version: 2, overrides: HashMap::new(), excludes: HashMap::new(), packages }, root_deps)
+    }
+
+    #[test]
+    fn plan_paths_interleave_per_hop_containers() {
+        let (lockfile, root_deps) = renamed_lockfile();
+        let plan = plan_install(&lockfile, &root_deps, "roblox_packages").unwrap();
+
+        let mut paths: Vec<(String, String)> = plan
+            .packages
+            .iter()
+            .map(|p| (p.name.clone(), p.path.clone()))
+            .collect();
+        paths.sort();
+        // The separator before each placed package is its deepest parent's
+        // container: Comm sits inside Knit's own "knit_deps", never inside a
+        // container named after Comm's.
+        assert_eq!(
+            paths,
+            vec![
+                ("acme/comm".to_string(), "./roblox_packages/Knit/knit_deps/Comm".to_string()),
+                ("acme/knit".to_string(), "./roblox_packages/Knit".to_string()),
+                ("acme/promise".to_string(), "./roblox_packages/Promise".to_string()),
+            ]
+        );
+
+        // The plan carries each package's own container for the receipt.
+        let by_name = |n: &str| plan.packages.iter().find(|p| p.name == n).unwrap();
+        assert_eq!(by_name("acme/knit").packages_dir, "knit_deps");
+        assert_eq!(by_name("acme/comm").packages_dir, "comm_deps");
+        assert_eq!(by_name("acme/promise").packages_dir, "Packages");
+    }
+
+    #[test]
+    fn pointers_cross_renamed_containers() {
+        let (lockfile, root_deps) = renamed_lockfile();
+        let plan = plan_install(&lockfile, &root_deps, "roblox_packages").unwrap();
+
+        let mut dirs: Vec<String> = plan.pointers.iter().map(|p| p.dir.clone()).collect();
+        dirs.sort();
+        // Pointer dirs live inside each consumer's own container.
+        assert_eq!(
+            dirs,
+            vec![
+                "./roblox_packages/Knit/knit_deps/Comm/comm_deps/Promise".to_string(),
+                "./roblox_packages/Knit/knit_deps/Promise".to_string(),
+            ]
+        );
+
+        // Knit's pointer climbs its own renamed container to the root mount.
+        let knit_ptr = plan.pointers.iter().find(|p| p.dir == "./roblox_packages/Knit/knit_deps/Promise").unwrap();
+        assert_eq!(
+            knit_ptr.init_lua,
+            "--Pointer file generated by Forest Package Manager.\nreturn require(script.Parent.Parent.Parent['Promise'])"
+        );
+        // Comm's climbs two containers (comm_deps + knit_deps), 5 Parents.
+        let comm_ptr = plan.pointers.iter().find(|p| p.dir.ends_with("Comm/comm_deps/Promise")).unwrap();
+        assert!(
+            comm_ptr.init_lua.ends_with("return require(script.Parent.Parent.Parent.Parent.Parent['Promise'])"),
+            "unexpected chain: {}",
+            comm_ptr.init_lua
+        );
+    }
+
+    #[test]
+    fn three_hop_chain_interleaves_every_ancestors_container() {
+        // A (a_deps) -> B (b_deps) -> C: each separator comes from that hop's
+        // own published container.
+        let mut packages = HashMap::new();
+        packages.insert(
+            "acme/a".to_string(),
+            vec![entry_in("1.0.0", "~", "aa", "a_deps", vec![dep("acme/b", "B", "1.0.0")])],
+        );
+        packages.insert(
+            "acme/b".to_string(),
+            vec![entry_in("1.0.0", "~/A", "bb", "b_deps", vec![dep("acme/c", "C", "1.0.0")])],
+        );
+        packages.insert(
+            "acme/c".to_string(),
+            vec![entry("1.0.0", "~/A/B", "cc", vec![])],
+        );
+        let root_deps: HashMap<String, DepSpec> =
+            [dep("acme/a", "A", "^1.0.0")].into_iter().collect();
+        let lockfile = LockFile { file_version: 2, overrides: HashMap::new(), excludes: HashMap::new(), packages };
+
+        let plan = plan_install(&lockfile, &root_deps, "Packages").unwrap();
+        let c = plan.packages.iter().find(|p| p.name == "acme/c").unwrap();
+        assert_eq!(c.path, "./Packages/A/a_deps/B/b_deps/C");
+    }
+
+    #[test]
+    fn invalid_container_names_are_rejected_before_any_path_is_built() {
+        let (lockfile, root_deps) = synthetic_lockfile();
+
+        // Registry-supplied entry container: untrusted input.
+        for bad in ["..", "a/b", "a\\b", "_lead", ".lead", "CON"] {
+            let mut poisoned_packages = lockfile.packages.clone();
+            poisoned_packages
+                .get_mut("acme/knit")
+                .unwrap()[0]
+                .packages_dir = bad.to_string();
+            let poisoned = LockFile {
+                file_version: 2,
+                overrides: HashMap::new(),
+                excludes: HashMap::new(),
+                packages: poisoned_packages,
+            };
+            let err = plan_install(&poisoned, &root_deps, "Packages").unwrap_err().to_string();
+            assert!(err.contains("packagesDir"), "{:?} must be rejected: {}", bad, err);
+        }
+
+        // Consumer container from the manifest.
+        let err = plan_install(&lockfile, &root_deps, "CON").unwrap_err().to_string();
+        assert!(err.contains("forest.json"), "{}", err);
     }
 }

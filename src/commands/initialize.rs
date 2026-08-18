@@ -10,9 +10,10 @@ use crate::platform::{InitMode, Platform};
 /// `platform` lets callers skip the interactive picker (e.g. `forest init
 /// --platform roblox`), keeping `init` scriptable. `project` selects the
 /// bare project scaffold — the same one install's create-on-install path
-/// uses. What actually gets scaffolded is wholly platform-owned
-/// (roblox/init.rs, uefn/init.rs).
-pub async fn init_command(platform: Option<String>, project: bool) -> Result<()> {
+/// uses. `packages_dir` is the `--packages-dir` flag (Roblox only). What
+/// actually gets scaffolded is wholly platform-owned (roblox/init.rs,
+/// uefn/init.rs).
+pub async fn init_command(platform: Option<String>, project: bool, packages_dir: Option<String>) -> Result<()> {
     let cwd = env::current_dir()?;
     let platform = match platform {
         Some(p) => match Platform::parse(&p) {
@@ -29,5 +30,5 @@ pub async fn init_command(platform: Option<String>, project: bool) -> Result<()>
     };
 
     let mode = if project { InitMode::Project { from_install: false } } else { InitMode::Package };
-    platform.init(&cwd, mode).await
+    platform.init(&cwd, mode, packages_dir.as_deref()).await
 }

@@ -225,6 +225,7 @@ mod tests {
             public: true,
             root: String::new(),
             location: "~".to_string(), // hoisting metadata - must be ignored
+            packages_dir: "Packages".to_string(),
             dependencies: deps
                 .iter()
                 .map(|(k, a, v)| (k.to_string(), dep(a, v)))

@@ -245,11 +245,18 @@ impl Platform {
 
     /// The `forest init` scaffold for this platform. Async because some
     /// scaffolds consult the registry (UEFN's scope picker offers the same
-    /// author list as publish).
-    pub async fn init(&self, cwd: &Path, mode: InitMode) -> Result<()> {
+    /// author list as publish). `packages_dir` is the `--packages-dir`
+    /// flag. Roblox only: UEFN has one shared mount whose name is compiled
+    /// into every package's source.
+    pub async fn init(&self, cwd: &Path, mode: InitMode, packages_dir: Option<&str>) -> Result<()> {
         match self {
-            Platform::Roblox => crate::roblox::init::init(cwd, mode),
-            Platform::Uefn => crate::uefn::init::init(cwd, mode).await,
+            Platform::Roblox => crate::roblox::init::init(cwd, mode, packages_dir),
+            Platform::Uefn => {
+                if packages_dir.is_some() {
+                    return Err(anyhow!("--packages-dir is not supported on UEFN."));
+                }
+                crate::uefn::init::init(cwd, mode).await
+            }
         }
     }
 
@@ -341,6 +348,18 @@ mod tests {
         fs::write(base.join("Island.uefnproject"), "{}").unwrap();
         assert_eq!(Platform::detect(&base), Some(Platform::Uefn));
         assert_eq!(Platform::detect(&base.join("Content")), Some(Platform::Uefn));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn uefn_init_rejects_the_packages_dir_flag() {
+        let base = fixture("uefn-packages-dir");
+        let err = Platform::Uefn
+            .init(&base, InitMode::Project { from_install: false }, Some("roblox_packages"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--packages-dir"), "{}", err);
+        assert!(!base.join("forest.json").exists(), "rejected before scaffolding");
         let _ = fs::remove_dir_all(&base);
     }
 
