@@ -1,39 +1,26 @@
 //! UEFN install executor.
 //!
 //! Reached only via the platform dispatch at the top of
-//! lockfile_gen::make_directories. The flow mirrors the Roblox executor -
-//! plan → scan → reconcile → clean → download → bookkeeping - but against
+//! lockfile_gen::make_directories. The flow mirrors the Roblox executor
+//! (plan → scan → reconcile → clean → download → bookkeeping) but against
 //! the flat mount with the 3-way ownership taxonomy (installed / authored /
 //! unknown) and Verse marker regeneration instead of pointer files.
-//!
-//! NOTE: the download worker pool below deliberately mirrors the one in
-//! lockfile_gen.rs (search: DOWNLOAD_WORKERS). Fixes to either pool likely
-//! apply to both - cross-referenced comments at both sites.
+//! Downloads go through the shared pool (src/download_pool.rs).
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
-use crate::cache::TarballCache;
+use crate::download_pool::DownloadJob;
+use crate::lockfile_gen::{InstallSummary, LockFile};
 use crate::fetch_and_extract::fetch_and_extract_verbatim;
-use crate::lockfile_gen::{cdn_base, fetch_signed_url, InstallSummary, LockFile, DOWNLOAD_WORKERS};
 use crate::lockfile_solver::DepSpec;
 use crate::message::{info, warn};
 use crate::receipts;
 
 use super::plan::plan_install_uefn;
-
-struct DownloadJob {
-    url: String,
-    name: String,
-    version: String,
-    integrity: String,
-    dir: PathBuf,
-}
 
 pub async fn make_directories_uefn(
     lockfile: &LockFile,
@@ -146,164 +133,42 @@ pub async fn make_directories_uefn(
         }
     }
 
-    let tarball_cache = TarballCache::open_default();
-
-    // Signed-URL prefetch for private packages - first request alone so a
-    // stale token refreshes exactly once, then bounded concurrency (mirrors
-    // lockfile_gen.rs; see the module NOTE).
-    let mut private_urls: HashMap<(String, String), String> = HashMap::new();
-    let private_entries: Vec<(String, String, String)> = rec
+    // Download + extract via the shared pool (verbatim extraction: the
+    // folder IS the package on UEFN).
+    let jobs: Vec<DownloadJob<()>> = rec
         .to_install
         .iter()
-        .map(|&i| &plan.packages[i])
-        .filter(|p| !p.public)
-        .filter(|p| tarball_cache.as_ref().map_or(true, |c| c.lookup(&p.integrity).is_none()))
-        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
-        .collect();
-    let mut private_iter = private_entries.into_iter();
-    if let Some((pkg, ver, integrity)) = private_iter.next() {
-        // These round-trips run with the install spinner paused; a counter
-        // keeps the terminal alive while a tree of private packages authorizes.
-        let auth_bar = ProgressBar::new((private_iter.len() + 1) as u64);
-        auth_bar.set_style(
-            ProgressStyle::with_template("{spinner:.green} Authorizing private packages {pos}/{len}")?
-                .tick_strings(crate::message::TICK_STRINGS),
-        );
-        auth_bar.enable_steady_tick(std::time::Duration::from_millis(70));
-
-        // Collected (not `?`-propagated) so the bar's line is cleared before
-        // any error message prints under it.
-        let prefetch: Result<()> = async {
-            let (key, url) = fetch_signed_url(pkg, ver, integrity, "uefn".to_string()).await?;
-            private_urls.insert(key, url);
-            auth_bar.inc(1);
-
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_WORKERS));
-            let mut tasks = tokio::task::JoinSet::new();
-            for (pkg, ver, integrity) in private_iter {
-                let semaphore = Arc::clone(&semaphore);
-                tasks.spawn(async move {
-                    let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
-                    fetch_signed_url(pkg, ver, integrity, "uefn".to_string()).await
-                });
-            }
-            while let Some(joined) = tasks.join_next().await {
-                let (key, url) = joined.map_err(|e| anyhow!("Signed-URL task panicked: {e}"))??;
-                private_urls.insert(key, url);
-                auth_bar.inc(1);
-            }
-            Ok(())
-        }.await;
-        auth_bar.finish_and_clear();
-        prefetch?;
-    }
-
-    // Download + extract (verbatim - the folder IS the package on UEFN).
-    if !rec.to_install.is_empty() {
-        // One line: package count plus a downloaded-bytes counter, mirroring
-        // the Roblox executor (rationale there).
-        let total_bar = ProgressBar::new(rec.to_install.len() as u64);
-        total_bar.set_style(
-            ProgressStyle::with_template("{spinner:.green} Installing packages {bar:30.cyan/blue} {pos}/{len} {msg}")?
-                .progress_chars("=>-")
-                .tick_strings(crate::message::TICK_STRINGS),
-        );
-        total_bar.enable_steady_tick(std::time::Duration::from_millis(70));
-        // Mutex-held byte counter, one critical section for update + display
-        // (see the Roblox executor).
-        let downloaded = Arc::new(Mutex::new(0u64));
-
-        let mut jobs: Vec<DownloadJob> = Vec::new();
-        for &i in &rec.to_install {
+        .map(|&i| {
             let pkg = &plan.packages[i];
-            let dir_path = PathBuf::from(&pkg.path);
-            if !dir_path.exists() {
-                fs::create_dir_all(&dir_path)?;
-            }
-
-            let url = if pkg.public {
-                format!("{}/public/{}.tgz", cdn_base(), pkg.integrity.trim())
-            } else {
-                private_urls
-                    .get(&(pkg.name.clone(), pkg.version.clone()))
-                    .cloned()
-                    .unwrap_or_else(|| format!("forest-cache://{}", pkg.integrity.trim()))
-            };
-            jobs.push(DownloadJob {
-                url,
+            DownloadJob {
                 name: pkg.name.clone(),
                 version: pkg.version.clone(),
                 integrity: pkg.integrity.clone(),
-                dir: dir_path,
-            });
-        }
-
-        // Bounded worker pool draining the queue; all downloads run to
-        // completion before the first error is reported (mirror of
-        // lockfile_gen.rs's pool - see the module NOTE).
-        let n_workers = jobs.len().min(DOWNLOAD_WORKERS);
-        let queue = Arc::new(Mutex::new(jobs));
-        let first_err: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
-        let mut workers = Vec::new();
-        for _ in 0..n_workers {
-            let queue = Arc::clone(&queue);
-            let first_err = Arc::clone(&first_err);
-            let tarball_cache = tarball_cache.clone();
-            let total_bar = total_bar.clone();
-            let downloaded = Arc::clone(&downloaded);
-            workers.push(std::thread::spawn(move || {
-                let on_bytes = |delta: u64| {
-                    let mut total = downloaded.lock().expect("byte counter poisoned");
-                    *total += delta;
-                    total_bar.set_message(format!("{}", HumanBytes(*total)));
-                };
-                loop {
-                    let job = queue.lock().expect("job queue poisoned").pop();
-                    let Some(job) = job else { break };
-                    // Receipt only after ITS dir extracted - per-package atomicity.
-                    let result = fetch_and_extract_verbatim(
-                        &job.url,
-                        &job.integrity,
-                        &job.dir,
-                        &on_bytes,
-                        tarball_cache.as_ref(),
-                    )
-                    .and_then(|_| {
-                        receipts::write(
-                            &job.dir,
-                            &receipts::Receipt {
-                                name: job.name.clone(),
-                                version: job.version.clone(),
-                                integrity: job.integrity.clone(),
-                                // No entry point on UEFN - the folder is the package.
-                                root: String::new(),
-                                // No nested containers either (flat mount);
-                                // keep the serde default.
-                                container: receipts::default_container(),
-                            },
-                        )
-                    });
-                    total_bar.inc(1);
-                    if let Err(e) = result {
-                        first_err.lock().expect("error slot poisoned").get_or_insert(e);
-                    }
-                }
-            }));
-        }
-        for handle in workers {
-            if let Err(e) = handle.join() {
-                let mut slot = first_err.lock().expect("error slot poisoned");
-                if slot.is_none() {
-                    *slot = Some(anyhow!("Fetch thread panicked: {:?}", e));
-                }
+                dir: PathBuf::from(&pkg.path),
+                public: pkg.public,
+                extra: (),
             }
-        }
-        total_bar.finish_and_clear();
-        let pool_err = first_err.lock().expect("error slot poisoned").take();
-        if let Some(e) = pool_err {
-            return Err(e);
-        }
-    }
+        })
+        .collect();
+    crate::download_pool::download_all(jobs, "uefn", |job, url, on_bytes, cache| {
+        // Receipt only after ITS dir extracted - per-package atomicity.
+        fetch_and_extract_verbatim(url, &job.integrity, &job.dir, on_bytes, cache).and_then(|_| {
+            receipts::write(
+                &job.dir,
+                &receipts::Receipt {
+                    name: job.name.clone(),
+                    version: job.version.clone(),
+                    integrity: job.integrity.clone(),
+                    // No entry point on UEFN - the folder is the package.
+                    root: String::new(),
+                    // No nested containers either (flat mount); keep the
+                    // serde default.
+                    container: receipts::default_container(),
+                },
+            )
+        })
+    })
+    .await?;
 
     // Marker regeneration - every run, like Roblox pointer files. Deleting
     // is licensed ONLY by the header; writing is unconditional and idempotent

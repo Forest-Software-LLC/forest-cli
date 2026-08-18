@@ -120,11 +120,6 @@ pub(crate) fn cdn_base() -> String {
     std::env::var("FOREST_CDN_BASE").unwrap_or_else(|_| DEFAULT_CDN_BASE.to_string())
 }
 
-/// How many tarballs download (and signed URLs prefetch) at once. Bounded so
-/// a large tree doesn't spawn hundreds of OS threads and TLS connections.
-/// Used by both platform executors' worker pools.
-pub(crate) const DOWNLOAD_WORKERS: usize = 8;
-
 /// Fetch the short-lived signed download URL for one private package version,
 /// cross-checking the registry's integrity hash against the lockfile's before
 /// anything is downloaded.

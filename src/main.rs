@@ -4,6 +4,7 @@ mod tokens;
 mod http;
 mod cache;
 mod links;
+mod download_pool;
 mod contracts;
 mod message;
 mod lockfile_gen;
