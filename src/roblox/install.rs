@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -15,7 +15,89 @@ use crate::lockfile_solver::DepSpec;
 use crate::receipts;
 use crate::roblox::extract::fetch_and_extract;
 use crate::roblox::plan::plan_install;
+use crate::roblox::scratch::{rename_with_retry, scratch_dirs, ScratchDirs, StagingArea, TrashBin};
 use crate::roblox::PACKAGES_DIR;
+
+/// A live rojo may still be draining events from a forest run that just
+/// finished, and mutating the mount again before its queue drains crashes
+/// it. The lockfile's mtime marks the end of the last mutating run; when it
+/// is fresh and a rojo answers from this directory, wait out the remainder.
+/// One-off commands never wait, and chains with no rojo attached fail the
+/// probe fast. FOREST_NO_SETTLE=1 skips even the probe.
+fn settle_watchers() {
+    // Margin, not load-bearing: the rapid-cycle bench passes with the wait
+    // disabled outright. A knit-sized tree takes a connected rojo ~2s to
+    // ingest; 3s covers that while keeping chained installs snappy.
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+    if std::env::var("FOREST_NO_SETTLE").as_deref() == Ok("1") {
+        return;
+    }
+    let Ok(meta) = fs::metadata("forest-lock.json") else { return };
+    let Ok(modified) = meta.modified() else { return };
+    let Ok(age) = modified.elapsed() else { return };
+    if age >= SETTLE {
+        return;
+    }
+    if !rojo_is_serving() {
+        return;
+    }
+    std::thread::sleep(SETTLE - age);
+}
+
+/// Is a rojo dev server plausibly serving this project? Checks the port in
+/// default.project.json's `servePort` (when present) and rojo's default
+/// 34872. Raw TCP: the probe runs on the async runtime's thread, where a
+/// blocking HTTP client can't be constructed.
+fn rojo_is_serving() -> bool {
+    let mut ports = vec![34872u16];
+    if let Ok(text) = fs::read_to_string("default.project.json") {
+        if let Ok(project) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(port) = project.get("servePort").and_then(|p| p.as_u64()) {
+                ports.insert(0, port as u16);
+            }
+        }
+    }
+    ports.dedup();
+    ports.iter().any(|&port| probe_rojo_port(port))
+}
+
+fn probe_rojo_port(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let timeout = std::time::Duration::from_millis(250);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let request = format!("GET /api/rojo HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 256];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+        _ => false,
+    }
+}
+
+/// Clear a reinstall target. A junction/symlink (a slot left by an earlier
+/// run while links were ignored) is removed as a link so the target tree is
+/// never touched; a real dir renames into the trash bin. A target already
+/// gone (its parent renamed out first) is a no-op.
+fn clear_target(target: &Path, trash: &mut TrashBin) -> Result<()> {
+    let Ok(meta) = fs::symlink_metadata(target) else {
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() {
+        crate::roblox::link_overlay::remove_link_path(target)
+            .with_context(|| format!("Failed to remove link at {}", target.display()))?;
+    } else if meta.is_dir() {
+        trash.remove_dir_all(target)?;
+    } else {
+        fs::remove_file(target)?;
+    }
+    Ok(())
+}
 
 /// What the installer needs per job beyond the pool's shared fields.
 struct RobloxExtra {
@@ -51,6 +133,12 @@ pub async fn make_directories_roblox(
     let container = crate::roblox::packages_container(manifest);
     let plan = plan_install(lockfile, &root_deps, &container)?;
     let base = crate::roblox::packages_base(manifest);
+
+    // All mount deletions below go through the bin (see TrashBin) so a live
+    // `rojo serve` never sees a child removal under an already-gone parent.
+    let ScratchDirs { trash: trash_dir, staging: staging_dir } = scratch_dirs();
+    let mut trash = TrashBin::new(trash_dir);
+    crate::roblox::scratch::sweep_leftovers();
 
     // A renamed `packagesDir` or a root move within the same parent leaves
     // the old tree behind. Receipts prove which leftovers are forest's and
@@ -125,81 +213,159 @@ pub async fn make_directories_roblox(
     to_install.retain(|&i| !under_link(&plan.packages[i].path));
     stale_dirs.retain(|dir| !under_link(dir));
 
+    if !to_install.is_empty() || !stale_dirs.is_empty() {
+        settle_watchers();
+    }
+
     // Stale dirs go FIRST: on case-insensitive filesystems (Windows/macOS) a
     // renamed alias's old dir would otherwise delete the freshly extracted
     // new one. exists() guard: children of already-deleted parents are gone.
     for dir in &stale_dirs {
         let p = crate::roblox::physical_path(&base, &container, dir);
         if p.exists() {
-            fs::remove_dir_all(&p).with_context(|| format!("Failed to remove stale {}", dir))?;
+            trash.remove_dir_all(&p).with_context(|| format!("Failed to remove stale {}", dir))?;
         }
     }
 
     // The top level of the mount stays fully managed: any non-exempt dir that
     // isn't a desired root alias is junk or a pre-receipt leftover. (This is
     // also what clears old trees on --force and first-run-after-upgrade.)
-    prune_top_level(&plan, &base, &container)?;
+    prune_top_level(&plan, &base, &container, &mut trash)?;
 
-    // A reinstall target may hold old content (integrity/root changed);
-    // clear it before extraction. Link-aware: when links are being ignored
-    // (CI), the target can still BE a junction from an earlier run, which
-    // must be removed as a link, never recursed into.
-    for &i in &to_install {
+    // A reinstall target may hold old content, clear it before extraction.
+    // Parents first: renaming a parent out takes its nested targets with it,
+    // so each cleared unit emits one watcher event (out-of-order delivery of
+    // the deep removals crashes a live rojo). The target can also be a
+    // junction from a run where links were ignored; clear_target removes
+    // those as links.
+    let mut clear_order = to_install.clone();
+    clear_order.sort_by_key(|&i| plan.packages[i].path.len());
+    for &i in &clear_order {
         let target = crate::roblox::physical_path(&base, &container, &plan.packages[i].path);
-        crate::roblox::link_overlay::remove_slot(&target)
+        clear_target(&target, &mut trash)
             .with_context(|| format!("Failed to clear {}", plan.packages[i].path))?;
     }
 
+    // Pointer dirs written into a staged unit below, skipped by the in-place
+    // pointer pass at the end.
+    let mut staged_pointers: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     // Download + extract only what reconciliation says is missing or
     // changed; the shared pool owns prefetch, bars, and error draining.
-    let jobs: Vec<DownloadJob<RobloxExtra>> = to_install
-        .iter()
-        .map(|&i| {
+    // Tarballs extract into staging, not the mount (see StagingArea).
+    if !to_install.is_empty() {
+        let mut staging = StagingArea::new(staging_dir);
+        // (plan path, staged dir, final dir) for the rename-in phase.
+        let mut placements: Vec<(String, PathBuf, PathBuf)> = Vec::new();
+        let mut jobs: Vec<DownloadJob<RobloxExtra>> = Vec::new();
+        for &i in &to_install {
             let pkg = &plan.packages[i];
-            DownloadJob {
+            let dir_path = crate::roblox::physical_path(&base, &container, &pkg.path);
+            let stage = staging.alloc(i)?;
+            placements.push((pkg.path.clone(), stage.clone(), dir_path));
+            jobs.push(DownloadJob {
                 name: pkg.name.clone(),
                 version: pkg.version.clone(),
                 integrity: pkg.integrity.clone(),
-                dir: crate::roblox::physical_path(&base, &container, &pkg.path),
+                dir: stage,
                 public: pkg.public,
                 extra: RobloxExtra { root: pkg.root.clone(), container: pkg.packages_dir.clone() },
-            }
+            });
+        }
+        // On a pool error nothing has landed in the mount: staged dirs vanish
+        // with `staging`, and the tarball cache makes the retry's redownloads
+        // free.
+        crate::download_pool::download_all(jobs, "roblox", |job, url, on_bytes, cache| {
+            // The receipt is written into the staged dir after its extraction
+            // succeeds, so what renames into the mount is always a complete,
+            // receipted package.
+            fetch_and_extract(url, &job.integrity, &job.dir, &job.extra.root, on_bytes, cache).and_then(
+                |_| {
+                    receipts::write(&job.dir, &receipts::Receipt {
+                        name: job.name.clone(),
+                        version: job.version.clone(),
+                        integrity: job.integrity.clone(),
+                        root: job.extra.root.clone(),
+                        container: job.extra.container.clone(),
+                    })
+                },
+            )
         })
-        .collect();
-    crate::download_pool::download_all(jobs, "roblox", |job, url, on_bytes, cache| {
-        // The receipt is written only after ITS dir extracted successfully;
-        // per-package atomicity: a dir without a receipt (crash, partial
-        // extract) is never trusted.
-        fetch_and_extract(url, &job.integrity, &job.dir, &job.extra.root, on_bytes, cache).and_then(
-            |_| {
-                receipts::write(&job.dir, &receipts::Receipt {
-                    name: job.name.clone(),
-                    version: job.version.clone(),
-                    integrity: job.integrity.clone(),
-                    root: job.extra.root.clone(),
-                    container: job.extra.container.clone(),
-                })
-            },
-        )
-    })
-    .await?;
+        .await?;
 
-    // Pointer files are always regenerated: a few tiny idempotent writes,
-    // self-healing, and immune to hoist-layout drift. Pointer dirs inside a
-    // linked slot are skipped (the developer's own install provides them);
-    // pointers from other branches INTO a linked subtree keep their targets
-    // and resolve through the link.
+        // Assemble nested packages inside their installing ancestor's staged
+        // dir, deepest first so a package's own children are in place before
+        // it moves. Whatever has no installing ancestor renames into the
+        // mount afterwards, arriving complete (nested deps, pointers,
+        // receipts) in one atomic event.
+        placements.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
+        let mut mount_moves: Vec<usize> = Vec::new();
+        for i in 0..placements.len() {
+            let (path, stage, _) = placements[i].clone();
+            let ancestor = placements
+                .iter()
+                .filter(|(a, _, _)| path.starts_with(&format!("{}/", a)))
+                .max_by_key(|(a, _, _)| a.len());
+            match ancestor {
+                Some((a_path, a_stage, _)) => {
+                    let target = a_stage.join(Path::new(&path[a_path.len() + 1..]));
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    rename_with_retry(&stage, &target)
+                        .with_context(|| format!("Failed to assemble {}", path))?;
+                }
+                None => mount_moves.push(i),
+            }
+        }
+
+        // Pointer files inside a staged unit are part of the unit.
+        for pointer in &plan.pointers {
+            let topmost = placements
+                .iter()
+                .filter(|(a, _, _)| pointer.dir.starts_with(&format!("{}/", a)))
+                .min_by_key(|(a, _, _)| a.len());
+            if let Some((a_path, a_stage, _)) = topmost {
+                let target = a_stage.join(Path::new(&pointer.dir[a_path.len() + 1..]));
+                write_pointer(&target, &pointer.init_lua, &mut trash)?;
+                staged_pointers.insert(pointer.dir.clone());
+            }
+        }
+
+        // Patch link files while the unit is still staged: the writes never
+        // become watcher events. Links whose chains leave the unit resolve in
+        // the in-mount pass at the end instead.
+        for &i in &mount_moves {
+            crate::roblox::type_link::relink_types_staged(&placements[i].1);
+        }
+
+        for &i in &mount_moves {
+            let (path, stage, dest) = &placements[i];
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            rename_with_retry(stage, dest)
+                .with_context(|| format!("Failed to move {} into place", path))?;
+        }
+    }
+
+    // Remaining pointer files (dirs under kept packages, or at the mount top
+    // level) are regenerated in place: tiny idempotent writes, self-healing,
+    // and immune to hoist-layout drift. Pointer dirs inside a linked slot are
+    // skipped (the developer's own install provides them); pointers from
+    // other branches INTO a linked subtree keep their targets and resolve
+    // through the link.
     for pointer in &plan.pointers {
-        if under_link(&pointer.dir) {
+        if staged_pointers.contains(&pointer.dir) || under_link(&pointer.dir) {
             continue;
         }
-        write_pointer(&crate::roblox::physical_path(&base, &container, &pointer.dir), &pointer.init_lua)?;
+        write_pointer(&crate::roblox::physical_path(&base, &container, &pointer.dir), &pointer.init_lua, &mut trash)?;
     }
 
     // Materialize the links before the type pass so pointers targeting a
     // linked package pick up its live exports.
     if !link_res.active.is_empty() {
-        for (name, mode) in crate::roblox::link_overlay::apply(&base, &container, &link_res.active)? {
+        for (name, mode) in crate::roblox::link_overlay::apply(&base, &container, &link_res.active, &mut trash)? {
             match mode {
                 crate::roblox::link_overlay::AppliedMode::Copy(reason) => {
                     crate::message::warn(&format!("{} linked in copy mode: {}", name, reason));
@@ -240,9 +406,9 @@ pub async fn make_directories_roblox(
 /// the real package were still inside it, and a leftover init.luau root
 /// module would shadow the generated init.lua. The receipt marks exactly that
 /// case, so wipe the dir when one is present.
-fn write_pointer(target_dir: &Path, init_lua: &str) -> Result<()> {
+fn write_pointer(target_dir: &Path, init_lua: &str, trash: &mut TrashBin) -> Result<()> {
     if target_dir.join(receipts::RECEIPT_FILE).exists() {
-        fs::remove_dir_all(target_dir)
+        trash.remove_dir_all(target_dir)
             .with_context(|| format!("Failed to clear former package dir {}", target_dir.display()))?;
     }
     if !target_dir.exists() {
@@ -275,7 +441,7 @@ fn write_pointer(target_dir: &Path, init_lua: &str) -> Result<()> {
 /// paths stay in the virtual `./<container>/...` format. `container` must be
 /// the one the plan was built with, or every plan path gets stripped from
 /// `desired` and the whole mount is deleted.
-fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, container: &str) -> Result<()> {
+fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, container: &str, trash: &mut TrashBin) -> Result<()> {
     let prefix = format!("./{}/", container);
     let desired: std::collections::HashSet<String> = plan.packages.iter()
         .filter_map(|p| {
@@ -299,7 +465,7 @@ fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, containe
             // the link itself, never through it.
             crate::roblox::link_overlay::remove_link_path(&entry.path())?;
         } else if file_type.is_dir() {
-            fs::remove_dir_all(entry.path())?;
+            trash.remove_dir_all(&entry.path())?;
         }
     }
     Ok(())
@@ -334,6 +500,11 @@ fn find_abandoned_mounts(manifest_dir: &Path, base: &str) -> Vec<String> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
+            // `_`/`.` entries are exempt like everywhere else (and a
+            // `.forest-trash` left by a crashed run holds receipts).
+            if name.starts_with('_') || name.starts_with('.') {
+                continue;
+            }
             let rel = if parent.is_empty() {
                 name
             } else {
@@ -367,6 +538,11 @@ mod tests {
     use std::path::PathBuf;
     use crate::roblox::plan::{InstallPlan, PlannedPackage};
 
+    /// TrashBin pointed at a unique temp dir so tests never touch the cwd.
+    fn test_trash(tag: &str) -> TrashBin {
+        TrashBin::new(std::env::temp_dir().join(format!("forest-trash-test-{}-{}", tag, std::process::id())))
+    }
+
     #[test]
     fn write_pointer_wipes_a_former_package_dir() {
         // The dep was physical here last install, then got hoisted. Its old
@@ -386,7 +562,7 @@ mod tests {
         fs::write(dir.join("Helper.luau"), "return {}").unwrap();
 
         let init_lua = "--Pointer file generated by Forest Package Manager.\nreturn require(script.Parent.Parent.Parent['X'])";
-        write_pointer(&dir, init_lua).unwrap();
+        write_pointer(&dir, init_lua, &mut test_trash("wipe")).unwrap();
 
         assert!(!dir.join("init.luau").exists(), "old root module would shadow the pointer");
         assert!(!dir.join("Helper.luau").exists());
@@ -402,7 +578,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("init.lua"), "--Pointer file generated by Forest Package Manager.\nold").unwrap();
 
-        write_pointer(&dir, "--Pointer file generated by Forest Package Manager.\nnew").unwrap();
+        write_pointer(&dir, "--Pointer file generated by Forest Package Manager.\nnew", &mut test_trash("regen")).unwrap();
 
         assert!(fs::read_to_string(dir.join("init.lua")).unwrap().ends_with("new"));
         let _ = fs::remove_dir_all(&dir);
@@ -420,7 +596,7 @@ mod tests {
         fs::write(dir.join("init.lua"), patched).unwrap();
 
         let plain = "--Pointer file generated by Forest Package Manager.\nreturn require(script.Parent.Parent.Parent['X'])";
-        write_pointer(&dir, plain).unwrap();
+        write_pointer(&dir, plain, &mut test_trash("keep")).unwrap();
 
         assert_eq!(
             fs::read_to_string(dir.join("init.lua")).unwrap(),
@@ -430,7 +606,7 @@ mod tests {
 
         // A different target is a real change and must still rewrite.
         let moved = "--Pointer file generated by Forest Package Manager.\nreturn require(script.Parent.Parent['Elsewhere'])";
-        write_pointer(&dir, moved).unwrap();
+        write_pointer(&dir, moved, &mut test_trash("keep2")).unwrap();
         assert_eq!(fs::read_to_string(dir.join("init.lua")).unwrap(), moved);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -459,7 +635,7 @@ mod tests {
             pointers: vec![],
         };
 
-        prune_top_level(&plan, &mount.to_string_lossy(), "Packages").unwrap();
+        prune_top_level(&plan, &mount.to_string_lossy(), "Packages", &mut test_trash("prune")).unwrap();
 
         assert!(mount.join("Knit").exists(), "desired alias survives");
         assert!(!mount.join("Junk").exists(), "junk under the nested mount is pruned");
@@ -492,7 +668,7 @@ mod tests {
             pointers: vec![],
         };
 
-        prune_top_level(&plan, &mount.to_string_lossy(), "roblox_packages").unwrap();
+        prune_top_level(&plan, &mount.to_string_lossy(), "roblox_packages", &mut test_trash("prune-renamed")).unwrap();
 
         assert!(mount.join("Knit").exists(), "desired alias survives under the renamed mount");
         assert!(!mount.join("Junk").exists(), "junk is still pruned");

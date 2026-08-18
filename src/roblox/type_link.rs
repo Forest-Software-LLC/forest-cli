@@ -43,10 +43,19 @@ const MAX_CHAIN: usize = 32;
 /// re-exports. Infallible by design: problems are per-file warnings.
 pub fn relink_types(mount: &Path) {
     let mut cache: HashMap<PathBuf, Option<Vec<ExportedType>>> = HashMap::new();
-    walk(mount, &mut cache);
+    walk(mount, &mut cache, false);
 }
 
-fn walk(dir: &Path, cache: &mut HashMap<PathBuf, Option<Vec<ExportedType>>>) {
+/// Same pass over a STAGED install unit before it renames into the mount, so
+/// those link writes never become watcher events (see install.rs). Links
+/// whose chains leave the unit can't resolve yet and are skipped silently;
+/// the in-mount pass after placement picks them up.
+pub fn relink_types_staged(unit: &Path) {
+    let mut cache: HashMap<PathBuf, Option<Vec<ExportedType>>> = HashMap::new();
+    walk(unit, &mut cache, true);
+}
+
+fn walk(dir: &Path, cache: &mut HashMap<PathBuf, Option<Vec<ExportedType>>>, quiet: bool) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -63,14 +72,14 @@ fn walk(dir: &Path, cache: &mut HashMap<PathBuf, Option<Vec<ExportedType>>>) {
         }
         let path = entry.path();
         if path.is_dir() {
-            walk(&path, cache);
+            walk(&path, cache, quiet);
         } else if name.ends_with(".lua") || name.ends_with(".luau") { //NOTE: Should we start force converting files to .luau?
-            relink_file(&path, cache);
+            relink_file(&path, cache, quiet);
         }
     }
 }
 
-fn relink_file(path: &Path, cache: &mut HashMap<PathBuf, Option<Vec<ExportedType>>>) {
+fn relink_file(path: &Path, cache: &mut HashMap<PathBuf, Option<Vec<ExportedType>>>, quiet: bool) {
     let Ok(source) = fs::read_to_string(path) else { return };
     if !is_link(&source) { // Doesnt have the pointer header, skip
         return;
@@ -80,10 +89,12 @@ fn relink_file(path: &Path, cache: &mut HashMap<PathBuf, Option<Vec<ExportedType
     let exports = match resolve_exports(path, &expr, cache) {
         Some(exports) => exports,
         None => {
-            crate::message::warn(&format!(
-                "Could not resolve types through {}; its target's exported types won't be visible.",
-                path.display()
-            ));
+            if !quiet {
+                crate::message::warn(&format!(
+                    "Could not resolve types through {}; its target's exported types won't be visible.",
+                    path.display()
+                ));
+            }
             return;
         }
     };
