@@ -18,14 +18,15 @@ pub struct TreeScan {
     pub pointer_dirs: Vec<String>,
 }
 
-/// Walk every package position under `packages_dir` (`Packages/*`, then each
-/// `*/Packages/*`, recursively), collecting receipts and pointer signatures.
-/// Keys are rendered in plan format regardless of where `packages_dir`
-/// physically is, so reconcile can compare strings directly. `_`/`.` entries
-/// are skipped, matching the install-cleanup exemption.
-pub fn scan(packages_dir: &Path) -> TreeScan {
+/// Walk every package position under `packages_dir` (`<container>/*`, then
+/// each package's own nested container, recursively), collecting receipts
+/// and pointer signatures. `consumer_container` must match the planner's
+/// root prefix so keys are rendered in plan format regardless of where
+/// `packages_dir` physically is and reconcile can compare strings directly.
+/// `_`/`.` entries are skipped, matching the install-cleanup exemption.
+pub fn scan(packages_dir: &Path, consumer_container: &str) -> TreeScan {
     let mut tree = TreeScan::default();
-    walk(packages_dir, &format!("./{}", PACKAGES_DIR), &mut tree);
+    walk(packages_dir, &format!("./{}", consumer_container), &mut tree);
     tree
 }
 
@@ -41,6 +42,12 @@ fn walk(container: &Path, container_str: &str, tree: &mut TreeScan) {
             continue;
         }
         let path_str = format!("{container_str}/{name}");
+        // Each receipt names its own nested container to descend into; dirs
+        // without a trusted receipt use the default. Only a validated name
+        // is followed, since receipts are just files on disk and must not
+        // steer the scan (or the stale deletes computed from it) outside
+        // the mount.
+        let mut nested_name = PACKAGES_DIR.to_string();
         // Pointer check first: older builds wrote pointer init.lua into a
         // package dir without clearing it, so a dir can carry both a stale
         // receipt and a pointer header. Trusting that receipt would keep the
@@ -48,11 +55,14 @@ fn walk(container: &Path, container_str: &str, tree: &mut TreeScan) {
         if is_pointer_dir(&path) {
             tree.pointer_dirs.push(path_str.clone());
         } else if let Some(receipt) = read_receipt(&path) {
+            if crate::roblox::validate_packages_dir(&receipt.container).is_ok() {
+                nested_name = receipt.container.clone();
+            }
             tree.receipts.insert(path_str.clone(), receipt);
         }
-        let nested = path.join(PACKAGES_DIR);
+        let nested = path.join(&nested_name);
         if nested.is_dir() {
-            walk(&nested, &format!("{path_str}/{PACKAGES_DIR}"), tree);
+            walk(&nested, &format!("{path_str}/{nested_name}"), tree);
         }
     }
 }
@@ -79,8 +89,9 @@ pub struct Reconciliation {
 /// Diff the plan against what the tree says about itself.
 ///
 /// A planned package is KEPT (skipped entirely) only when:
-///   1. its dir carries a receipt with the same (integrity, root) — receipt
-///      presence implies the dir existed at scan time, and
+///   1. its dir carries a receipt with the same (integrity, root,
+///      container) — receipt presence implies the dir existed at scan time,
+///      and
 ///   2. every planned ancestor package is also kept — a nested package
 ///      physically lives INSIDE its parent's directory, so a re-extracted
 ///      parent wipes the child no matter what the child's receipt says.
@@ -96,7 +107,7 @@ pub fn reconcile(plan: &InstallPlan, tree: &TreeScan) -> Reconciliation {
         let receipt_ok = tree
             .receipts
             .get(pkg.path.as_str())
-            .map(|r| r.integrity == pkg.integrity && r.root == pkg.root)
+            .map(|r| r.integrity == pkg.integrity && r.root == pkg.root && r.container == pkg.packages_dir)
             .unwrap_or(false);
         let ancestors_ok = plan.packages.iter().all(|other| {
             !pkg.path.starts_with(&format!("{}/", other.path))
@@ -148,6 +159,7 @@ mod tests {
             version: "1.0.0".to_string(),
             integrity: integrity.to_string(),
             root: "src/init.luau".to_string(),
+            packages_dir: "Packages".to_string(),
             public: true,
         }
     }
@@ -174,6 +186,7 @@ mod tests {
                         version: p.version.clone(),
                         integrity: p.integrity.clone(),
                         root: p.root.clone(),
+                        container: p.packages_dir.clone(),
                     })
                 })
                 .collect(),
@@ -263,7 +276,7 @@ mod tests {
         let packages = base.join("Packages");
         let broken = packages.join("Knit").join("Packages").join("X");
         fs::create_dir_all(&broken).unwrap();
-        write(&broken, &Receipt { name: "acme/x".into(), version: "1.0.0".into(), integrity: "xx".into(), root: "src/init.luau".into() }).unwrap();
+        write(&broken, &Receipt { name: "acme/x".into(), version: "1.0.0".into(), integrity: "xx".into(), root: "src/init.luau".into(), container: "Packages".into() }).unwrap();
         fs::write(broken.join("init.luau"), "return {}").unwrap();
         fs::write(
             broken.join("init.lua"),
@@ -271,7 +284,7 @@ mod tests {
         )
         .unwrap();
 
-        let tree = scan(&packages);
+        let tree = scan(&packages, "Packages");
 
         assert!(tree.receipts.is_empty(), "stale receipt beside a pointer must not be trusted");
         assert_eq!(tree.pointer_dirs, vec!["./Packages/Knit/Packages/X".to_string()]);
@@ -314,9 +327,10 @@ mod tests {
             version: "1.0.0".into(),
             integrity: "aa".into(),
             root: "src/init.luau".into(),
+            container: "Packages".into(),
         };
         write(&knit, &receipt).unwrap();
-        write(&knit.join("Packages").join("Comm"), &Receipt { name: "acme/comm".into(), version: "1.0.0".into(), integrity: "bb".into(), root: "init.luau".into() }).unwrap();
+        write(&knit.join("Packages").join("Comm"), &Receipt { name: "acme/comm".into(), version: "1.0.0".into(), integrity: "bb".into(), root: "init.luau".into(), container: "Packages".into() }).unwrap();
         fs::write(
             knit.join("Packages").join("Promise").join("init.lua"),
             format!("{POINTER_HEADER}\nreturn require(script.Parent)"),
@@ -328,7 +342,7 @@ mod tests {
         fs::create_dir_all(packages.join("_Index")).unwrap();
         fs::write(packages.join("stray.txt"), "x").unwrap();
 
-        let tree = scan(&packages);
+        let tree = scan(&packages, "Packages");
 
         assert_eq!(tree.receipts.get("./Packages/Knit"), Some(&receipt));
         assert!(tree.receipts.contains_key("./Packages/Knit/Packages/Comm"));
@@ -336,5 +350,96 @@ mod tests {
         assert_eq!(tree.pointer_dirs, vec!["./Packages/Knit/Packages/Promise".to_string()]);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_descends_a_receipts_own_renamed_container() {
+        // Knit was published with packagesDir "knit_deps": the scan must
+        // find nested Comm inside it under a key matching the planner's
+        // per-hop path. The consumer's own mount is renamed too.
+        let base = std::env::temp_dir().join(format!("forest-receipts-renamed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let mount = base.join("roblox_packages");
+
+        let knit = mount.join("Knit");
+        fs::create_dir_all(knit.join("knit_deps").join("Comm")).unwrap();
+        write(&knit, &Receipt {
+            name: "acme/knit".into(),
+            version: "1.0.0".into(),
+            integrity: "aa".into(),
+            root: "src/init.luau".into(),
+            container: "knit_deps".into(),
+        }).unwrap();
+        write(&knit.join("knit_deps").join("Comm"), &Receipt {
+            name: "acme/comm".into(),
+            version: "1.0.0".into(),
+            integrity: "bb".into(),
+            root: "init.luau".into(),
+            container: "Packages".into(),
+        }).unwrap();
+        // A stray default-named subdir must not be scanned as Knit's
+        // container once the receipt says otherwise.
+        fs::create_dir_all(knit.join("Packages").join("Ghost")).unwrap();
+        write(&knit.join("Packages").join("Ghost"), &Receipt {
+            name: "acme/ghost".into(),
+            version: "1.0.0".into(),
+            integrity: "gg".into(),
+            root: "init.luau".into(),
+            container: "Packages".into(),
+        }).unwrap();
+
+        let tree = scan(&mount, "roblox_packages");
+
+        assert!(tree.receipts.contains_key("./roblox_packages/Knit"));
+        assert!(
+            tree.receipts.contains_key("./roblox_packages/Knit/knit_deps/Comm"),
+            "nested scan must follow the receipt's container: {:?}",
+            tree.receipts.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(tree.receipts.len(), 2, "the stray default-named subdir is not descended");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_never_follows_a_traversal_shaped_container() {
+        // A receipt is just a file on disk; a poisoned container name must
+        // not steer the scan (and the stale deletes computed from its keys)
+        // outside the mount.
+        let base = std::env::temp_dir().join(format!("forest-receipts-poison-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let mount = base.join("Packages");
+        let evil = mount.join("Evil");
+        fs::create_dir_all(&evil).unwrap();
+        write(&evil, &Receipt {
+            name: "acme/evil".into(),
+            version: "1.0.0".into(),
+            integrity: "ee".into(),
+            root: "init.luau".into(),
+            container: "..".into(),
+        }).unwrap();
+
+        let tree = scan(&mount, "Packages");
+
+        assert!(tree.receipts.contains_key("./Packages/Evil"));
+        assert!(
+            tree.receipts.keys().all(|k| !k.contains("..")),
+            "no scan key may carry a traversal segment: {:?}",
+            tree.receipts.keys().collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn container_rename_forces_a_clean_reinstall() {
+        // Same integrity/root, but the package was republished with a new
+        // packagesDir: keeping the dir would orphan the old nested tree.
+        let old = plan_of(vec![pkg("./Packages/A", "aa")], &[]);
+        let mut new = plan_of(vec![pkg("./Packages/A", "aa")], &[]);
+        new.packages[0].packages_dir = "a_deps".to_string();
+        let rec = reconcile(&new, &tree_of(&old));
+        assert_eq!(rec.to_install, vec![0], "container is part of the keep-key");
+        assert_eq!(rec.kept, 0);
     }
 }

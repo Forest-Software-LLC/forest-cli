@@ -18,11 +18,14 @@ use std::{fs, path::Path};
 use crate::message::{info, success, warn};
 use crate::platform::InitMode;
 
-pub fn init(cwd: &Path, mode: InitMode) -> Result<()> {
+pub fn init(cwd: &Path, mode: InitMode, packages_dir: Option<&str>) -> Result<()> {
     if cwd.join("forest.json").exists() {
         warn("forest.json already exists in the current directory. Please remove it before initializing a new project.");
         return Ok(());
     }
+
+    // Fail a bad --packages-dir before any prompts.
+    let packages_dir = resolve_packages_dir(packages_dir)?;
 
     // Wally conversion offer: pull the deps straight into forest.json.
     let mut dependencies = Map::new();
@@ -74,7 +77,7 @@ pub fn init(cwd: &Path, mode: InitMode) -> Result<()> {
 
     match mode {
         InitMode::Project { from_install } => {
-            scaffold_project(cwd, dependencies, license)?;
+            scaffold_project(cwd, &packages_dir, dependencies, license)?;
             success(&format!("Initialized a new project in {}", cwd.display()));
             if !from_install {
                 info("You can now run `forest install` to install dependencies!");
@@ -108,7 +111,7 @@ pub fn init(cwd: &Path, mode: InitMode) -> Result<()> {
                 .interact_text()?;
             let root = normalize_root(&root);
 
-            let manifest = scaffold_package(cwd, &name, &root, dependencies, license)?;
+            let manifest = scaffold_package(cwd, &name, &root, &packages_dir, dependencies, license)?;
 
             success(&format!("Initialized package \"{}\" in {}", name, cwd.display()));
             info(&format!(
@@ -122,33 +125,54 @@ pub fn init(cwd: &Path, mode: InitMode) -> Result<()> {
     Ok(())
 }
 
-/// Bare consuming manifest + the top-level Packages mount (install's
-/// create-on-install scaffold; must never prompt).
-fn scaffold_project(cwd: &Path, dependencies: Map<String, Value>, license: Option<String>) -> Result<()> {
+/// Resolve the `--packages-dir` flag: trim and validate, default when
+/// absent.
+fn resolve_packages_dir(flag: Option<&str>) -> Result<String> {
+    match flag {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            crate::roblox::validate_packages_dir(trimmed)
+                .map_err(|reason| anyhow::anyhow!("Invalid --packages-dir: {}", reason))?;
+            Ok(trimmed.to_string())
+        }
+        None => Ok(crate::roblox::PACKAGES_DIR.to_string()),
+    }
+}
+
+/// Bare consuming manifest + the top-level dependency mount (install's
+/// create-on-install scaffold; must never prompt). `packages_dir` must
+/// already be validated; written only when non-default.
+fn scaffold_project(cwd: &Path, packages_dir: &str, dependencies: Map<String, Value>, license: Option<String>) -> Result<()> {
     let mut manifest = json!({
         "dependencies": dependencies,
         "platform": "roblox",
     });
+    if packages_dir != crate::roblox::PACKAGES_DIR {
+        manifest["packagesDir"] = Value::String(packages_dir.to_string());
+    }
     if let Some(license) = license {
         manifest["license"] = Value::String(license);
     }
 
-    let packages_dir = cwd.join(crate::roblox::PACKAGES_DIR);
-    if !packages_dir.exists() {
-        fs::create_dir_all(&packages_dir)?;
+    let mount = cwd.join(crate::roblox::packages_base(&manifest));
+    if !mount.exists() {
+        fs::create_dir_all(&mount)?;
     }
     fs::write(cwd.join("forest.json"), serde_json::to_string_pretty(&manifest)?)?;
     Ok(())
 }
 
 /// Package-authoring scaffold: manifest with name/version/root, a starter
-/// root module (only when the file doesn't exist yet), and the Packages
+/// root module (only when the file doesn't exist yet), and the dependency
 /// mount inside the root dir. Promptless so it's unit-testable; returns the
-/// manifest it wrote. `root` must already be normalized (forward slashes).
+/// manifest it wrote. `root` must already be normalized (forward slashes),
+/// and `packages_dir` already validated. `packagesDir` is written only when
+/// non-default; absent means `Packages`, matching every published version.
 fn scaffold_package(
     cwd: &Path,
     name: &str,
     root: &str,
+    packages_dir: &str,
     dependencies: Map<String, Value>,
     license: Option<String>,
 ) -> Result<Value> {
@@ -159,6 +183,9 @@ fn scaffold_package(
         "platform": "roblox",
         "root": root,
     });
+    if packages_dir != crate::roblox::PACKAGES_DIR {
+        manifest["packagesDir"] = Value::String(packages_dir.to_string());
+    }
     if let Some(license) = license {
         manifest["license"] = Value::String(license);
     }
@@ -240,7 +267,7 @@ mod tests {
     #[test]
     fn package_scaffold_writes_manifest_starter_and_nested_mount() {
         let base = fixture("pkg");
-        let manifest = scaffold_package(&base, "MyPkg", "src/init.luau", Map::new(), None).unwrap();
+        let manifest = scaffold_package(&base, "MyPkg", "src/init.luau", "Packages", Map::new(), None).unwrap();
 
         let on_disk: Value =
             serde_json::from_str(&fs::read_to_string(base.join("forest.json")).unwrap()).unwrap();
@@ -249,6 +276,10 @@ mod tests {
         assert_eq!(on_disk["version"], "0.1.0");
         assert_eq!(on_disk["platform"], "roblox");
         assert_eq!(on_disk["root"], "src/init.luau", "root stays forward-slashed");
+        assert!(
+            on_disk.get("packagesDir").is_none(),
+            "the default container is written as absence, matching all published versions"
+        );
 
         let starter = fs::read_to_string(base.join("src").join("init.luau")).unwrap();
         assert!(starter.contains("return MyPkg"));
@@ -266,7 +297,7 @@ mod tests {
         fs::create_dir_all(base.join("src")).unwrap();
         fs::write(base.join("src").join("init.luau"), "return \"existing\"").unwrap();
 
-        scaffold_package(&base, "MyPkg", "src/init.luau", Map::new(), None).unwrap();
+        scaffold_package(&base, "MyPkg", "src/init.luau", "Packages", Map::new(), None).unwrap();
 
         assert_eq!(
             fs::read_to_string(base.join("src").join("init.luau")).unwrap(),
@@ -278,7 +309,7 @@ mod tests {
     #[test]
     fn package_scaffold_pascals_hyphenated_names_in_the_starter() {
         let base = fixture("hyphen");
-        scaffold_package(&base, "nav-mesh", "init.luau", Map::new(), None).unwrap();
+        scaffold_package(&base, "nav-mesh", "init.luau", "Packages", Map::new(), None).unwrap();
 
         let starter = fs::read_to_string(base.join("init.luau")).unwrap();
         assert!(starter.contains("local NavMesh = {}"), "hyphens aren't valid in Luau identifiers");
@@ -287,9 +318,27 @@ mod tests {
     }
 
     #[test]
+    fn package_scaffold_writes_a_custom_container_and_mounts_it() {
+        let base = fixture("custom-container");
+        let manifest =
+            scaffold_package(&base, "MyPkg", "src/init.luau", "roblox_packages", Map::new(), None).unwrap();
+
+        let on_disk: Value =
+            serde_json::from_str(&fs::read_to_string(base.join("forest.json")).unwrap()).unwrap();
+        assert_eq!(on_disk, manifest);
+        assert_eq!(on_disk["packagesDir"], "roblox_packages");
+        assert!(
+            base.join("src").join("roblox_packages").is_dir(),
+            "the renamed mount lives inside the root dir"
+        );
+        assert!(!base.join("src").join("Packages").exists(), "no default-named mount");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn project_scaffold_stays_bare() {
         let base = fixture("proj");
-        scaffold_project(&base, Map::new(), None).unwrap();
+        scaffold_project(&base, "Packages", Map::new(), None).unwrap();
 
         let manifest: Value =
             serde_json::from_str(&fs::read_to_string(base.join("forest.json")).unwrap()).unwrap();
@@ -297,8 +346,33 @@ mod tests {
         assert!(manifest["dependencies"].as_object().unwrap().is_empty());
         assert!(manifest.get("name").is_none(), "project manifests carry no package identity");
         assert!(manifest.get("root").is_none());
+        assert!(manifest.get("packagesDir").is_none(), "no key without the flag");
         assert!(base.join("Packages").is_dir());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn project_scaffold_writes_a_custom_container_and_mounts_it() {
+        let base = fixture("proj-container");
+        scaffold_project(&base, "roblox_packages", Map::new(), None).unwrap();
+
+        let manifest: Value =
+            serde_json::from_str(&fs::read_to_string(base.join("forest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["packagesDir"], "roblox_packages");
+        assert!(base.join("roblox_packages").is_dir());
+        assert!(!base.join("Packages").exists(), "no default-named mount");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn packages_dir_flag_resolves_trimmed_or_defaults() {
+        assert_eq!(resolve_packages_dir(None).unwrap(), "Packages");
+        assert_eq!(resolve_packages_dir(Some(" roblox_packages ")).unwrap(), "roblox_packages");
+
+        let err = resolve_packages_dir(Some("..")).unwrap_err().to_string();
+        assert!(err.contains("--packages-dir"), "{}", err);
+        assert!(resolve_packages_dir(Some("CON")).is_err());
+        assert!(resolve_packages_dir(Some("")).is_err());
     }
 
     #[test]

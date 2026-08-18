@@ -36,6 +36,17 @@ pub struct Receipt {
     /// archiveRoot — layout-affecting on extraction, so part of the match key.
     /// Empty for platforms with verbatim extraction (UEFN).
     pub root: String,
+    /// The package's own nested dep container name (its published
+    /// `packagesDir`). Defaults to "Packages" so pre-field receipts still
+    /// parse. The Roblox scan descends into it, and it is part of the
+    /// keep-key so a republished rename forces a clean reinstall.
+    #[serde(default = "default_container")]
+    pub container: String,
+}
+
+/// Serde default for `Receipt.container`: the historic hardcoded mount name.
+pub(crate) fn default_container() -> String {
+    "Packages".to_string()
 }
 
 pub fn write(dir: &Path, receipt: &Receipt) -> Result<()> {
@@ -215,7 +226,7 @@ mod tests {
         // Installed: receipt-carrying dir.
         let installed = mount.join("cool_studio").join("MathUtil");
         fs::create_dir_all(&installed).unwrap();
-        write(&installed, &Receipt { name: "cool-studio/mathutil".into(), version: "1.0.0".into(), integrity: "aa".into(), root: String::new() }).unwrap();
+        write(&installed, &Receipt { name: "cool-studio/mathutil".into(), version: "1.0.0".into(), integrity: "aa".into(), root: String::new(), container: default_container() }).unwrap();
 
         // Authored: forest.json, no receipt.
         let authored = mount.join("mine").join("MyPkg");
@@ -233,7 +244,7 @@ mod tests {
         // `_`-prefixed scope dirs are real (digit-led/reserved mappings).
         let underscore = mount.join("_123_team").join("Pkg");
         fs::create_dir_all(&underscore).unwrap();
-        write(&underscore, &Receipt { name: "123-team/pkg".into(), version: "1.0.0".into(), integrity: "bb".into(), root: String::new() }).unwrap();
+        write(&underscore, &Receipt { name: "123-team/pkg".into(), version: "1.0.0".into(), integrity: "bb".into(), root: String::new(), container: default_container() }).unwrap();
 
         let tree = scan_flat(&mount, "ForestPackages", TEST_HEADER);
 
@@ -256,9 +267,9 @@ mod tests {
     fn reconcile_flat_keeps_blocks_installs_and_stales() {
         let tree = FlatTreeScan {
             receipts: [
-                ("./M/a/Kept".to_string(), Receipt { name: "a/kept".into(), version: "1".into(), integrity: "ok".into(), root: String::new() }),
-                ("./M/a/Changed".to_string(), Receipt { name: "a/changed".into(), version: "1".into(), integrity: "OLD".into(), root: String::new() }),
-                ("./M/a/Gone".to_string(), Receipt { name: "a/gone".into(), version: "1".into(), integrity: "xx".into(), root: String::new() }),
+                ("./M/a/Kept".to_string(), Receipt { name: "a/kept".into(), version: "1".into(), integrity: "ok".into(), root: String::new(), container: default_container() }),
+                ("./M/a/Changed".to_string(), Receipt { name: "a/changed".into(), version: "1".into(), integrity: "OLD".into(), root: String::new(), container: default_container() }),
+                ("./M/a/Gone".to_string(), Receipt { name: "a/gone".into(), version: "1".into(), integrity: "xx".into(), root: String::new(), container: default_container() }),
             ].into(),
             authored: vec![AuthoredDir { path: "./M/mine/Authored".into(), scope_dir: "mine".into(), name_dir: "Authored".into() }],
             unknown: vec!["./M/junk/Thing".into()],
@@ -298,9 +309,19 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let receipt = Receipt { name: "a/b".into(), version: "1.2.3".into(), integrity: "cc".into(), root: "init.lua".into() };
+        let receipt = Receipt { name: "a/b".into(), version: "1.2.3".into(), integrity: "cc".into(), root: "init.lua".into(), container: "roblox_packages".into() };
         write(&dir, &receipt).unwrap();
         assert_eq!(read_receipt(&dir), Some(receipt));
+
+        // Receipts written before the container field existed must parse
+        // with the historic default.
+        fs::write(
+            dir.join(RECEIPT_FILE),
+            r#"{ "name": "a/b", "version": "1.2.3", "integrity": "cc", "root": "init.lua" }"#,
+        )
+        .unwrap();
+        let legacy = read_receipt(&dir).expect("legacy receipt must parse");
+        assert_eq!(legacy.container, "Packages");
 
         fs::write(dir.join(RECEIPT_FILE), "{not json").unwrap();
         assert_eq!(read_receipt(&dir), None, "corrupt receipt must read as absent");

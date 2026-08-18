@@ -55,6 +55,10 @@ enum Commands {
         /// Non-interactive-safe.
         #[arg(long = "project")]
         project: bool,
+
+        /// Dependency folder name (Roblox only, default "Packages")
+        #[arg(long = "packages-dir", value_name = "NAME")]
+        packages_dir: Option<String>,
     },
 
     /// Install dependencies for the package
@@ -198,8 +202,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Publish => {
             publish_command().await?;
         }
-        Commands::Init { platform, project } => {
-            init_command(platform, project).await?;
+        Commands::Init { platform, project, packages_dir } => {
+            init_command(platform, project, packages_dir).await?;
         }
         Commands::Install { package, version, alias, force, init } => {
             install_command(package, version, alias, force, init).await?;

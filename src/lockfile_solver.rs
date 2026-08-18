@@ -77,7 +77,11 @@ struct VersionState {
     dependencies: HashMap<String, DepSpec>,
     integrity: String,
     public: bool,
-    archive_root: String
+    archive_root: String,
+    /// The version's own nested dep container name (`packagesDir` in the
+    /// registry metadata); "Packages" when unset, covering pre-field and
+    /// wally-mirrored versions.
+    packages_dir: String,
 }
 
 /// Holds buckets (grouped ranges) and per-version state
@@ -144,6 +148,7 @@ fn merge_fresh_version_list(state: &mut PackageState, version_data: &serde_json:
                 integrity: String::new(),
                 public: false,
                 archive_root: String::new(),
+                packages_dir: default_packages_dir(),
             },
         );
     }
@@ -158,14 +163,33 @@ type ResolvedVersions = HashMap<String, PackageState>;
 /// (`{integrity}.tgz` on the CDN), so the URL is derived from `integrity` at
 /// install time. A URL field would be an attacker-editable pointer in PRs
 /// (lockfile injection); the hash both names and verifies the content.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockfileEntry {
     pub version: String,
     pub integrity: String,
     pub public: bool,
     pub root : String,
     pub location: String,
+    /// The version's own nested dep container name (registry `packagesDir`).
+    /// Defaulted so v2 lockfiles written before the field stay readable, and
+    /// skipped on write when default so unaffected lockfiles don't churn.
+    #[serde(
+        rename = "packagesDir",
+        default = "default_packages_dir",
+        skip_serializing_if = "is_default_packages_dir"
+    )]
+    pub packages_dir: String,
     pub dependencies: HashMap<String, DepSpec>,
+}
+
+/// Serde default for `LockfileEntry::packages_dir` / `VersionState`: the
+/// historic hardcoded container name.
+pub fn default_packages_dir() -> String {
+    "Packages".to_string()
+}
+
+fn is_default_packages_dir(value: &String) -> bool {
+    value == "Packages"
 }
 
 type LockfilePackages = HashMap<String, Vec<LockfileEntry>>;
@@ -354,7 +378,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
                 //println!("Found version {} for package {}", ver, name.full_name);
                 pkg_state.versions.insert(
                     ver,
-                    VersionState { resolved: false, prefetched, dependencies: HashMap::new(), integrity: String::new(), public: false, archive_root: String::new() }
+                    VersionState { resolved: false, prefetched, dependencies: HashMap::new(), integrity: String::new(), public: false, archive_root: String::new(), packages_dir: default_packages_dir() }
                 );
             }
         }
@@ -567,6 +591,15 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
             .map(|s| s.to_string())
             .unwrap_or("".to_string());
 
+        // Absent/empty = the historic "Packages" (all pre-field versions and
+        // every wally-mirrored version). Validation happens where the value
+        // flows into filesystem paths (the install planner).
+        vs.packages_dir = package_info.get("packagesDir")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(default_packages_dir);
+
 
         for (dep_name, dep_spec) in deps_hm {
             let dep_pkg = digest_package_name(&dep_name);
@@ -663,6 +696,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
                 public: vs.public,
                 root: vs.archive_root.clone(),
                 location: String::new(),
+                packages_dir: vs.packages_dir.clone(),
                 dependencies: deps,
             });
         }
@@ -981,6 +1015,7 @@ mod tests {
                 integrity: if *resolved { "kept".into() } else { String::new() },
                 public: false,
                 archive_root: String::new(),
+                packages_dir: default_packages_dir(),
             });
         }
         PackageState { canonical: "Scope/Pkg".into(), buckets: HashMap::new(), versions: vs }

@@ -239,6 +239,7 @@ mod tests {
             public: true,
             root: String::new(),
             location: location.to_string(),
+            packages_dir: "Packages".to_string(),
             dependencies: deps.iter().map(|(n, v)| dep(n, v)).collect(),
         }
     }

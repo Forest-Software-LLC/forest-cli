@@ -386,6 +386,7 @@ mod tests {
                 public: true,
                 root: String::new(),
                 location: location.to_string(),
+                packages_dir: "Packages".to_string(),
                 dependencies: HashMap::new(),
             });
         }

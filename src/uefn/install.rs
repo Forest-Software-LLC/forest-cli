@@ -271,6 +271,9 @@ pub async fn make_directories_uefn(
                                 integrity: job.integrity.clone(),
                                 // No entry point on UEFN - the folder is the package.
                                 root: String::new(),
+                                // No nested containers either (flat mount);
+                                // keep the serde default.
+                                container: receipts::default_container(),
                             },
                         )
                     });

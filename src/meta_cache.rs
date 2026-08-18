@@ -32,6 +32,7 @@ pub fn trim_install_meta(source: &Value, public_override: Option<bool>) -> Value
         "dependencies",
         "integrity",
         "archiveRoot",
+        "packagesDir",
         "license",
         "licenseRating",
         "licenseCaveats",
@@ -222,6 +223,7 @@ mod tests {
             "dependencies": { "a/b": "^1.0.0" },
             "integrity": "abc123",
             "archiveRoot": "src",
+            "packagesDir": "roblox_packages",
             "license": "MIT",
             "licenseRating": "safe",
             "licenseCaveats": [],
@@ -234,6 +236,9 @@ mod tests {
         assert!(trimmed.get("description").is_none());
         assert_eq!(trimmed["integrity"], "abc123");
         assert_eq!(trimmed["public"], false);
+        // Dropping packagesDir here would make the disk cache's confirmation
+        // pass mismatch on every renamed-container package.
+        assert_eq!(trimmed["packagesDir"], "roblox_packages");
 
         // Fat version-list blocks carry no public field of their own; the
         // package-level flag is injected. compatVersion survives when present.
