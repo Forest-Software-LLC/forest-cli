@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::fs;
 use anyhow::Result;
 use serde_json::{Value, Map};
 
@@ -10,31 +10,13 @@ use crate::utils::{normalize_forest_deps, resolve_dep_ref, DepRef};
 pub async fn remove_command(
     target_package: String,
 ) -> Result<()> {
+    let Some(project) = super::context::load_project()? else {
+        crate::message::info("No forest.json found, nothing to remove.");
+        return Ok(());
+    };
     let mut msg = Message::new("Removing...");
 
-    // Same manifest discovery as install: some platforms keep forest.json
-    // away from the project root (UEFN: inside Content/).
-    if !Path::new("forest.json").exists() {
-        if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
-            std::env::set_current_dir(&manifest_dir)?;
-            msg.emit(
-                MessageType::Info,
-                &format!("Using manifest at {}", manifest_dir.join("forest.json").display()),
-            );
-        }
-    }
-
-    // Ensure forest.json exists
-    if !Path::new("forest.json").exists() {
-        msg.finish(
-            MessageType::Info,
-            "No forest.json found, nothing to remove.",
-        );
-        return Ok(());
-    }
-
-    // Read and parse forest.json
-    let mut info: Value = serde_json::from_str(&fs::read_to_string("forest.json")?)?;
+    let mut info = project.manifest;
     // Ensure dependencies object exists
     if !info.get("dependencies").map_or(false, |v| v.is_object()) {
         info["dependencies"] = Value::Object(Map::new());

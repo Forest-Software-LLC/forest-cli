@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs};
 use anyhow::Result;
 use colored::Colorize;
 use reqwest::Method;
@@ -118,24 +118,20 @@ mod tests {
 /// `target_package`, limit the audit to that dependency. With `update`, bump
 /// forest.json to the latest versions and reinstall.
 pub async fn audit_command(target_package: Option<String>, update: bool) -> Result<()> {
+    // Discovery included: audit historically read forest.json from the cwd
+    // only, so it failed where install worked (UEFN keeps the manifest in
+    // Content/).
+    let Some(project) = super::context::load_project()? else {
+        crate::message::fail("No forest.json found. Run `forest init` to create a new package.");
+        return Ok(());
+    };
     let mut msg = Message::new("Checking for updates...");
 
-    // Ensure forest.json exists
-    if !Path::new("forest.json").exists() {
-        msg.finish(
-            MessageType::Fail,
-            "No forest.json found. Run `forest init` to create a new package.",
-        );
-        return Ok(());
-    }
-
-    // Read and parse forest.json
-    let mut info: Value = serde_json::from_str(&fs::read_to_string("forest.json")?)?;
-
+    let mut info = project.manifest;
     let platform = info
         .get("platform")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing platform in forest.json"))?
+        .unwrap_or_default()
         .to_string();
 
     let roots = normalize_forest_deps(&info);

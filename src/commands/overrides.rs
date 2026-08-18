@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs};
 
 use anyhow::Result;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input};
@@ -27,19 +27,11 @@ pub async fn override_command(
     yes: bool,
     remove: bool,
 ) -> Result<()> {
-    // Same manifest discovery as install/tree (UEFN keeps forest.json in
-    // Content/).
-    if !Path::new("forest.json").exists() {
-        if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
-            std::env::set_current_dir(&manifest_dir)?;
-        }
-    }
-    if !Path::new("forest.json").exists() {
+    let Some(project) = super::context::load_project()? else {
         message::fail("No forest.json found. Run `forest init` to create a new package.");
         return Ok(());
-    }
-
-    let mut manifest: Value = serde_json::from_str(&fs::read_to_string("forest.json")?)?;
+    };
+    let mut manifest = project.manifest;
     let overrides = normalize_forest_overrides(&manifest);
 
     let Some(reference) = package else {

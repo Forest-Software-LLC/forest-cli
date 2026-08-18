@@ -16,19 +16,11 @@ use crate::utils::{digest_package_name, get_ci, normalize_forest_deps, normalize
 /// registry calls are needed. With a package reference, only that root
 /// dependency's subtree is shown.
 pub fn tree_command(target_package: Option<String>) -> Result<()> {
-    // Same manifest discovery as install: some platforms keep forest.json
-    // away from the project root (UEFN: inside Content/).
-    if !Path::new("forest.json").exists() {
-        if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
-            std::env::set_current_dir(&manifest_dir)?;
-        }
-    }
-    if !Path::new("forest.json").exists() {
+    let Some(project) = super::context::load_project()? else {
         info("No forest.json found, nothing to show.");
         return Ok(());
-    }
-
-    let manifest: Value = serde_json::from_str(&fs::read_to_string("forest.json")?)?;
+    };
+    let manifest = project.manifest;
     let roots = normalize_forest_deps(&manifest);
     if roots.is_empty() {
         info("No dependencies declared in forest.json.");

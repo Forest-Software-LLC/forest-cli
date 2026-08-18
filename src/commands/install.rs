@@ -30,20 +30,8 @@ pub async fn install_command(
         // apply otherwise.
         Some(crate::links::LinksMode::Forbid) | None => {}
     }
+    let mut project = super::context::load_project()?;
     let mut msg = Message::new("Installing...");
-
-    // Some platforms keep the manifest away from the project root (UEFN:
-    // inside Content/). When there's no forest.json here, ask the platform
-    // seam whether one lives nearby; a local forest.json always wins.
-    if !Path::new("forest.json").exists() {
-        if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
-            std::env::set_current_dir(&manifest_dir)?;
-            msg.emit(
-                MessageType::Info,
-                &format!("Using manifest at {}", manifest_dir.join("forest.json").display()),
-            );
-        }
-    }
 
     // Strict mode for CI: a links file with entries is a hard failure, so a
     // leaked .forest/links.json can never produce a non-lockfile install
@@ -68,7 +56,7 @@ pub async fn install_command(
     // non-interactive path; otherwise offer interactively. The platform
     // scaffold writes a minimal manifest (dependencies + platform, no name)
     // and knows where it belongs (UEFN: the project's Content folder).
-    if !Path::new("forest.json").exists() {
+    if project.is_none() {
         msg.pause();
         let chosen_platform = if let Some(p) = &init_platform {
             Some(crate::platform::Platform::parse(p)?)
@@ -87,15 +75,11 @@ pub async fn install_command(
         if let Some(plat) = chosen_platform {
             plat.init(&std::env::current_dir()?, crate::platform::InitMode::Project { from_install: true }, None).await?;
             // The scaffold may have placed the manifest elsewhere
-            // (UEFN: Content/) - re-run discovery to land on it.
-            if !Path::new("forest.json").exists() {
-                if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
-                    std::env::set_current_dir(&manifest_dir)?;
-                }
-            }
+            // (UEFN: Content/); re-run discovery to land on it.
+            project = super::context::load_project()?;
         }
         msg.resume();
-        if !Path::new("forest.json").exists() {
+        if project.is_none() {
             msg.emit(
                 MessageType::Fail,
                 "No forest.json found. Run `forest init` to create a new package, or pass --init <platform>.",
@@ -109,20 +93,21 @@ pub async fn install_command(
         );
     }
 
-    // Read and parse forest.json
-    let mut info: Value = serde_json::from_str(&fs::read_to_string("forest.json")?)?;
+    let project = project.expect("checked above");
+    let mut info = project.manifest;
     // Ensure dependencies object exists
     if !info.get("dependencies").map_or(false, |v| v.is_object()) {
         info["dependencies"] = Value::Object(Map::new());
     }
 
+    // The raw manifest value, for registry endpoints.
     let platform = info
         .get("platform")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing platform in forest.json"))?
-        .to_string(); // clone the value so we don't hold a borrow
+        .unwrap_or_default()
+        .to_string();
 
-    let plat = crate::platform::Platform::parse(&platform)?;
+    let plat = project.platform;
 
     // Some platforms reject aliases outright (UEFN: Verse has no cheap
     // re-export shims). Fail before any network work; the planner backstops

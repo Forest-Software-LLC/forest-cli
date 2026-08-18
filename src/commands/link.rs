@@ -16,24 +16,6 @@ use crate::message::{fail, info, success, warn};
 use crate::platform::Platform;
 use crate::utils::{normalize_forest_deps, same_package};
 
-/// Enter the manifest directory, mirroring install/remove discovery.
-fn enter_manifest_dir() -> Result<bool> {
-    if !Path::new("forest.json").exists() {
-        if let Some(manifest_dir) = crate::platform::discover_manifest_dir(&std::env::current_dir()?) {
-            std::env::set_current_dir(&manifest_dir)?;
-            info(&format!(
-                "Using manifest at {}",
-                manifest_dir.join("forest.json").display()
-            ));
-        }
-    }
-    Ok(Path::new("forest.json").exists())
-}
-
-fn read_manifest() -> Result<Value> {
-    Ok(serde_json::from_str(&fs::read_to_string("forest.json")?)?)
-}
-
 /// The lockfile-pinned root version for a dependency key.
 fn pinned_version(lockfile: &Option<LockFile>, name: &str) -> Option<String> {
     lockfile
@@ -42,12 +24,12 @@ fn pinned_version(lockfile: &Option<LockFile>, name: &str) -> Option<String> {
 }
 
 pub async fn link_command(path: Option<String>, list: bool) -> Result<()> {
-    if !enter_manifest_dir()? {
+    let Some(project) = super::context::load_project()? else {
         fail("No forest.json found. Run `forest init` first.");
         return Ok(());
-    }
-    let manifest = read_manifest()?;
-    let platform = Platform::from_manifest(&manifest)?;
+    };
+    let manifest = project.manifest;
+    let platform = project.platform;
 
     let Some(path) = path.filter(|_| !list) else {
         print_links_list(&manifest);
@@ -211,11 +193,11 @@ fn warn_on_runnable_scripts(target: &Path, linked_manifest: &Value) {
 }
 
 pub async fn unlink_command(reference: Option<String>, all: bool) -> Result<()> {
-    if !enter_manifest_dir()? {
+    let Some(project) = super::context::load_project()? else {
         fail("No forest.json found here.");
         return Ok(());
-    }
-    let manifest = read_manifest()?;
+    };
+    let manifest = project.manifest;
 
     let stored = links::stored_links();
     if stored.is_empty() {
