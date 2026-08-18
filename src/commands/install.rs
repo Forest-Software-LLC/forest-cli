@@ -4,9 +4,7 @@ use serde_json::{Value, Map};
 use urlencoding::encode;
 use reqwest::Method;
 
-use std::collections::{HashMap};
 use crate::http::packages_api_request;
-use crate::lockfile_solver::DepSpec;
 use crate::message::{Message, MessageType};
 use crate::lockfile_gen::{lockfile_gen, lockfile_satisfies_manifest, make_directories, LockFile};
 use crate::utils::{normalize_forest_deps, normalize_forest_excludes, normalize_forest_overrides};
@@ -138,6 +136,7 @@ pub async fn install_command(
 
     // Read before `deps` takes its mutable borrow of the manifest.
     let manifest_overrides = normalize_forest_overrides(&info);
+    let normalized_root_deps = normalize_forest_deps(&info);
     let deps = info.get_mut("dependencies").unwrap().as_object_mut().unwrap();
 
     if let Some(pkg) = target_package {
@@ -265,25 +264,7 @@ pub async fn install_command(
             return Ok(());
         }
 
-        // Check for alias conflicts
-        let normalized_root_deps: HashMap<String, DepSpec> = deps.iter()
-            .map(|(name, val)| {
-                let default_alias = name.split('/').last().unwrap_or(name).to_string();
-                let spec = if let Some(vstr) = val.as_str() {
-                    DepSpec { alias: default_alias.clone(), version: vstr.to_string() }
-                } else if let Some(obj) = val.as_object() {
-                    let version = obj.get("version").and_then(Value::as_str).unwrap_or("").to_string();
-                    let alias = obj.get("alias").and_then(Value::as_str).map(|s| s.to_string()).unwrap_or(default_alias.clone());
-                    DepSpec { alias, version }
-                } else {
-                    DepSpec { alias: default_alias.clone(), version: String::new() }
-                };
-                (name.clone(), spec)
-            })
-            .collect();
-
-
-        // Case-insensitive: aliases become folder names under packages/, and
+        // Alias conflicts. Case-insensitive: aliases become folder names under packages/, and
         // Windows/macOS filesystems case-fold; `DataStream` and `datastream`
         // would silently merge into one directory.
         if normalized_root_deps.values().any(|spec| spec.alias.eq_ignore_ascii_case(&resolved_name)) {

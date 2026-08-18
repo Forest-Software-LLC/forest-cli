@@ -75,9 +75,7 @@ pub fn tree_command(target_package: Option<String>) -> Result<()> {
         warn(warning);
     }
     crate::links::print_banner(&link_res.active, |name| {
-        get_ci(&lockfile.packages, name)
-            .and_then(|entries| entries.iter().find(|e| e.location == "~"))
-            .map(|e| e.version.clone())
+        lockfile.pinned_version(name).map(str::to_string)
     });
 
     // Same trust check install uses (UEFN widens the roots to the whole
@@ -140,10 +138,9 @@ fn render_tree(label: &str, roots: &HashMap<String, DepSpec>, lockfile: &LockFil
 /// Root deps pin their resolved version at location "~". Fall back to a
 /// range match so a hand-edited or stale lockfile still renders something.
 fn find_root_entry<'a>(lockfile: &'a LockFile, name: &str, range: &str) -> Option<&'a LockfileEntry> {
-    let entries = get_ci(&lockfile.packages, name)?;
-    entries.iter().find(|e| e.location == "~").or_else(|| {
+    lockfile.root_entry(name).or_else(|| {
         let req = semver::VersionReq::parse(range).ok()?;
-        entries
+        get_ci(&lockfile.packages, name)?
             .iter()
             .find(|e| semver::Version::parse(&e.version).map_or(false, |v| req.matches(&v)))
     })

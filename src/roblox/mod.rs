@@ -45,11 +45,9 @@ pub fn packages_base(manifest: &serde_json::Value) -> String {
         .get("root")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let root = root.replace('\\', "/");
-    let root = root.strip_prefix("./").unwrap_or(&root);
-    match root.rsplit_once('/') {
-        Some((parent, _)) if !parent.is_empty() => format!("{}/{}", parent, container),
-        _ => container,
+    match crate::utils::manifest_root_parent(root) {
+        Some(parent) => format!("{}/{}", parent, container),
+        None => container,
     }
 }
 

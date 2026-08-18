@@ -361,8 +361,8 @@ pub async fn make_directories_roblox(
         // Deps the linked working tree declares beyond the pinned registry
         // version come from ITS OWN tree; surface the drift explicitly.
         for link in &link_res.active {
-            let pinned_deps = crate::utils::get_ci(&lockfile.packages, &link.name)
-                .and_then(|entries| entries.iter().find(|e| e.location == "~"))
+            let pinned_deps = lockfile
+                .root_entry(&link.name)
                 .map(|e| e.dependencies.clone())
                 .unwrap_or_default();
             for diff in crate::links::dep_divergences(link, &pinned_deps) {
@@ -373,9 +373,7 @@ pub async fn make_directories_roblox(
             }
         }
         crate::links::print_banner(&link_res.active, |name| {
-            crate::utils::get_ci(&lockfile.packages, name)
-                .and_then(|entries| entries.iter().find(|e| e.location == "~"))
-                .map(|e| e.version.clone())
+            lockfile.pinned_version(name).map(str::to_string)
         });
     }
 

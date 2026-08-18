@@ -34,21 +34,11 @@ fn read_manifest() -> Result<Value> {
     Ok(serde_json::from_str(&fs::read_to_string("forest.json")?)?)
 }
 
-fn read_lockfile() -> Option<LockFile> {
-    let content: Value = serde_json::from_str(&fs::read_to_string("forest-lock.json").ok()?).ok()?;
-    if content.get("file_version").and_then(Value::as_u64) != Some(2) {
-        return None;
-    }
-    serde_json::from_value(content).ok()
-}
-
 /// The lockfile-pinned root version for a dependency key.
 fn pinned_version(lockfile: &Option<LockFile>, name: &str) -> Option<String> {
-    lockfile.as_ref().and_then(|lf| {
-        crate::utils::get_ci(&lf.packages, name)
-            .and_then(|entries| entries.iter().find(|e| e.location == "~"))
-            .map(|e| e.version.clone())
-    })
+    lockfile
+        .as_ref()
+        .and_then(|lf| lf.pinned_version(name).map(str::to_string))
 }
 
 pub async fn link_command(path: Option<String>, list: bool) -> Result<()> {
@@ -194,14 +184,12 @@ fn warn_on_runnable_scripts(target: &Path, linked_manifest: &Value) {
     let root = linked_manifest
         .get("root")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .replace('\\', "/");
-    let root = root.strip_prefix("./").unwrap_or(&root);
-    let source_dir = match root.rsplit_once('/') {
-        Some((parent, _)) if !parent.is_empty() => target.join(parent),
-        _ => target.to_path_buf(),
+        .unwrap_or("");
+    let source_dir = match crate::utils::manifest_root_parent(root) {
+        Some(parent) => target.join(parent),
+        None => target.to_path_buf(),
     };
-    let root_file = root.rsplit('/').next().unwrap_or("");
+    let root_file = root.replace('\\', "/").rsplit('/').next().unwrap_or("").to_string();
     let count = WalkDir::new(&source_dir)
         .into_iter()
         .filter_entry(|e| e.file_name().to_str().map_or(true, |n| n != ".git"))
@@ -273,15 +261,13 @@ pub async fn unlink_command(reference: Option<String>, all: bool) -> Result<()> 
                 // The slot links the root PARENT, so probe the manifest's
                 // root as well as the project dir itself.
                 let mut candidates = vec![target.clone()];
-                if let Some(root) = fs::read_to_string(target.join("forest.json"))
+                if let Some(parent) = fs::read_to_string(target.join("forest.json"))
                     .ok()
                     .and_then(|t| serde_json::from_str::<Value>(&t).ok())
                     .and_then(|m| m.get("root").and_then(Value::as_str).map(str::to_string))
+                    .and_then(|root| crate::utils::manifest_root_parent(&root))
                 {
-                    let root = root.replace('\\', "/");
-                    if let Some((parent, _)) = root.trim_start_matches("./").rsplit_once('/') {
-                        candidates.push(target.join(parent));
-                    }
+                    candidates.push(target.join(parent));
                 }
                 for candidate in candidates {
                     for slot in crate::roblox::link_overlay::find_slots_for_target(&base, &candidate) {
@@ -315,7 +301,7 @@ fn print_links_list(manifest: &Value) {
         return;
     }
     let root_deps = normalize_forest_deps(manifest);
-    let lockfile = read_lockfile();
+    let lockfile = LockFile::load();
     let (base, container) = if Platform::from_manifest(manifest).ok() == Some(Platform::Roblox) {
         (
             crate::roblox::packages_base(manifest),
@@ -375,25 +361,13 @@ fn print_links_list(manifest: &Value) {
 
         // Dependency divergence vs the pinned registry version.
         if let Some(lf) = &lockfile {
-            let pinned_deps = crate::utils::get_ci(&lf.packages, dep_key)
-                .and_then(|entries| entries.iter().find(|e| e.location == "~"))
+            let pinned_deps = lf
+                .root_entry(dep_key)
                 .map(|e| e.dependencies.clone())
                 .unwrap_or_default();
             let linked_deps = linked_manifest
                 .as_ref()
-                .and_then(|m| m.get("dependencies").and_then(Value::as_object))
-                .map(|deps| {
-                    deps.iter()
-                        .filter_map(|(k, v)| {
-                            let range = match v {
-                                Value::String(s) => s.clone(),
-                                Value::Object(o) => o.get("version")?.as_str()?.to_string(),
-                                _ => return None,
-                            };
-                            Some((k.clone(), range))
-                        })
-                        .collect()
-                })
+                .map(crate::utils::manifest_dep_ranges)
                 .unwrap_or_default();
             let probe = links::ActiveLink {
                 name: dep_key.clone(),

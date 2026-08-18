@@ -164,6 +164,40 @@ pub fn same_package(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// Parent dir of a manifest `root` ("src/init.luau" -> Some("src")), with
+/// backslash and leading "./" normalization. None for top-level or empty
+/// roots. Shared by the mount derivation and the link overlay, which must
+/// agree on where a root's directory is.
+pub fn manifest_root_parent(root: &str) -> Option<String> {
+    let root = root.replace('\\', "/");
+    let root = root.strip_prefix("./").unwrap_or(&root);
+    match root.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => Some(parent.to_string()),
+        _ => None,
+    }
+}
+
+/// Declared dependency ranges from a manifest: name -> range. Handles both
+/// the plain string form and the { version, alias } object form; malformed
+/// entries are skipped.
+pub fn manifest_dep_ranges(forest_json: &Value) -> HashMap<String, String> {
+    forest_json
+        .get("dependencies")
+        .and_then(Value::as_object)
+        .map_or_else(HashMap::new, |deps| {
+            deps.iter()
+                .filter_map(|(k, v)| {
+                    let range = match v {
+                        Value::String(s) => s.clone(),
+                        Value::Object(o) => o.get("version")?.as_str()?.to_string(),
+                        _ => return None,
+                    };
+                    Some((k.clone(), range))
+                })
+                .collect()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +288,34 @@ mod tests {
     fn same_package_ignores_case() {
         assert!(same_package("Scope/Pkg", "scope/pkg"));
         assert!(!same_package("a/pkg", "b/pkg"));
+    }
+
+    #[test]
+    fn root_parent_normalizes_and_handles_top_level_roots() {
+        assert_eq!(manifest_root_parent("src/init.luau"), Some("src".to_string()));
+        assert_eq!(manifest_root_parent("a/b/init.lua"), Some("a/b".to_string()));
+        assert_eq!(manifest_root_parent("src\\init.luau"), Some("src".to_string()));
+        assert_eq!(manifest_root_parent("./src/init.luau"), Some("src".to_string()));
+        assert_eq!(manifest_root_parent("./init.luau"), None);
+        assert_eq!(manifest_root_parent("init.luau"), None);
+        assert_eq!(manifest_root_parent(""), None);
+    }
+
+    #[test]
+    fn dep_ranges_parse_both_forms_and_skip_malformed() {
+        let manifest = serde_json::json!({
+            "dependencies": {
+                "a/plain": "^1.0.0",
+                "b/aliased": { "version": "^2.0.0", "alias": "B" },
+                "c/broken": 42,
+                "d/no-version": { "alias": "D" }
+            }
+        });
+        let ranges = manifest_dep_ranges(&manifest);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges["a/plain"], "^1.0.0");
+        assert_eq!(ranges["b/aliased"], "^2.0.0");
+        assert!(manifest_dep_ranges(&serde_json::json!({})).is_empty());
     }
 
     #[test]

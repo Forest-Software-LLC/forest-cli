@@ -265,9 +265,9 @@ fn resolve_one(link: &StoredLink, alias: &str, dep_key: &str) -> std::result::Re
         .unwrap_or("")
         .replace('\\', "/");
     let root = root.strip_prefix("./").unwrap_or(&root).to_string();
-    let source_dir = match root.rsplit_once('/') {
-        Some((parent, _)) if !parent.is_empty() => target.join(parent),
-        _ => target.clone(),
+    let source_dir = match crate::utils::manifest_root_parent(&root) {
+        Some(parent) => target.join(parent),
+        None => target.clone(),
     };
     if !source_dir.is_dir() {
         return Err(format!(
@@ -288,22 +288,7 @@ fn resolve_one(link: &StoredLink, alias: &str, dep_key: &str) -> std::result::Re
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        dependencies: manifest
-            .get("dependencies")
-            .and_then(Value::as_object)
-            .map(|deps| {
-                deps.iter()
-                    .filter_map(|(k, v)| {
-                        let range = match v {
-                            Value::String(s) => s.clone(),
-                            Value::Object(o) => o.get("version")?.as_str()?.to_string(),
-                            _ => return None,
-                        };
-                        Some((k.clone(), range))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        dependencies: crate::utils::manifest_dep_ranges(&manifest),
     })
 }
 

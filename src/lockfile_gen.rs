@@ -34,6 +34,32 @@ pub struct LockFile {
     pub packages: HashMap<String, Vec<LockfileEntry>>,
 }
 
+impl LockFile {
+    /// Read forest-lock.json from the current directory. None when missing,
+    /// unparseable, or not the current format. Callers that need to say WHY
+    /// it was rejected (install's messaging) keep their own read path.
+    pub fn load() -> Option<LockFile> {
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string("forest-lock.json").ok()?).ok()?;
+        if content.get("file_version").and_then(Value::as_u64) != Some(2) {
+            return None;
+        }
+        serde_json::from_value(content).ok()
+    }
+
+    /// A root dependency's entry: the one pinned at the tree root
+    /// (location "~"). Key lookup is case-insensitive like every other
+    /// package-name map.
+    pub fn root_entry(&self, name: &str) -> Option<&LockfileEntry> {
+        get_ci(&self.packages, name)?.iter().find(|e| e.location == "~")
+    }
+
+    /// The version a root dependency is pinned to.
+    pub fn pinned_version(&self, name: &str) -> Option<&str> {
+        self.root_entry(name).map(|e| e.version.as_str())
+    }
+}
+
 /// Whether the lockfile still satisfies the manifest's declared dependencies.
 /// Root deps pin their resolved version at the tree root (`location == "~"`),
 /// so each declared range is checked against that pin, and a pin whose package
@@ -64,9 +90,7 @@ pub fn lockfile_satisfies_manifest(
         let Ok(req) = semver::VersionReq::parse(&spec.version) else {
             return false;
         };
-        let Some(root_entry) = get_ci(&lockfile.packages, name)
-            .and_then(|entries| entries.iter().find(|e| e.location == "~"))
-        else {
+        let Some(root_entry) = lockfile.root_entry(name) else {
             return false;
         };
         let Ok(version) = semver::Version::parse(&root_entry.version) else {
