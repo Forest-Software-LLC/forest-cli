@@ -2,7 +2,7 @@
 //! resolution entry point, and the services every platform executor uses
 //! (CDN base, signed-URL fetch, worker-pool sizing). The actual layout /
 //! extraction / bookkeeping work is platform-owned and reached through
-//! `Platform::install` (src/platform.rs) — this module contains no
+//! `Platform::install` (src/platform.rs); this module contains no
 //! platform-specific logic.
 
 use std::collections::{HashMap, HashSet};
@@ -25,7 +25,7 @@ pub struct LockFile {
     pub file_version: u32,
     /// The manifest overrides this resolution was solved under, so adding,
     /// changing, or removing an override invalidates the lockfile. Absent
-    /// from disk when empty — pre-override lockfiles parse unchanged.
+    /// from disk when empty; pre-override lockfiles parse unchanged.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub overrides: HashMap<String, String>,
     /// Same recording for the manifest's excludes (banned version ranges).
@@ -48,7 +48,7 @@ pub fn lockfile_satisfies_manifest(
 ) -> bool {
     // The lockfile records the overrides/excludes it was solved under; any
     // drift (added, changed, or removed entry) forces re-resolution. Ranges
-    // are compared verbatim — rewriting "^2.0" to "^2.0.0" is a re-solve,
+    // are compared verbatim; rewriting "^2.0" to "^2.0.0" is a re-solve,
     // which lands on the same versions anyway.
     let maps_match = |locked: &HashMap<String, String>, declared: &HashMap<String, String>| {
         locked.len() == declared.len()
@@ -147,7 +147,7 @@ pub(crate) async fn fetch_signed_url(
     Ok(((pkg_name, version), url.to_string()))
 }
 
-/// What an install run actually did — lets callers print "up to date"
+/// What an install run actually did, which lets callers print "up to date"
 /// instead of implying work happened.
 pub struct InstallSummary {
     pub installed: usize,
@@ -158,7 +158,7 @@ pub struct InstallSummary {
 /// Materialize a lockfile on disk. Thin dispatcher: each platform owns its
 /// entire layout/extraction/bookkeeping pipeline. Takes the whole manifest
 /// (not just the platform string) because layout can depend on other
-/// manifest fields — Roblox mounts Packages/ inside the `root` dir.
+/// manifest fields; Roblox mounts Packages/ inside the `root` dir.
 pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, DepSpec>, manifest: &Value, force: bool) -> Result<InstallSummary> {
     Platform::from_manifest(manifest)?.install(lockfile, root_deps, manifest, force).await
 }
@@ -202,7 +202,7 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
     for key in &solve_report.override_unnecessary {
         msg.emit(
             MessageType::Info,
-            &format!("Override for {} is no longer needed — dependencies already resolve inside it. Remove it with `forest override {} --remove`.", key, key),
+            &format!("Override for {} is no longer needed; dependencies already resolve inside it. Remove it with `forest override {} --remove`.", key, key),
         );
     }
     for key in &solve_report.exclude_unused {
@@ -214,7 +214,7 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
     for key in &solve_report.exclude_inert {
         msg.emit(
             MessageType::Info,
-            &format!("Exclusion for {} no longer affects resolution — every range now picks an allowed version. Safe to remove with `forest exclude {} --remove`.", key, key),
+            &format!("Exclusion for {} no longer affects resolution; every range now picks an allowed version. Safe to remove with `forest exclude {} --remove`.", key, key),
         );
     }
 
@@ -257,7 +257,7 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
 
     // Surface registry license-safety ratings for anything caution/unsafe in
     // the resolved tree (direct and transitive) before files land on disk.
-    // One consolidated line — per-package details live in `forest audit`.
+    // One consolidated line; per-package details live in `forest audit`.
     if !license_warnings.is_empty() {
         let flagged: HashSet<&str> = license_warnings
             .iter()
@@ -281,7 +281,7 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
         packages: lockfile_packages
     };
 
-    // make_directories draws its own download bars — hide the spinner while
+    // make_directories draws its own download bars; hide the spinner while
     // they own the terminal, or the two draw systems leave stuck lines.
     msg.pause();
     make_directories(&lockfile, roots, forest_json, force).await
@@ -293,7 +293,7 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
 
 /// One claimed-scope rename actually applied to the local manifest.
 pub(crate) struct AppliedRename {
-    /// The rename map's key — also the key the resolution roots carry.
+    /// The rename map's key, which is also the key the resolution roots carry.
     pub rename_key: String,
     /// True when the dependency declared no explicit alias, so its install
     /// folder follows the (now canonical) package name.
@@ -304,7 +304,7 @@ pub(crate) struct AppliedRename {
 /// Persist claimed-scope renames into the manifest in the current directory
 /// (every command chdirs to the manifest dir before resolving). Reads the
 /// file fresh so only the dependency keys change. Keys the local manifest
-/// doesn't declare are skipped without error — under UEFN the resolution
+/// doesn't declare are skipped without error; under UEFN the resolution
 /// roots span other workspace manifests.
 fn rewrite_manifest_renames(renames: &HashMap<String, String>) -> Result<Vec<AppliedRename>> {
     let path = "forest.json";
@@ -325,7 +325,7 @@ fn rewrite_manifest_renames(renames: &HashMap<String, String>) -> Result<Vec<App
 /// A dependency without an explicit alias deliberately follows the canonical
 /// name after the rename: wally-era code requires the wally ALIAS (the
 /// wally.toml key, e.g. `AnimNation`), which is the casing the claimed
-/// native package carries — the old mirrored key's lowercase name was never
+/// native package carries; the old mirrored key's lowercase name was never
 /// what that code referenced. An explicitly declared alias always survives
 /// untouched.
 pub(crate) fn canonicalize_manifest_deps(
@@ -343,7 +343,7 @@ pub(crate) fn canonicalize_manifest_deps(
             continue;
         };
         if deps.keys().any(|k| *k != manifest_key && k.eq_ignore_ascii_case(canonical)) {
-            // Both names are declared — the canonical entry already wins at
+            // Both names are declared; the canonical entry already wins at
             // install time; merging two version ranges is the user's call.
             continue;
         }
@@ -537,7 +537,7 @@ mod tests {
         // The claimed-scope shape that surfaced this: wally's lowercase
         // mirror name becomes the natively-cased name on claim. Wally-era
         // code requires the wally ALIAS (`AnimNation`), which the canonical
-        // name matches — the dep stays a plain string and the install
+        // name matches; the dep stays a plain string and the install
         // folder follows the new key's default.
         let mut manifest = json!({
             "dependencies": { "michaeldougal/animnation": "^1.11.0" }

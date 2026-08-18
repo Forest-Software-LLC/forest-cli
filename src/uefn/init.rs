@@ -63,7 +63,7 @@ fn infer_uefn_target(cwd: &Path) -> UefnInitTarget {
 pub async fn init(cwd: &Path, mode: InitMode) -> Result<()> {
     // Project mode skips the position triage entirely: it must produce the
     // bare project manifest without prompts or login, even when run from
-    // inside the mount (install's create-on-install path calls this — the
+    // inside the mount (install's create-on-install path calls this; the
     // triage's NewPackage arm would otherwise demand a login and prompt in
     // the middle of an install).
     let target = if matches!(mode, InitMode::Project { .. }) {

@@ -1,7 +1,7 @@
 //! Roblox `forest init` scaffolds. Package mode (the default) starts
 //! development on a new package: name + root prompts, a starter root module,
 //! `root` written into forest.json, and the Packages mount created INSIDE
-//! the root dir (e.g. `src/Packages/`) — the same place a consumer's install
+//! the root dir (e.g. `src/Packages/`), the same place a consumer's install
 //! puts a package's deps, so `script.Packages.X` requires work identically
 //! in development and when installed. Project mode (`--project`, and
 //! install's create-on-install path) writes the bare consuming manifest.
@@ -225,14 +225,14 @@ fn default_root(cwd: &Path) -> String {
     "src/init.luau".to_string()
 }
 
-/// Forward slashes, no leading `./` — the form `root` is stored in.
+/// Forward slashes, no leading `./`; the form `root` is stored in.
 fn normalize_root(input: &str) -> String {
     let normalized = input.trim().replace('\\', "/");
     normalized.strip_prefix("./").unwrap_or(&normalized).to_string()
 }
 
 /// Root-prompt rule: a relative `.luau`/`.lua` path inside the package.
-/// Existence is NOT required — init creates the file.
+/// Existence is NOT required; init creates the file.
 fn validate_root(input: &str) -> std::result::Result<(), String> {
     let normalized = normalize_root(input);
     if normalized.is_empty() {

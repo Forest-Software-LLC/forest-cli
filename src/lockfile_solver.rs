@@ -48,7 +48,7 @@ fn version_list_path(scope: &str, pkg_name: &str, platform: &str) -> String {
 /// Fire the version-list request for a package the moment its name is known,
 /// instead of when the BFS gets around to it. The BFS awaits the memoized
 /// handle at exactly the point it used to issue the request, so processing
-/// order — and therefore bucket merging and the resulting lockfile — is
+/// order (and therefore bucket merging and the resulting lockfile) is
 /// unchanged; only the network wait overlaps.
 fn spawn_version_list_fetch(
     scope: String,
@@ -209,22 +209,22 @@ pub struct SolveReport {
     pub override_edges: usize,
     /// Overrides that matched no edge in the resolved graph.
     pub override_unused: Vec<String>,
-    /// Overrides every rewritten edge would satisfy naturally — removing
+    /// Overrides every rewritten edge would satisfy naturally; removing
     /// them would not change the resolution.
     pub override_unnecessary: Vec<String>,
     /// Excludes whose package never appeared in the graph.
     pub exclude_unused: Vec<String>,
-    /// Excludes that removed nothing any range would have picked — natural
+    /// Excludes that removed nothing any range would have picked; natural
     /// resolution already lands outside the banned set.
     pub exclude_inert: Vec<String>,
 }
 
 /// Resolves the dependency graph. Also returns license-safety issues for any
-/// resolved version the registry rated caution/unsafe — each version is fetched
+/// resolved version the registry rated caution/unsafe; each version is fetched
 /// exactly once, so issues are naturally deduplicated. The final map records
 /// root manifest keys whose registry identity is a different package name
 /// entirely (claimed/renamed scopes, e.g. a wally scope claimed under a new
-/// username) — casing-only differences are not renames.
+/// username); casing-only differences are not renames.
 ///
 /// `use_meta_cache: false` (install --force) resolves everything from the
 /// network. When the cache IS used and its confirmation pass finds a stale
@@ -268,7 +268,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
 
     // Excludes ban versions outright: they are filtered from the candidate
     // set wherever versions are matched, for roots and transitive deps
-    // alike, so declared ranges are still honored — or resolution fails
+    // alike, so declared ranges are still honored; or resolution fails
     // naming the exclusion. An unparseable exclude range is a hard error,
     // same as an unparseable dependency range.
     let mut excludes_lc: HashMap<String, VersionReq> = HashMap::new();
@@ -290,7 +290,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
 
     // Version lists are fetched eagerly as names are discovered (roots now,
     // deps as their parents resolve) and awaited at the same point the BFS
-    // always fetched them — see spawn_version_list_fetch.
+    // always fetched them; see spawn_version_list_fetch.
     let limiter = Arc::new(tokio::sync::Semaphore::new(PREFETCH_CONCURRENCY));
     let mut list_prefetch: HashMap<String, VersionListHandle> = HashMap::new();
     for (name, _, _) in &queue {
@@ -337,8 +337,8 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
                 ))?;
             }
 
-            // The response carries the canonical (stored) casing — what the
-            // lockfile keys are written as. Fall back to the casing we
+            // The response carries the canonical (stored) casing, which is
+            // what the lockfile keys are written as. Fall back to the casing we
             // queried with if a response ever lacks the fields.
             let canonical = match (
                 version_data.get("scope").and_then(|v| v.as_str()),
@@ -536,7 +536,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
                         .to_string();
                     // An alias is present only when the publisher declared one.
                     // Aliases containing '/' are full-key fabrications from
-                    // older publishes (`alias: "<scope>/<name>"`) — never a
+                    // older publishes (`alias: "<scope>/<name>"`), never a
                     // real folder name; treat them as unset.
                     let alias = obj.get("alias")
                         .and_then(|x| x.as_str())
@@ -670,7 +670,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
         }
     }
 
-    // 2) Build lockfile entries — keyed by the canonical casing, while dep
+    // 2) Build lockfile entries; keyed by the canonical casing, while dep
     // keys (verbatim from publishers' recorded manifests) are looked up
     // through their lowercased form. Every dep was queued and fetched, so
     // every lookup hits.
@@ -746,7 +746,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
 
     for (name, dep_spec) in &root_deps {
         // Manifest keys may carry non-canonical casing (hand-edited or
-        // pre-canonicalization installs) — the lowercased key still hits.
+        // pre-canonicalization installs); the lowercased key still hits.
         if let Some(state) = resolved.get(&name.to_lowercase()) {
             if !state.canonical.eq_ignore_ascii_case(name) {
                 root_renames.insert(name.clone(), state.canonical.clone());
@@ -829,7 +829,7 @@ fn version_excluded(exclude_req: Option<&VersionReq>, v: &str) -> bool {
     }
 }
 
-/// True when no requested range would naturally pick a banned version —
+/// True when no requested range would naturally pick a banned version:
 /// the exclusion currently changes nothing (a newer allowed version now
 /// outranks the banned ones everywhere).
 fn exclusion_is_inert(available: &[Version], ranges: &[String], exclude_req: &VersionReq) -> bool {
@@ -846,7 +846,7 @@ fn exclusion_is_inert(available: &[Version], ranges: &[String], exclude_req: &Ve
 }
 
 /// True when every declared range the override replaced would naturally
-/// resolve to a version the override also accepts — removing the override
+/// resolve to a version the override also accepts; removing the override
 /// would not change any edge it rewrote. A declared range matching nothing
 /// keeps the override load-bearing.
 fn override_is_unnecessary(available: &[Version], declared_ranges: &[String], override_req: &VersionReq) -> bool {
@@ -967,7 +967,7 @@ mod tests {
 
     #[test]
     fn exclusion_active_while_a_banned_version_is_the_natural_pick() {
-        // ^1.5.0 would naturally take 1.6.0 — the exclusion is doing work.
+        // ^1.5.0 would naturally take 1.6.0; the exclusion is doing work.
         let avail = versions(&["1.5.2", "1.6.0"]);
         assert!(!exclusion_is_inert(
             &avail,
@@ -1033,7 +1033,7 @@ mod tests {
             ]
         }));
 
-        // The already-resolved entry is untouched — a fresh list must never
+        // The already-resolved entry is untouched; a fresh list must never
         // rewrite state the BFS already consumed.
         assert_eq!(state.versions["1.0.0"].integrity, "kept");
         assert!(state.versions["1.0.0"].prefetched.is_none());

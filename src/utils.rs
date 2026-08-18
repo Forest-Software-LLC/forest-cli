@@ -20,7 +20,7 @@ pub fn digest_package_name(name : &str) -> PackageName {
     PackageName { name: parts[1].to_string(), scope: parts[0].to_string(), full_name: name.to_string() }
 }
 
-/// Lowercase hex SHA-256 — the format lockfile integrity hashes use.
+/// Lowercase hex SHA-256, the format lockfile integrity hashes use.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -140,7 +140,7 @@ pub fn normalize_forest_overrides(forest_json: &Value) -> HashMap<String, String
 /// versions that must never be installed. Unlike overrides, exclusions
 /// apply uniformly to direct and transitive deps: the solver just removes
 /// the banned versions from the candidate set, so every declared range is
-/// still honored — or resolution fails loudly when a range has no
+/// still honored; or resolution fails loudly when a range has no
 /// non-excluded version left.
 pub fn normalize_forest_excludes(forest_json: &Value) -> HashMap<String, String> {
     string_map_field(forest_json, "excludes")

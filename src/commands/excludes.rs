@@ -22,7 +22,7 @@ struct ExcludeCheck {
 
 /// Manage version exclusions: ban a range of a package's versions from ever
 /// being installed, recorded under `excludes` in forest.json. Applies
-/// uniformly to direct and transitive dependencies — the solver drops the
+/// uniformly to direct and transitive dependencies; the solver drops the
 /// banned versions from the candidate set, so every declared range is still
 /// honored (or resolution fails loudly, naming the exclusion). With no
 /// package argument, lists the declared exclusions.
@@ -79,7 +79,7 @@ pub async fn exclude_command(
         .ok_or_else(|| anyhow::anyhow!("Missing platform in forest.json"))?
         .to_string();
 
-    // Unlike overrides, direct deps are fair game — "never install 1.6.0"
+    // Unlike overrides, direct deps are fair game; "never install 1.6.0"
     // is a fact about the package, not about who depends on it. Resolution
     // order: existing exclusion key, declared root key, typed scope/name,
     // unique bare name in the lockfile.
@@ -247,7 +247,7 @@ fn validate_exclude_range(
     }
     if banned.len() == versions.len() {
         return Err(format!(
-            "{} bans every published version of {} — the package could never be installed.",
+            "{} bans every published version of {}; the package could never be installed.",
             range, pkg
         ));
     }
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn banning_nothing_or_everything_is_rejected() {
         let avail = versions(&["1.5.2", "1.6.0"]);
-        // "1.6.0" as a bare range means ^1.6.0 in semver — still valid here,
+        // "1.6.0" as a bare range means ^1.6.0 in semver; still valid here,
         // but a range matching zero published versions is a typo.
         assert!(validate_exclude_range("=9.9.9", &avail, "s/p").is_err());
         assert!(validate_exclude_range(">=0.0.0", &avail, "s/p").is_err());

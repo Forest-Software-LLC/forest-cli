@@ -181,7 +181,7 @@ pub(crate) mod test_util {
     }
 
     /// Like make_tgz_with, but writes the entry name bytes directly into the
-    /// header so traversal paths bypass tar::Builder's own validation — the
+    /// header so traversal paths bypass tar::Builder's own validation; the
     /// shape a malicious archive would actually take.
     pub(crate) fn make_tgz_with_raw_names(entries: &[(&str, &str)]) -> Vec<u8> {
         let mut tar_bytes = Vec::new();
