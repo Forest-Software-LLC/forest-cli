@@ -49,7 +49,7 @@ pub async fn link_command(path: Option<String>, list: bool) -> Result<()> {
     let target = Path::new(&path);
     let target_manifest_path = target.join("forest.json");
     if !target.is_dir() {
-        fail(&format!("{} is not a directory.", target.display()));
+        fail(&format!("{} is not a directory.{}", target.display(), backslash_hint(&path)));
         return Ok(());
     }
     if !target_manifest_path.is_file() {
@@ -159,6 +159,25 @@ pub async fn link_command(path: Option<String>, list: bool) -> Result<()> {
     Ok(())
 }
 
+/// A follow-up hint when `path` looks like a Windows path whose backslashes
+/// were eaten by a POSIX shell: a drive-letter prefix with no separator
+/// anywhere after it ("C:UsersthereDocuments..."). Unquoted `C:\Users\...`
+/// in Git Bash delivers exactly that, because bash treats each backslash as
+/// an escape character. Empty when the path doesn't match the shape.
+fn backslash_hint(path: &str) -> &'static str {
+    let bytes = path.as_bytes();
+    let stripped = bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && !path[2..].contains('/')
+        && !path[2..].contains('\\');
+    if stripped {
+        " Your shell likely removed the backslashes (Git Bash does this to unquoted Windows paths); quote the path or use forward slashes, e.g. C:/Users/..."
+    } else {
+        ""
+    }
+}
+
 /// Count Script/LocalScript sources in the linked root dir; a registry
 /// install would have scrubbed these.
 fn warn_on_runnable_scripts(target: &Path, linked_manifest: &Value) {
@@ -216,7 +235,11 @@ pub async fn unlink_command(reference: Option<String>, all: bool) -> Result<()> 
         match links::remove_link(Path::new("."), &reference)? {
             Some(key) => stored.into_iter().filter(|l| l.name == key).collect(),
             None => {
-                info(&format!("No active link matches {}; nothing to do.", reference));
+                info(&format!(
+                    "No active link matches {}; nothing to do.{}",
+                    reference,
+                    backslash_hint(&reference)
+                ));
                 return Ok(());
             }
         }
@@ -364,5 +387,27 @@ fn print_links_list(manifest: &Value) {
                 println!("    dependency drift: {}", diff);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backslash_hint_fires_only_on_the_stripped_shape() {
+        // Unquoted C:\Users\... through Git Bash arrives with every
+        // backslash removed.
+        assert!(!backslash_hint("C:UsersthereDocumentsGitHubvaultSharedCleaner").is_empty());
+        assert!(!backslash_hint("d:projectspkg").is_empty());
+
+        // Real paths, relative or absolute, any separator: no hint.
+        assert!(backslash_hint(r"C:\Users\me\pkg").is_empty());
+        assert!(backslash_hint("C:/Users/me/pkg").is_empty());
+        assert!(backslash_hint("../knit-dev").is_empty());
+        assert!(backslash_hint("pkg").is_empty());
+        assert!(backslash_hint("/c/Users/me/pkg").is_empty());
+        // Bare drive roots are too short to judge.
+        assert!(backslash_hint("C:").is_empty());
     }
 }
