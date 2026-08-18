@@ -21,12 +21,247 @@ use crate::roblox::extract::fetch_and_extract;
 use crate::roblox::plan::plan_install;
 use crate::roblox::PACKAGES_DIR;
 
+/// Deleting dirs inside the mount crashes a live `rojo serve`:
+/// remove_dir_all deletes children before their parent, and Rojo's change
+/// processor canonicalizes each removed path's parent, so a child event
+/// processed after the parent is gone panics the server (rojo 7.7.0
+/// src/change_processor.rs:179). The bin renames each doomed dir out of the
+/// mount instead — one atomic event with a live parent — and the real
+/// deletion happens in `.forest-trash`, which no normal Rojo project watches.
+struct TrashBin {
+    dir: PathBuf,
+    counter: u64,
+    created: bool,
+}
+
+impl TrashBin {
+    /// `dir` should sit next to forest.json: same volume as the mount (so
+    /// rename never degrades to copy+delete) and outside the watched tree.
+    /// A leftover bin from a crashed run is swept here.
+    fn new(dir: PathBuf) -> Self {
+        if dir.exists() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        TrashBin { dir, counter: 0, created: false }
+    }
+
+    /// Move `path` into the bin. The rename is retried hard: a watcher
+    /// re-snapshotting the tree holds file handles inside it, and Windows
+    /// denies renaming a dir with open children. Only if it never succeeds
+    /// does this fall back to deleting in place — the old behavior, at the
+    /// cost of the Rojo-crash risk.
+    fn remove_dir_all(&mut self, path: &Path) -> std::io::Result<()> {
+        if !self.created {
+            fs::create_dir_all(&self.dir)?;
+            self.created = true;
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let target = self.dir.join(format!("{}-{}-{}", std::process::id(), self.counter, name));
+        self.counter += 1;
+        let mut result = Ok(());
+        for attempt in 0..20 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            result = fs::rename(path, &target);
+            if result.is_ok() {
+                return result;
+            }
+        }
+        result.or_else(|_| fs::remove_dir_all(path))
+    }
+}
+
+impl Drop for TrashBin {
+    /// Best effort on every exit path; a failure is swept by the next run.
+    fn drop(&mut self) {
+        if self.created {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// Staging ground for extraction: tarballs unpack OUTSIDE the mount, then
+/// each completed package dir is renamed into place as one atomic event.
+/// Extracting in place would stream hundreds of per-file create events to a
+/// live `rojo serve`; its processor canonicalizes each event path, so a path
+/// removed again before its event is processed (fast install-then-remove
+/// sequences) panics the server, and the flood itself lags the queue enough
+/// to widen that window (rojo 7.7.0 src/change_processor.rs:172).
+struct StagingArea {
+    dir: PathBuf,
+    created: bool,
+}
+
+impl StagingArea {
+    /// Same placement rules as TrashBin: next to forest.json, swept here.
+    fn new(dir: PathBuf) -> Self {
+        if dir.exists() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        StagingArea { dir, created: false }
+    }
+
+    /// Fresh unique dir for one package's extraction.
+    fn alloc(&mut self, idx: usize) -> std::io::Result<PathBuf> {
+        let p = self.dir.join(format!("{}-{}", std::process::id(), idx));
+        fs::create_dir_all(&p)?;
+        self.created = true;
+        Ok(p)
+    }
+}
+
+impl Drop for StagingArea {
+    /// Best effort on every exit path; a failure is swept by the next run.
+    fn drop(&mut self) {
+        if self.created {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// Where the trash + staging dirs live. The system temp dir is preferred:
+/// rojo's project watch is recursive over the whole project root (notify
+/// re-keys pending staging events onto final mount paths when a staged unit
+/// renames in), so scratch space inside the project still leaks watcher
+/// events — temp space leaks none. Temp is only usable when it shares a
+/// volume with the project (renames must move, never copy); otherwise both
+/// dirs fall back to dot-named siblings of forest.json.
+struct ScratchDirs {
+    trash: PathBuf,
+    staging: PathBuf,
+}
+
+fn scratch_dirs() -> ScratchDirs {
+    let temp = std::env::temp_dir().join("forest-scratch");
+    if same_volume(Path::new("."), &std::env::temp_dir()) {
+        let pid = std::process::id();
+        ScratchDirs {
+            trash: temp.join(format!("{}-trash", pid)),
+            staging: temp.join(format!("{}-stage", pid)),
+        }
+    } else {
+        ScratchDirs {
+            trash: PathBuf::from(".forest-trash"),
+            staging: PathBuf::from(".forest-staging"),
+        }
+    }
+}
+
+/// Same-volume check WITHOUT writing anywhere: a rename probe inside the
+/// project would itself be a create-then-remove event for the watcher.
+#[cfg(windows)]
+fn same_volume(a: &Path, b: &Path) -> bool {
+    fn root(p: &Path) -> Option<std::ffi::OsString> {
+        let canon = fs::canonicalize(p).ok()?;
+        match canon.components().next()? {
+            std::path::Component::Prefix(pre) => {
+                Some(pre.as_os_str().to_ascii_uppercase())
+            }
+            _ => None,
+        }
+    }
+    matches!((root(a), root(b)), (Some(x), Some(y)) if x == y)
+}
+
+#[cfg(not(windows))]
+fn same_volume(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev(),
+        _ => false,
+    }
+}
+
+/// A live `rojo serve` may still be draining events from a forest run that
+/// JUST finished: its watcher emits a rescan event per directory of a
+/// renamed-in tree, each costing a subtree re-snapshot, and its change
+/// processor resolves every queued path against the live filesystem —
+/// mutating the mount again before the queue drains crashes it. The
+/// lockfile's mtime marks the end of the last mutating run; when it is
+/// fresh AND a rojo is actually serving from this directory, hold off until
+/// it is comfortably old. Normal one-command usage never waits, and neither
+/// do chains with no rojo attached (the probe fails fast). FOREST_NO_SETTLE=1
+/// skips even the probe.
+fn settle_watchers() {
+    // Margin, not load-bearing: the rapid-cycle bench passes with the wait
+    // disabled outright. A knit-sized tree takes a connected rojo ~2s to
+    // ingest; 3s covers that while keeping chained installs snappy.
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+    if std::env::var("FOREST_NO_SETTLE").as_deref() == Ok("1") {
+        return;
+    }
+    let Ok(meta) = fs::metadata("forest-lock.json") else { return };
+    let Ok(modified) = meta.modified() else { return };
+    let Ok(age) = modified.elapsed() else { return };
+    if age >= SETTLE {
+        return;
+    }
+    if !rojo_is_serving() {
+        return;
+    }
+    std::thread::sleep(SETTLE - age);
+}
+
+/// Is a rojo dev server plausibly serving this project? Checks the port in
+/// default.project.json's `servePort` (when present) and rojo's default
+/// 34872. Raw TCP: the probe runs on the async runtime's thread, where a
+/// blocking HTTP client can't be constructed.
+fn rojo_is_serving() -> bool {
+    let mut ports = vec![34872u16];
+    if let Ok(text) = fs::read_to_string("default.project.json") {
+        if let Ok(project) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(port) = project.get("servePort").and_then(|p| p.as_u64()) {
+                ports.insert(0, port as u16);
+            }
+        }
+    }
+    ports.dedup();
+    ports.iter().any(|&port| probe_rojo_port(port))
+}
+
+fn probe_rojo_port(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let timeout = std::time::Duration::from_millis(250);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let request = format!("GET /api/rojo HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 256];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+        _ => false,
+    }
+}
+
+/// Windows can transiently deny a dir rename (indexer or AV holding a child
+/// open); a few short retries ride that out.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.expect("at least one rename attempt"))
+}
+
 /// One tarball to download + extract, queued to the bounded worker pool.
 struct DownloadJob {
     url: String,
     name: String,
     version: String,
     integrity: String,
+    /// Staging dir the tarball extracts into (renamed into the mount later).
     dir: PathBuf,
     root: String,
     /// The package's own nested container name, recorded in its receipt.
@@ -59,6 +294,18 @@ pub async fn make_directories_roblox(
     let container = crate::roblox::packages_container(manifest);
     let plan = plan_install(lockfile, &root_deps, &container)?;
     let base = crate::roblox::packages_base(manifest);
+
+    // All mount deletions below go through the bin (see TrashBin) so a live
+    // `rojo serve` never sees a child removal under an already-gone parent.
+    let ScratchDirs { trash: trash_dir, staging: staging_dir } = scratch_dirs();
+    let mut trash = TrashBin::new(trash_dir);
+    // Leftover project-local dirs from an older run (or the fallback mode of
+    // a crashed one) are swept regardless of where this run's scratch lives.
+    for leftover in [".forest-trash", ".forest-staging"] {
+        if Path::new(leftover).exists() {
+            let _ = fs::remove_dir_all(leftover);
+        }
+    }
 
     // A renamed `packagesDir` or a root move within the same parent leaves
     // the old tree behind. Receipts prove which leftovers are forest's and
@@ -103,32 +350,45 @@ pub async fn make_directories_roblox(
     let rec = crate::roblox::receipts::reconcile(&plan, &tree);
     let (to_install, kept, stale_dirs) = (rec.to_install, rec.kept, rec.stale_dirs);
 
+    if !to_install.is_empty() || !stale_dirs.is_empty() {
+        settle_watchers();
+    }
+
     // Stale dirs go FIRST: on case-insensitive filesystems (Windows/macOS) a
     // renamed alias's old dir would otherwise delete the freshly extracted
     // new one. exists() guard: children of already-deleted parents are gone.
     for dir in &stale_dirs {
         let p = crate::roblox::physical_path(&base, &container, dir);
         if p.exists() {
-            fs::remove_dir_all(&p).with_context(|| format!("Failed to remove stale {}", dir))?;
+            trash.remove_dir_all(&p).with_context(|| format!("Failed to remove stale {}", dir))?;
         }
     }
 
     // The top level of the mount stays fully managed: any non-exempt dir that
     // isn't a desired root alias is junk or a pre-receipt leftover. (This is
     // also what clears old trees on --force and first-run-after-upgrade.)
-    prune_top_level(&plan, &base, &container)?;
+    prune_top_level(&plan, &base, &container, &mut trash)?;
 
     // A reinstall target may hold old content (integrity/root changed) —
-    // clear it before extraction.
-    for &i in &to_install {
+    // clear it before extraction. Parents first: renaming a parent out takes
+    // its nested targets with it (the exists() check skips them), so each
+    // cleared unit emits ONE watcher event instead of one per nesting level
+    // (out-of-order delivery of the deep ones crashes a live rojo).
+    let mut clear_order = to_install.clone();
+    clear_order.sort_by_key(|&i| plan.packages[i].path.len());
+    for &i in &clear_order {
         let target = crate::roblox::physical_path(&base, &container, &plan.packages[i].path);
         if target.exists() {
-            fs::remove_dir_all(&target)
+            trash.remove_dir_all(&target)
                 .with_context(|| format!("Failed to clear {}", plan.packages[i].path))?;
         }
     }
 
     let tarball_cache = TarballCache::open_default();
+
+    // Pointer dirs written into a staged unit below, skipped by the in-place
+    // pointer pass at the end.
+    let mut staged_pointers: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Private tarballs sit behind the CDN worker's HMAC gate and their signed
     // URLs expire in minutes, so they are never stored in the lockfile. Fetch a
@@ -206,13 +466,15 @@ pub async fn make_directories_roblox(
         // set_message calls make the counter run backwards.
         let downloaded = Arc::new(Mutex::new(0u64));
 
+        let mut staging = StagingArea::new(staging_dir);
         let mut jobs: Vec<DownloadJob> = Vec::new();
+        // (plan path, staged dir, final dir) for the rename-in phase.
+        let mut placements: Vec<(String, PathBuf, PathBuf)> = Vec::new();
         for &i in &to_install {
             let pkg = &plan.packages[i];
             let dir_path = crate::roblox::physical_path(&base, &container, &pkg.path);
-            if !dir_path.exists() {
-                fs::create_dir_all(&dir_path)?;
-            }
+            let stage = staging.alloc(i)?;
+            placements.push((pkg.path.clone(), stage.clone(), dir_path));
 
             // Public tarballs are content-addressed: the integrity hash IS the
             // path, so a lockfile can't point the CLI anywhere else.
@@ -232,7 +494,7 @@ pub async fn make_directories_roblox(
                 name: pkg.name.clone(),
                 version: pkg.version.clone(),
                 integrity: pkg.integrity.clone(),
-                dir: dir_path,
+                dir: stage,
                 root: pkg.root.clone(),
                 container: pkg.packages_dir.clone(),
             });
@@ -262,9 +524,9 @@ pub async fn make_directories_roblox(
                 loop {
                     let job = queue.lock().expect("job queue poisoned").pop();
                     let Some(job) = job else { break };
-                    // The receipt is written only after ITS dir extracted
-                    // successfully — per-package atomicity: a dir without a
-                    // receipt (crash, partial extract) is never trusted.
+                    // The receipt is written into the staged dir after its
+                    // extraction succeeds, so what renames into the mount is
+                    // always a complete, receipted package.
                     let result = fetch_and_extract(
                         &job.url,
                         &job.integrity,
@@ -300,14 +562,75 @@ pub async fn make_directories_roblox(
         total_bar.finish_and_clear();
         let pool_err = first_err.lock().expect("error slot poisoned").take();
         if let Some(e) = pool_err {
+            // Nothing landed in the mount; staged dirs vanish with `staging`.
+            // The tarball cache makes the retry's redownloads free.
             return Err(e);
+        }
+
+        // Assemble nested packages inside their installing ancestor's staged
+        // dir, deepest first so a package's own children are in place before
+        // it moves. Whatever has no installing ancestor renames into the
+        // mount afterwards — each such unit arrives complete (nested deps,
+        // pointers, receipts) in ONE atomic event.
+        placements.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.len()));
+        let mut mount_moves: Vec<usize> = Vec::new();
+        for i in 0..placements.len() {
+            let (path, stage, _) = placements[i].clone();
+            let ancestor = placements
+                .iter()
+                .filter(|(a, _, _)| path.starts_with(&format!("{}/", a)))
+                .max_by_key(|(a, _, _)| a.len());
+            match ancestor {
+                Some((a_path, a_stage, _)) => {
+                    let target = a_stage.join(Path::new(&path[a_path.len() + 1..]));
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    rename_with_retry(&stage, &target)
+                        .with_context(|| format!("Failed to assemble {}", path))?;
+                }
+                None => mount_moves.push(i),
+            }
+        }
+
+        // Pointer files inside a staged unit are part of the unit.
+        for pointer in &plan.pointers {
+            let topmost = placements
+                .iter()
+                .filter(|(a, _, _)| pointer.dir.starts_with(&format!("{}/", a)))
+                .min_by_key(|(a, _, _)| a.len());
+            if let Some((a_path, a_stage, _)) = topmost {
+                let target = a_stage.join(Path::new(&pointer.dir[a_path.len() + 1..]));
+                write_pointer(&target, &pointer.init_lua, &mut trash)?;
+                staged_pointers.insert(pointer.dir.clone());
+            }
+        }
+
+        // Patch link files while the unit is still staged: the writes never
+        // become watcher events. Links whose chains leave the unit resolve in
+        // the in-mount pass at the end instead.
+        for &i in &mount_moves {
+            crate::roblox::type_link::relink_types_staged(&placements[i].1);
+        }
+
+        for &i in &mount_moves {
+            let (path, stage, dest) = &placements[i];
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            rename_with_retry(stage, dest)
+                .with_context(|| format!("Failed to move {} into place", path))?;
         }
     }
 
-    // Pointer files are always regenerated: a few tiny idempotent writes,
-    // self-healing, and immune to hoist-layout drift.
+    // Remaining pointer files (dirs under kept packages, or at the mount top
+    // level) are regenerated in place: tiny idempotent writes, self-healing,
+    // and immune to hoist-layout drift.
     for pointer in &plan.pointers {
-        write_pointer(&crate::roblox::physical_path(&base, &container, &pointer.dir), &pointer.init_lua)?;
+        if staged_pointers.contains(&pointer.dir) {
+            continue;
+        }
+        write_pointer(&crate::roblox::physical_path(&base, &container, &pointer.dir), &pointer.init_lua, &mut trash)?;
     }
 
     // Luau doesn't carry `export type` through `return require(...)`, so we re-export the types
@@ -323,9 +646,9 @@ pub async fn make_directories_roblox(
 /// the real package were still inside it, and a leftover init.luau root
 /// module would shadow the generated init.lua. The receipt marks exactly that
 /// case, so wipe the dir when one is present.
-fn write_pointer(target_dir: &Path, init_lua: &str) -> Result<()> {
+fn write_pointer(target_dir: &Path, init_lua: &str, trash: &mut TrashBin) -> Result<()> {
     if target_dir.join(receipts::RECEIPT_FILE).exists() {
-        fs::remove_dir_all(target_dir)
+        trash.remove_dir_all(target_dir)
             .with_context(|| format!("Failed to clear former package dir {}", target_dir.display()))?;
     }
     if !target_dir.exists() {
@@ -358,7 +681,7 @@ fn write_pointer(target_dir: &Path, init_lua: &str) -> Result<()> {
 /// paths stay in the virtual `./<container>/...` format. `container` must be
 /// the one the plan was built with, or every plan path gets stripped from
 /// `desired` and the whole mount is deleted.
-fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, container: &str) -> Result<()> {
+fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, container: &str, trash: &mut TrashBin) -> Result<()> {
     let prefix = format!("./{}/", container);
     let desired: std::collections::HashSet<String> = plan.packages.iter()
         .filter_map(|p| {
@@ -374,7 +697,7 @@ fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, containe
             continue;
         }
         if entry.file_type()?.is_dir() && !desired.contains(&name.to_ascii_lowercase()) {
-            fs::remove_dir_all(entry.path())?;
+            trash.remove_dir_all(&entry.path())?;
         }
     }
     Ok(())
@@ -409,6 +732,11 @@ fn find_abandoned_mounts(manifest_dir: &Path, base: &str) -> Vec<String> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
+            // `_`/`.` entries are exempt like everywhere else (and a
+            // `.forest-trash` left by a crashed run holds receipts).
+            if name.starts_with('_') || name.starts_with('.') {
+                continue;
+            }
             let rel = if parent.is_empty() {
                 name
             } else {
@@ -441,6 +769,11 @@ mod tests {
     use super::*;
     use crate::roblox::plan::{InstallPlan, PlannedPackage};
 
+    /// TrashBin pointed at a unique temp dir so tests never touch the cwd.
+    fn test_trash(tag: &str) -> TrashBin {
+        TrashBin::new(std::env::temp_dir().join(format!("forest-trash-test-{}-{}", tag, std::process::id())))
+    }
+
     #[test]
     fn write_pointer_wipes_a_former_package_dir() {
         // The dep was physical here last install, then got hoisted. Its old
@@ -460,7 +793,7 @@ mod tests {
         fs::write(dir.join("Helper.luau"), "return {}").unwrap();
 
         let init_lua = "--Pointer file generated by Forest Package Manager.\nreturn require(script.Parent.Parent.Parent['X'])";
-        write_pointer(&dir, init_lua).unwrap();
+        write_pointer(&dir, init_lua, &mut test_trash("wipe")).unwrap();
 
         assert!(!dir.join("init.luau").exists(), "old root module would shadow the pointer");
         assert!(!dir.join("Helper.luau").exists());
@@ -476,7 +809,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("init.lua"), "--Pointer file generated by Forest Package Manager.\nold").unwrap();
 
-        write_pointer(&dir, "--Pointer file generated by Forest Package Manager.\nnew").unwrap();
+        write_pointer(&dir, "--Pointer file generated by Forest Package Manager.\nnew", &mut test_trash("regen")).unwrap();
 
         assert!(fs::read_to_string(dir.join("init.lua")).unwrap().ends_with("new"));
         let _ = fs::remove_dir_all(&dir);
@@ -494,7 +827,7 @@ mod tests {
         fs::write(dir.join("init.lua"), patched).unwrap();
 
         let plain = "--Pointer file generated by Forest Package Manager.\nreturn require(script.Parent.Parent.Parent['X'])";
-        write_pointer(&dir, plain).unwrap();
+        write_pointer(&dir, plain, &mut test_trash("keep")).unwrap();
 
         assert_eq!(
             fs::read_to_string(dir.join("init.lua")).unwrap(),
@@ -504,7 +837,7 @@ mod tests {
 
         // A different target is a real change and must still rewrite.
         let moved = "--Pointer file generated by Forest Package Manager.\nreturn require(script.Parent.Parent['Elsewhere'])";
-        write_pointer(&dir, moved).unwrap();
+        write_pointer(&dir, moved, &mut test_trash("keep2")).unwrap();
         assert_eq!(fs::read_to_string(dir.join("init.lua")).unwrap(), moved);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -533,7 +866,7 @@ mod tests {
             pointers: vec![],
         };
 
-        prune_top_level(&plan, &mount.to_string_lossy(), "Packages").unwrap();
+        prune_top_level(&plan, &mount.to_string_lossy(), "Packages", &mut test_trash("prune")).unwrap();
 
         assert!(mount.join("Knit").exists(), "desired alias survives");
         assert!(!mount.join("Junk").exists(), "junk under the nested mount is pruned");
@@ -566,7 +899,7 @@ mod tests {
             pointers: vec![],
         };
 
-        prune_top_level(&plan, &mount.to_string_lossy(), "roblox_packages").unwrap();
+        prune_top_level(&plan, &mount.to_string_lossy(), "roblox_packages", &mut test_trash("prune-renamed")).unwrap();
 
         assert!(mount.join("Knit").exists(), "desired alias survives under the renamed mount");
         assert!(!mount.join("Junk").exists(), "junk is still pruned");
