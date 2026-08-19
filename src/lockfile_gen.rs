@@ -236,6 +236,20 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
             &format!("Exclusion for {} no longer affects resolution; every range now picks an allowed version. Safe to remove with `forest exclude {} --remove`.", key, key),
         );
     }
+    // Archived packages keep installing; the registry just marks them so
+    // consumers know maintenance stopped. One consolidated line, same shape
+    // as the license warning below; per-package details live in `forest audit`.
+    if !solve_report.archived.is_empty() {
+        let count = solve_report.archived.len();
+        msg.emit(
+            MessageType::Warn,
+            &format!(
+                "{} package{} no longer maintained. Run `forest audit` to view.",
+                count,
+                if count == 1 { " is" } else { "s are" }
+            ),
+        );
+    }
 
     // A claimed/renamed scope resolves under its old name but the lockfile is keyed by the canonical one. re-key the roots to match
     let mut roots = roots;

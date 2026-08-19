@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs};
+use std::{collections::{BTreeMap, HashMap}, fs};
 use anyhow::Result;
 use colored::Colorize;
 use reqwest::Method;
@@ -56,6 +56,21 @@ fn locked_versions(packages: Option<&Map<String, Value>>) -> HashMap<String, Ver
     locked
 }
 
+/// Render one archived package, same layout as the license blocks: colored
+/// accents, plain indented text for the owner's reason.
+fn render_archived_block(name: &str, reason: Option<&str>) -> String {
+    let mut out = format!(
+        "  {} {} {}",
+        name.cyan(),
+        "·".dimmed(),
+        "archived, no longer maintained".yellow()
+    );
+    if let Some(reason) = reason {
+        out.push_str(&format!("\n      {} {}", "•".dimmed(), reason));
+    }
+    out
+}
+
 /// Render one flagged package. Color only the accents; caveat text stays in
 /// the terminal's default color so long lists remain readable.
 fn render_license_block(info: &LicenseInfo) -> String {
@@ -97,6 +112,19 @@ mod tests {
         assert_eq!(lines[0], "  scope/pkg@1.2.3 · GPL-3.0 · legal risk for closed-source games");
         assert_eq!(lines[1], "      • First caveat.");
         assert_eq!(lines[2], "      • Second caveat.");
+    }
+
+    #[test]
+    fn archived_block_matches_license_layout_with_optional_reason() {
+        colored::control::set_override(false);
+        let with_reason = render_archived_block("scope/pkg", Some("Superseded by @scope/new-pkg"));
+        let without_reason = render_archived_block("scope/pkg", None);
+        colored::control::unset_override();
+
+        let lines: Vec<&str> = with_reason.lines().collect();
+        assert_eq!(lines[0], "  scope/pkg · archived, no longer maintained");
+        assert_eq!(lines[1], "      • Superseded by @scope/new-pkg");
+        assert_eq!(without_reason, "  scope/pkg · archived, no longer maintained");
     }
 
     #[test]
@@ -409,6 +437,11 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
     pairs.dedup();
 
     let mut license_infos: Vec<LicenseInfo> = Vec::new();
+    // Package name -> archive reason. Archived state rides the same metadata
+    // responses as the license check, so this costs no extra requests; the
+    // map dedupes packages installed at more than one version, and BTreeMap
+    // keeps the report deterministically ordered.
+    let mut archived: BTreeMap<String, Option<String>> = BTreeMap::new();
     if !pairs.is_empty() {
         // Metadata only, so this goes to the main API rather than the package
         // gateway; no download URLs are needed for a license check.
@@ -440,6 +473,15 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
                 continue;
             }
             license_infos.push(extract_license_info(&data, &format!("{}@{}", name, version)));
+
+            if data.get("archived").and_then(Value::as_bool) == Some(true) {
+                let reason = data
+                    .get("archivedReason")
+                    .and_then(Value::as_str)
+                    .filter(|r| !r.is_empty())
+                    .map(str::to_string);
+                archived.insert(name.clone(), reason);
+            }
         }
         msg.destroy();
     }
@@ -481,6 +523,18 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
         }
         println!("  {}", "Automated license review, not legal advice.".dimmed());
         println!();
+    }
+
+    // ---- Archived check ----
+    // Archived packages keep installing (never blocked); this is the detail
+    // view behind install's consolidated "no longer maintained" warning.
+    if !archived.is_empty() {
+        message::warn(&format!("{} package(s) are no longer maintained:", archived.len()));
+        println!();
+        for (name, reason) in &archived {
+            println!("{}", render_archived_block(name, reason.as_deref()));
+            println!();
+        }
     }
 
     // ---- Overrides & excludes ----

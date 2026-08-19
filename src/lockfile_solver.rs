@@ -217,6 +217,17 @@ pub struct SolveReport {
     /// Excludes that removed nothing any range would have picked; natural
     /// resolution already lands outside the banned set.
     pub exclude_inert: Vec<String>,
+    /// Resolved packages (direct or transitive) the registry marked archived.
+    /// Warn-only: archived packages always keep installing.
+    pub archived: Vec<ArchivedPackage>,
+}
+
+/// A resolved package marked archived by the registry, with the owner's
+/// optional reason/successor note for the warning line.
+#[derive(Debug)]
+pub struct ArchivedPackage {
+    pub name: String,
+    pub reason: Option<String>,
 }
 
 /// Resolves the dependency graph. Also returns license-safety issues for any
@@ -245,6 +256,9 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
 async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, platform : String, msg: &mut Message, use_meta_cache: bool) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>, SolveReport)> {
     let mut resolved: ResolvedVersions = HashMap::new();
     let mut license_warnings: Vec<LicenseInfo> = Vec::new();
+    // Archived packages in the resolved tree; warn-only, collected once per
+    // package at its first-encounter fetch.
+    let mut archived_packages: Vec<ArchivedPackage> = Vec::new();
 
     // Disk metadata cache. Entries only ever save round trips (threat model
     // in meta_cache.rs): everything consumed this run is re-fetched in the
@@ -351,6 +365,18 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
             let versions = version_data.get("versions")
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| anyhow::anyhow!("Invalid versions data for {}", name.full_name))?;
+
+            // Archived packages still install; the registry marks them so the
+            // resolve can warn (an old backend simply sends no flag).
+            if version_data.get("archived").and_then(|v| v.as_bool()) == Some(true) {
+                archived_packages.push(ArchivedPackage {
+                    name: canonical.clone(),
+                    reason: version_data.get("archivedReason")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                });
+            }
 
             // Fat responses carry `public` at package level; inject it into
             // each version's trimmed block so every metadata source shares
@@ -817,6 +843,8 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
     report.override_unnecessary.sort();
     report.exclude_unused.sort();
     report.exclude_inert.sort();
+    archived_packages.sort_by(|a, b| a.name.cmp(&b.name));
+    report.archived = archived_packages;
 
     Ok((lockfile, license_warnings, root_renames, report))
 }
