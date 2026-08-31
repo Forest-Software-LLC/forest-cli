@@ -55,9 +55,7 @@ pub async fn remove_command(
     // Generate and write lockfile using blocking context
     let info_clone = info.clone();
     let lockfile_content = lockfile_gen(&info_clone, &mut msg, false).await?;
-    // Convert content to string
-    let lockfile_content = serde_json::to_string_pretty(&lockfile_content)?;
-    fs::write("forest-lock.json", lockfile_content)?;
+    fs::write("forest-lock.json", lockfile_content.to_json_pretty()?)?;
 
     msg.finish(
         MessageType::Success,

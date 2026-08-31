@@ -35,6 +35,13 @@ pub struct LockFile {
 }
 
 impl LockFile {
+    /// Serialize with sorted keys. Serializing the HashMaps directly
+    /// streams them in random order; going through serde_json::Value first
+    /// sorts every object, so the same resolution writes identical bytes.
+    pub fn to_json_pretty(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string_pretty(&serde_json::to_value(self)?)?)
+    }
+
     /// Read forest-lock.json from the current directory. None when missing,
     /// unparseable, or not the current format. Callers that need to say WHY
     /// it was rejected (install's messaging) keep their own read path.
