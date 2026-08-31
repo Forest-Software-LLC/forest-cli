@@ -331,10 +331,19 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
             };
 
             if !versions_status.is_success() {
-                Err(anyhow::anyhow!(
-                    "Failed to fetch package info for {}: HTTP {}",
-                    name.full_name, versions_status
-                ))?;
+                let hint = version_data.get("hint")
+                    .and_then(|h| h.get("message"))
+                    .and_then(|m| m.as_str());
+                Err(match hint {
+                    Some(hint) => anyhow::anyhow!(
+                        "Failed to fetch package info for {}: HTTP {}\n  {}",
+                        name.full_name, versions_status, hint
+                    ),
+                    None => anyhow::anyhow!(
+                        "Failed to fetch package info for {}: HTTP {}",
+                        name.full_name, versions_status
+                    ),
+                })?;
             }
 
             // The response carries the canonical (stored) casing, which is

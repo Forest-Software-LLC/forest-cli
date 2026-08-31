@@ -4,7 +4,7 @@ use serde_json::{Value, Map};
 use urlencoding::encode;
 use reqwest::Method;
 
-use crate::http::packages_api_request;
+use crate::http::{api_request, packages_api_request};
 use crate::message::{Message, MessageType};
 use crate::lockfile_gen::{lockfile_gen, lockfile_satisfies_manifest, make_directories, LockFile};
 use crate::utils::{normalize_forest_deps, normalize_forest_excludes, normalize_forest_overrides};
@@ -183,13 +183,39 @@ pub async fn install_command(
         };
 
         if !status_code.is_success() {
-            msg.emit(
-                MessageType::Fail,
-                &format!(
+            // The gateway's 404 carries no explanation. The registry's
+            // version list does when the scope is one an upstream registry
+            // reserves but forest cannot mirror (a hint), so on a miss ask it
+            // once and print that under the error.
+            let hint = if status_code.as_u16() == 404 {
+                let list_path = format!(
+                    "v1/package/{}/{}/{}",
+                    encode(package_identifiers[0]),
+                    encode(&platform),
+                    encode(package_identifiers[1])
+                );
+                match api_request(&list_path, Method::GET, None, None).await {
+                    Ok((body, _)) => body
+                        .get("hint")
+                        .and_then(|h| h.get("message"))
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string()),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let text = match hint {
+                Some(hint) => format!(
+                    "Failed to fetch package information for {}: HTTP {}\n  {}",
+                    pkg, status_code, hint
+                ),
+                None => format!(
                     "Failed to fetch package information for {}: HTTP {}",
                     pkg, status_code
                 ),
-            );
+            };
+            msg.emit(MessageType::Fail, &text);
             return Ok(());
         }
 
