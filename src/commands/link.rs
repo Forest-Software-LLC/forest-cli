@@ -140,8 +140,7 @@ pub async fn link_command(path: Option<String>, list: bool) -> Result<()> {
         }
     }
 
-    // A registry install scrubs Script/LocalScript files; a linked working
-    // tree exposes them as-is, and they RUN on place load.
+    // Same heads-up a registry install gives for packaged scripts.
     warn_on_runnable_scripts(target, &linked);
 
     links::upsert_link(Path::new("."), &dep_key, &path)?;
@@ -178,8 +177,8 @@ fn backslash_hint(path: &str) -> &'static str {
     }
 }
 
-/// Count Script/LocalScript sources in the linked root dir; a registry
-/// install would have scrubbed these.
+/// Count Script/LocalScript sources in the linked root dir, mirroring
+/// the warning a registry install prints.
 fn warn_on_runnable_scripts(target: &Path, linked_manifest: &Value) {
     const RUNNABLE: [&str; 4] = [".server.lua", ".server.luau", ".client.lua", ".client.luau"];
     let root = linked_manifest
@@ -204,7 +203,7 @@ fn warn_on_runnable_scripts(target: &Path, linked_manifest: &Value) {
         .count();
     if count > 0 {
         warn(&format!(
-            "The linked source contains {} Script/LocalScript file{} that a registry install would scrub; linked, they will run in your place.",
+            "The linked source contains {} Script/LocalScript file{} that can run in your place; review them if unexpected.",
             count,
             if count == 1 { "" } else { "s" }
         ));

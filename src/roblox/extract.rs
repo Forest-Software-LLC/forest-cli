@@ -1,12 +1,15 @@
 //! Roblox tarball extraction: Rojo folder-module semantics. The archive root
 //! (the package's declared init file) picks the source directory, the root
 //! file is renamed to `init.<ext>` so the installed folder is requirable,
-//! auto-running `*.server.lua(u)` / `*.client.lua(u)` files are scrubbed,
 //! and a top-level LICENSE is hoisted. Trusted-byte acquisition (cache /
 //! download / hash gate) is shared core (src/fetch_and_extract.rs).
+//!
+//! Runnable script sources (`*.server.lua(u)` / `*.client.lua(u)`, and
+//! `.meta.json` files that set RunContext or a script className) install
+//! as packaged and are reported back so the install can warn about them.
 
 use std::fs;
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Read};
 use std::path::Path;
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
@@ -23,6 +26,39 @@ const RUNNABLE_SUFFIXES: [&str; 4] = [
     ".client.luau",
 ];
 
+/// What extraction observed about the installed files.
+#[derive(Debug, Default)]
+pub struct ExtractReport {
+    pub script_sources: Vec<String>,
+}
+
+/// A .meta.json that turns its instance into something runnable: an explicit
+/// non-Legacy RunContext, or a Script/LocalScript className (init.meta.json
+/// can class a whole folder).
+fn meta_declares_script(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    let run_context = value
+        .get("properties")
+        .and_then(|p| p.get("RunContext"))
+        .and_then(|r| r.as_str());
+    if matches!(run_context, Some(rc) if rc != "Legacy") {
+        return true;
+    }
+    matches!(
+        value.get("className").and_then(|c| c.as_str()),
+        Some("Script") | Some("LocalScript")
+    )
+}
+
+fn rel_display(dest: &Path, out_dir: &Path) -> String {
+    dest.strip_prefix(out_dir)
+        .unwrap_or(dest)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 /// Install a package tarball into `out_dir`: serve it from the
 /// content-addressed cache when possible, otherwise download from `url` and
 /// warm the cache. Either way the SHA-256 is checked against the lockfile's
@@ -34,15 +70,13 @@ pub fn fetch_and_extract(
     archive_root: &str,
     on_bytes: OnBytes<'_>,
     cache: Option<&TarballCache>,
-) -> Result<()> {
+) -> Result<ExtractReport> {
     let bytes = obtain_verified_bytes(url, expected_sha256, out_dir, on_bytes, cache)?;
-    extract_tgz(bytes, out_dir, archive_root)?;
-
-    Ok(())
+    extract_tgz(bytes, out_dir, archive_root)
 }
 
 /// Unpack already-verified tgz bytes into `out_dir`, honoring `archive_root`.
-fn extract_tgz(bytes: Vec<u8>, out_dir: &Path, archive_root: &str) -> Result<()> {
+fn extract_tgz(bytes: Vec<u8>, out_dir: &Path, archive_root: &str) -> Result<ExtractReport> {
     let decompressor = GzDecoder::new(Cursor::new(bytes));
 
     // Tar entry paths are always forward-slashed, but versions published
@@ -81,6 +115,7 @@ fn extract_tgz(bytes: Vec<u8>, out_dir: &Path, archive_root: &str) -> Result<()>
 
     let mut archive = Archive::new(decompressor);
     let entries = archive.entries().context("Failed to read archive entries")?;
+    let mut report = ExtractReport::default();
 
     for entry in entries {
         let mut entry = entry.context("Failed to read a tar entry")?;
@@ -103,19 +138,17 @@ fn extract_tgz(bytes: Vec<u8>, out_dir: &Path, archive_root: &str) -> Result<()>
             continue;
         }
 
-        // Script/LocalScript files run on place load without being required,
-        // so never install them. The declared root is exempt: the init
-        // rename below makes it an inert ModuleScript.
+        // Script/LocalScript sources install as packaged and get reported.
+        // The declared root never counts: the init rename below makes it an
+        // inert ModuleScript.
         let is_runnable_script = entry_path
             .file_name()
             .and_then(|s| s.to_str())
             .map(|name| {
                 RUNNABLE_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
             })
-            .unwrap_or(false);
-        if is_runnable_script && entry_path != root_path {
-            continue;
-        }
+            .unwrap_or(false)
+            && entry_path != root_path;
 
         // Detect a top-level LICENSE
         let is_top_level = entry_path.components().count() == 1;
@@ -180,10 +213,31 @@ fn extract_tgz(bytes: Vec<u8>, out_dir: &Path, archive_root: &str) -> Result<()>
                     fs::create_dir_all(parent)
                         .with_context(|| format!("Failed to create parent dir {}", parent.display()))?;
                 }
-                let mut out = fs::File::create(&dest_path)
-                    .with_context(|| format!("Failed to create {}", dest_path.display()))?;
-                io::copy(&mut entry, &mut out)
-                    .with_context(|| format!("Failed to write {}", dest_path.display()))?;
+                let is_meta = dest_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|name| name.ends_with(".meta.json"))
+                    .unwrap_or(false);
+                if is_meta {
+                    // Buffered so the content can be inspected; meta files
+                    // are tiny.
+                    let mut buf = Vec::new();
+                    entry.read_to_end(&mut buf)
+                        .with_context(|| format!("Failed to read {}", dest_path.display()))?;
+                    fs::write(&dest_path, &buf)
+                        .with_context(|| format!("Failed to write {}", dest_path.display()))?;
+                    if meta_declares_script(&buf) {
+                        report.script_sources.push(rel_display(&dest_path, out_dir));
+                    }
+                } else {
+                    let mut out = fs::File::create(&dest_path)
+                        .with_context(|| format!("Failed to create {}", dest_path.display()))?;
+                    io::copy(&mut entry, &mut out)
+                        .with_context(|| format!("Failed to write {}", dest_path.display()))?;
+                }
+                if is_runnable_script {
+                    report.script_sources.push(rel_display(&dest_path, out_dir));
+                }
             } else {
                 // Skip symlinks and other types for safety
                 continue;
@@ -191,7 +245,8 @@ fn extract_tgz(bytes: Vec<u8>, out_dir: &Path, archive_root: &str) -> Result<()>
         }
     }
 
-    Ok(())
+    report.script_sources.sort();
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -321,65 +376,97 @@ mod tests {
     }
 
     #[test]
-    fn scrubs_server_and_client_scripts() {
-        // A Script/LocalScript inside an installed package would execute on
-        // place load without ever being required. Never install them.
+    fn installs_and_reports_runnable_scripts() {
+        // Script/LocalScript sources install as packaged (SmartBone clones
+        // its Runtime template into Actors) and are reported so the install
+        // can warn about them.
         let tgz = make_tgz_with(&[
             ("src/init.luau", "return {} -- root"),
             ("src/Helper.luau", "return {} -- helper"),
-            ("src/Backdoor.server.luau", "print('pwned')"),
-            ("src/Backdoor.server.lua", "print('pwned')"),
-            ("src/Sneaky.client.luau", "print('pwned')"),
-            ("src/Sneaky.client.lua", "print('pwned')"),
-            ("src/Nested/init.server.luau", "print('pwned')"),
+            ("src/Runtime.client.luau", "print('runtime')"),
+            ("src/Nested/init.server.luau", "print('server folder')"),
             ("src/Nested/Deep.luau", "return {} -- deep"),
         ]);
         let hash = sha256_hex(&tgz);
         let url = serve_once(tgz);
-        let out = temp_out_dir("scrub-scripts");
+        let out = temp_out_dir("report-scripts");
 
-        fetch_and_extract(&url, &hash, &out, "src/init.luau", &|_| {}, None).unwrap();
+        let report = fetch_and_extract(&url, &hash, &out, "src/init.luau", &|_| {}, None).unwrap();
 
         assert!(out.join("init.luau").exists());
         assert!(out.join("Helper.luau").exists());
-        assert!(out.join("Nested").join("Deep.luau").exists());
-        assert!(!out.join("Backdoor.server.luau").exists());
-        assert!(!out.join("Backdoor.server.lua").exists());
-        assert!(!out.join("Sneaky.client.luau").exists());
-        assert!(!out.join("Sneaky.client.lua").exists());
-        assert!(!out.join("Nested").join("init.server.luau").exists(),
-            "an init.server file would turn the whole folder into a Script");
+        assert_eq!(fs::read_to_string(out.join("Runtime.client.luau")).unwrap(), "print('runtime')");
+        assert!(out.join("Nested").join("init.server.luau").exists(),
+            "an init.server file classes the whole folder as a Script and must survive");
+        assert_eq!(report.script_sources, vec![
+            "Nested/init.server.luau".to_string(),
+            "Runtime.client.luau".to_string(),
+        ]);
         let _ = fs::remove_dir_all(&out);
     }
 
     #[test]
-    fn scrubs_scripts_in_top_level_root_layout() {
+    fn reports_scripts_in_top_level_root_layout() {
         let tgz = make_tgz_with(&[
             ("init.luau", "return {} -- root"),
-            ("Runner.server.luau", "print('pwned')"),
+            ("Runner.server.luau", "print('runner')"),
         ]);
         let hash = sha256_hex(&tgz);
         let url = serve_once(tgz);
-        let out = temp_out_dir("scrub-top-level");
+        let out = temp_out_dir("report-top-level");
 
-        fetch_and_extract(&url, &hash, &out, "init.luau", &|_| {}, None).unwrap();
+        let report = fetch_and_extract(&url, &hash, &out, "init.luau", &|_| {}, None).unwrap();
 
         assert!(out.join("init.luau").exists());
-        assert!(!out.join("Runner.server.luau").exists());
+        assert!(out.join("Runner.server.luau").exists());
+        assert_eq!(report.script_sources, vec!["Runner.server.luau".to_string()]);
         let _ = fs::remove_dir_all(&out);
     }
 
     #[test]
     fn root_declared_as_server_script_becomes_module_init() {
+        // The init rename makes the root an inert ModuleScript, so it is
+        // neither installed as a script nor reported as one.
         let tgz = make_tgz_with(&[("Main.server.luau", "return {} -- root")]);
         let hash = sha256_hex(&tgz);
         let url = serve_once(tgz);
-        let out = temp_out_dir("scrub-root-exempt");
+        let out = temp_out_dir("root-exempt");
 
-        fetch_and_extract(&url, &hash, &out, "Main.server.luau", &|_| {}, None).unwrap();
+        let report = fetch_and_extract(&url, &hash, &out, "Main.server.luau", &|_| {}, None).unwrap();
 
         assert_eq!(fs::read_to_string(out.join("init.luau")).unwrap(), "return {} -- root");
         assert!(!out.join("Main.server.luau").exists());
+        assert!(report.script_sources.is_empty());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn reports_meta_json_that_makes_an_instance_runnable() {
+        let tgz = make_tgz_with(&[
+            ("src/init.luau", "return {} -- root"),
+            // A non-Legacy RunContext runs wherever it is mounted.
+            ("src/Worker.luau", "return {}"),
+            ("src/Worker.meta.json", r#"{"properties":{"RunContext":"Client"}}"#),
+            // Explicit Legacy is the inert default, not worth a warning.
+            ("src/Calm.luau", "return {}"),
+            ("src/Calm.meta.json", r#"{"properties":{"RunContext":"Legacy"}}"#),
+            // init.meta.json can class a whole folder as a script.
+            ("src/Runner/init.meta.json", r#"{"className":"LocalScript"}"#),
+            // Unrelated meta content stays quiet.
+            ("src/Quiet.meta.json", r#"{"ignoreUnknownInstances":true}"#),
+        ]);
+        let hash = sha256_hex(&tgz);
+        let url = serve_once(tgz);
+        let out = temp_out_dir("report-meta");
+
+        let report = fetch_and_extract(&url, &hash, &out, "src/init.luau", &|_| {}, None).unwrap();
+
+        assert!(out.join("Worker.meta.json").exists());
+        assert!(out.join("Quiet.meta.json").exists());
+        assert_eq!(report.script_sources, vec![
+            "Runner/init.meta.json".to_string(),
+            "Worker.meta.json".to_string(),
+        ]);
         let _ = fs::remove_dir_all(&out);
     }
 
