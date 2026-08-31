@@ -103,8 +103,17 @@ mod tests {
         let contract = licenses();
         assert!(contract.spdx_licenses.iter().any(|l| l == "0BSD"));
         assert!(contract.spdx_licenses.iter().any(|l| l == "CC-BY-SA-4.0"));
-        // Order sensitivity is part of the contract: AGPL must be evaluated
-        // before GPL (its text contains "general public license" too).
-        assert_eq!(contract.text_fingerprints[0].id, "AGPL-3.0");
+        // Order sensitivity is part of the contract, so the parser must keep
+        // the JSON array order: MPL names the AGPL in its own text, and the
+        // AGPL title contains the GPL title.
+        let pos = |id: &str| {
+            contract
+                .text_fingerprints
+                .iter()
+                .position(|f| f.id == id)
+                .expect(id)
+        };
+        assert!(pos("MPL-2.0") < pos("AGPL-3.0"));
+        assert!(pos("AGPL-3.0") < pos("GPL-3.0"));
     }
 }
