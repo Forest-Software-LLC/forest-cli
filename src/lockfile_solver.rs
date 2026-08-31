@@ -691,9 +691,12 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
             let mut deps = HashMap::new();
             for (dn, dr) in &vs.dependencies {
                 let dep_state = &resolved[&dn.to_lowercase()];
-                let v = dep_state.buckets.keys()
-                    .find(|v| VersionReq::parse(&dr.version).unwrap().matches(&Version::parse(v).unwrap()))
-                    .cloned().unwrap();
+                // Highest matching bucket, not HashMap iteration order, so
+                // two buckets satisfying a loose range always pick the same.
+                let req = VersionReq::parse(&dr.version)
+                    .expect("dep range was parsed during resolution");
+                let v = highest_matching_bucket(dep_state.buckets.keys(), &req)
+                    .expect("BFS leaves a matching bucket for every dep edge");
                 deps.insert(dep_state.canonical.clone(), DepSpec{
                     version : v,
                     alias : dr.alias.clone()
@@ -709,6 +712,8 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
                 dependencies: deps,
             });
         }
+        // Stable entry order, not bucket-map iteration order.
+        entries.sort_by(|a, b| Version::parse(&a.version).unwrap().cmp(&Version::parse(&b.version).unwrap()));
         lockfile.insert(state.canonical.clone(), entries);
     }
 
@@ -730,10 +735,12 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
 
                 entry.location = loc.to_string();
 
-                // Collect dependencies to avoid holding a mutable borrow during recursion
-                let deps: Vec<(String, DepSpec)> = entry.dependencies.iter()
+                // Collect dependencies to avoid holding a mutable borrow during recursion.
+                // Sorted so equal-length location ties always break the same way.
+                let mut deps: Vec<(String, DepSpec)> = entry.dependencies.iter()
                     .map(|(dn, dv)| (dn.clone(), dv.clone()))
                     .collect();
+                deps.sort_by(|a, b| a.0.cmp(&b.0));
 
                 // Also collect dependency keys for each dependency
 
@@ -768,7 +775,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
             // can merge the root into a lower bucket, and the registry max
             // would then name a version with no lockfile entry, so build_tree
             // silently no-ops and the root never gets planned.
-            let root_version = select_root_bucket(state.buckets.keys(), &req)
+            let root_version = highest_matching_bucket(state.buckets.keys(), &req)
                 .ok_or_else(|| anyhow::anyhow!("No versions found for {} matching {}", name, dep_spec.version))?;
 
             // Lockfile keys use canonical casing, not the manifest's
@@ -872,9 +879,10 @@ fn override_is_unnecessary(available: &[Version], declared_ranges: &[String], ov
 }
 
 
-/// Highest bucket version satisfying `req`. Roots processed by the BFS
-/// always have a matching bucket, so None is defensive.
-fn select_root_bucket<'a>(buckets: impl Iterator<Item = &'a String>, req: &VersionReq) -> Option<String> {
+/// Highest bucket version satisfying `req`. Used for root annotation and
+/// for pinning dep edges; the BFS always leaves a matching bucket for both,
+/// so None is defensive.
+fn highest_matching_bucket<'a>(buckets: impl Iterator<Item = &'a String>, req: &VersionReq) -> Option<String> {
     buckets
         .filter_map(|v| Version::parse(v).ok().map(|parsed| (v, parsed)))
         .filter(|(_, parsed)| req.matches(parsed))
@@ -906,7 +914,7 @@ mod tests {
         // with no lockfile entry, so the root was never annotated.
         let b = buckets(&["1.2.3"]);
         assert_eq!(
-            select_root_bucket(b.iter(), &req("^1.0.0")),
+            highest_matching_bucket(b.iter(), &req("^1.0.0")),
             Some("1.2.3".to_string())
         );
     }
@@ -915,7 +923,7 @@ mod tests {
     fn highest_matching_bucket_wins() {
         let b = buckets(&["1.2.3", "2.0.0", "1.5.0"]);
         assert_eq!(
-            select_root_bucket(b.iter(), &req("^1.0.0")),
+            highest_matching_bucket(b.iter(), &req("^1.0.0")),
             Some("1.5.0".to_string())
         );
     }
@@ -923,7 +931,7 @@ mod tests {
     #[test]
     fn no_matching_bucket_is_none() {
         let b = buckets(&["2.0.0"]);
-        assert_eq!(select_root_bucket(b.iter(), &req("^1.0.0")), None);
+        assert_eq!(highest_matching_bucket(b.iter(), &req("^1.0.0")), None);
     }
 
     fn versions(list: &[&str]) -> Vec<Version> {

@@ -82,7 +82,7 @@ pub async fn update_command() -> Result<()> {
         .unwrap_or_default();
 
     let lockfile = lockfile_gen(&info, &mut msg, false).await?;
-    fs::write("forest-lock.json", serde_json::to_string_pretty(&lockfile)?)?;
+    fs::write("forest-lock.json", lockfile.to_json_pretty()?)?;
 
     let new_versions = locked_version_map(&serde_json::to_value(&lockfile)?);
     let changes = diff_locked(&old_versions, &new_versions);

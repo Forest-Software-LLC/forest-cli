@@ -272,26 +272,50 @@ pub async fn make_directories_roblox(
                 extra: RobloxExtra { root: pkg.root.clone(), container: pkg.packages_dir.clone() },
             });
         }
+        // Script sources found during extraction. Receipted packages never
+        // re-extract, so the warning fires on first install and upgrades.
+        let script_findings: std::sync::Arc<std::sync::Mutex<Vec<(String, String, Vec<String>)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let findings_sink = script_findings.clone();
+
         // On a pool error nothing has landed in the mount: staged dirs vanish
         // with `staging`, and the tarball cache makes the retry's redownloads
         // free.
-        crate::download_pool::download_all(jobs, "roblox", |job, url, on_bytes, cache| {
+        crate::download_pool::download_all(jobs, "roblox", move |job, url, on_bytes, cache| {
             // The receipt is written into the staged dir after its extraction
             // succeeds, so what renames into the mount is always a complete,
             // receipted package.
-            fetch_and_extract(url, &job.integrity, &job.dir, &job.extra.root, on_bytes, cache).and_then(
-                |_| {
-                    receipts::write(&job.dir, &receipts::Receipt {
-                        name: job.name.clone(),
-                        version: job.version.clone(),
-                        integrity: job.integrity.clone(),
-                        root: job.extra.root.clone(),
-                        container: job.extra.container.clone(),
-                    })
-                },
-            )
+            let report = fetch_and_extract(url, &job.integrity, &job.dir, &job.extra.root, on_bytes, cache)?;
+            if !report.script_sources.is_empty() {
+                findings_sink
+                    .lock()
+                    .expect("script findings lock")
+                    .push((job.name.clone(), job.version.clone(), report.script_sources));
+            }
+            receipts::write(&job.dir, &receipts::Receipt {
+                name: job.name.clone(),
+                version: job.version.clone(),
+                integrity: job.integrity.clone(),
+                root: job.extra.root.clone(),
+                container: job.extra.container.clone(),
+            })
         })
         .await?;
+
+        let mut findings = script_findings.lock().expect("script findings lock").split_off(0);
+        findings.sort();
+        for (name, version, files) in findings {
+            let shown = files.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            let more = if files.len() > 3 {
+                format!(" and {} more", files.len() - 3)
+            } else {
+                String::new()
+            };
+            crate::message::warn(&format!(
+                "{}@{} contains script files that can run in your place: {}{}. Review them if unexpected.",
+                name, version, shown, more
+            ));
+        }
 
         // Assemble nested packages inside their installing ancestor's staged
         // dir, deepest first so a package's own children are in place before

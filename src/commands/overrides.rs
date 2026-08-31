@@ -464,7 +464,7 @@ pub(crate) async fn reinstall_or_rollback(manifest: &Value, manifest_before: &st
     let mut msg = Message::new("Updating packages...");
     match lockfile_gen(manifest, &mut msg, false).await {
         Ok(lockfile) => {
-            fs::write("forest-lock.json", serde_json::to_string_pretty(&lockfile)?)?;
+            fs::write("forest-lock.json", lockfile.to_json_pretty()?)?;
             msg.destroy();
             Ok(true)
         }
