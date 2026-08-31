@@ -17,6 +17,27 @@ const DEFAULT_BASE: &str = "https://releases.forest.dev";
 /// Throttle the passive "update available" check to once a day.
 const CHECK_INTERVAL_SECS: u64 = 60 * 60 * 24;
 
+/// Rokit pins a version per project, so an older forest is often deliberate.
+/// Nudge rarely instead of daily.
+const ROKIT_CHECK_INTERVAL_SECS: u64 = 60 * 60 * 24 * 14;
+
+/// Check for Rokit by looking for  `~/.rokit` dir.
+pub fn rokit_managed() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let Ok(root) = home.join(".rokit").canonicalize() else {
+        return false;
+    };
+    let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) else {
+        return false;
+    };
+    exe.starts_with(&root)
+}
+
+const ROKIT_UPGRADE_HINT: &str =
+    "forest is managed by rokit. Run `rokit update forest` (or edit rokit.toml and run `rokit install`).";
+
 fn release_base() -> String {
     std::env::var("FOREST_INSTALL_BASE").unwrap_or_else(|_| DEFAULT_BASE.to_string())
 }
@@ -106,6 +127,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// without installing.
 pub async fn upgrade_command(check_only: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
+    let rokit = rokit_managed();
+
+    if rokit && !check_only {
+        Message::new("Checking for updates...").finish(MessageType::Fail, ROKIT_UPGRADE_HINT);
+        return Ok(());
+    }
 
     let mut msg = Message::new("Checking for updates...");
     let manifest = match fetch_manifest(None).await {
@@ -129,8 +156,13 @@ pub async fn upgrade_command(check_only: bool) -> Result<()> {
         msg.finish(
             MessageType::Info,
             &format!(
-                "Update available: v{current} -> v{}. Run `forest upgrade` to install.",
-                manifest.version
+                "Update available: v{current} -> v{}. {}",
+                manifest.version,
+                if rokit {
+                    ROKIT_UPGRADE_HINT
+                } else {
+                    "Run `forest upgrade` to install."
+                }
             ),
         );
         return Ok(());
@@ -275,7 +307,13 @@ pub async fn maybe_notify_update() {
     if !std::io::stderr().is_terminal() {
         return;
     }
-    if now_secs().saturating_sub(read_state().last_check) < CHECK_INTERVAL_SECS {
+    let rokit = rokit_managed();
+    let interval = if rokit {
+        ROKIT_CHECK_INTERVAL_SECS
+    } else {
+        CHECK_INTERVAL_SECS
+    };
+    if now_secs().saturating_sub(read_state().last_check) < interval {
         return;
     }
 
@@ -290,8 +328,13 @@ pub async fn maybe_notify_update() {
         eprintln!(
             "\n{}",
             format!(
-                "⬆ forest v{} is available (you have v{current}). Run `forest upgrade` to install it.",
-                manifest.version
+                "⬆ forest v{} is available (you have v{current}). {}",
+                manifest.version,
+                if rokit {
+                    ROKIT_UPGRADE_HINT
+                } else {
+                    "Run `forest upgrade` to install it."
+                }
             )
             .yellow()
         );
