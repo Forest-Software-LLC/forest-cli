@@ -177,6 +177,11 @@ fn create_tarball_buffer(dir: &Path, matcher: &Gitignore) -> Result<Vec<u8>> {
 pub async fn publish_command() -> Result<()> {
     let cwd = env::current_dir().context("Failed to get current directory")?;
 
+    if crate::api_token::env_api_token().is_some() {
+        fail("API tokens are read only. Unset FOREST_TOKEN to publish with your login.");
+        return Ok(());
+    }
+
     // The spinner is destroyed before every prompt or printed line below -
     // dialoguer and an active spinner fight over the terminal.
     let msg = Message::new("Verifying session...");

@@ -1,5 +1,6 @@
+use crate::api_token::{env_api_token, ENV_VAR as API_TOKEN_VAR};
 use crate::tokens::{get_stored_tokens, store_tokens};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::{header, multipart::Form, Client, Method, StatusCode};
 use serde_json::Value;
 use std::{env, sync::Arc, sync::OnceLock, time::Duration};
@@ -130,7 +131,11 @@ async fn api_request_with_base(
     headers: Option<header::HeaderMap>,
 ) -> Result<(Value, StatusCode)> {
     let api_url = env::var(base_env).with_context(|| format!("{} must be set", base_env))?;
-    let mut tokens = get_stored_tokens()?;
+    let api_token = env_api_token();
+    let mut access_token = match &api_token {
+        Some(token) => token.clone(),
+        None => get_stored_tokens()?.access_token,
+    };
     let client = async_client();
 
     // Builder function for a new request with the given token
@@ -165,10 +170,20 @@ async fn api_request_with_base(
     };
 
     // First attempt
-    let mut resp = build_req(&tokens.access_token)
+    let mut resp = build_req(&access_token)
         .send()
         .await
         .context("Network error on first attempt")?;
+
+    // An API token can't refresh; a 401 means it is revoked, expired or mistyped.
+    if resp.status() == StatusCode::UNAUTHORIZED && api_token.is_some() {
+        let body: Value = resp.json().await.unwrap_or_default();
+        let reason = body.get("error").and_then(Value::as_str).unwrap_or("unauthorized");
+        return Err(anyhow!(
+            "{} was rejected: {}. Create a new token in your forest.dev settings.",
+            API_TOKEN_VAR, reason
+        ));
+    }
 
     // On 401, refresh token and retry once. The refresh always goes to the
     // main API regardless of which base this request used; auth is
@@ -189,7 +204,7 @@ async fn api_request_with_base(
             new_tokens.get("refreshToken").and_then(Value::as_str)
         ) {
             store_tokens(at, rt)?;
-            tokens = get_stored_tokens()?;
+            access_token = at.to_string();
         } else {
             return Ok((
                 serde_json::json!({ "error": "Failed to refresh token" }),
@@ -197,7 +212,7 @@ async fn api_request_with_base(
             ));
         }
         // Retry with new token
-        resp = build_req(&tokens.access_token)
+        resp = build_req(&access_token)
             .send()
             .await
             .context("Network error on retry")?;
