@@ -17,7 +17,11 @@ pub async fn install_command(
     force: bool,
     init_platform: Option<String>,
     links_mode: Option<crate::links::LinksMode>,
+    frozen: bool,
 ) -> Result<()> {
+    if frozen && target_package.is_some() {
+        return Err(anyhow::anyhow!("--frozen installs the lockfile as is, so it can't add a package."));
+    }
     match links_mode {
         Some(crate::links::LinksMode::Apply) => {
             crate::links::set_policy(crate::links::LinkPolicy::Apply);
@@ -271,7 +275,7 @@ pub async fn install_command(
                 MessageType::Info,
                 &format!("Package {} is already in forest.json. Verifying installed packages...", existing_key),
             );
-            sync_from_lockfile(&info, msg, force).await?;
+            sync_from_lockfile(&info, msg, force, frozen).await?;
             return Ok(());
         }
 
@@ -323,7 +327,7 @@ pub async fn install_command(
         }
     } else {
         // No specific package: install all via lockfile
-        sync_from_lockfile(&info, msg, force).await?;
+        sync_from_lockfile(&info, msg, force, frozen).await?;
     }
 
     Ok(())
@@ -338,6 +342,7 @@ async fn sync_from_lockfile(
     info: &Value,
     mut msg: Message,
     force: bool,
+    frozen: bool,
 ) -> Result<()> {
     let lock_content: Option<Value> = if Path::new("forest-lock.json").exists() {
         Some(serde_json::from_str(&fs::read_to_string("forest-lock.json")?)?)
@@ -386,6 +391,13 @@ async fn sync_from_lockfile(
             None
         }
     };
+
+    if frozen && lockfile.is_none() {
+        msg.destroy();
+        return Err(anyhow::anyhow!(
+            "--frozen: forest-lock.json is missing or out of date with forest.json. Run `forest install` locally and commit the lockfile."
+        ));
+    }
 
     if let Some(lockfile) = lockfile {
         msg.destroy();

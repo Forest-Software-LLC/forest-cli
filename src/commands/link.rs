@@ -152,7 +152,7 @@ pub async fn link_command(path: Option<String>, list: bool) -> Result<()> {
     // overlay, restoring/keeping everything else registry-faithful. The
     // explicit mode makes `forest link` apply even where installs would
     // default to ignoring links (CI).
-    super::install::install_command(None, None, None, false, None, Some(links::LinksMode::Apply)).await?;
+    super::install::install_command(None, None, None, false, None, Some(links::LinksMode::Apply), false).await?;
 
     success(&format!("Linked {} → {}", dep_key, path));
     Ok(())
@@ -290,7 +290,7 @@ pub async fn unlink_command(reference: Option<String>, all: bool) -> Result<()> 
 
     // Restore the exact registry versions via the normal pipeline. Apply
     // mode so any REMAINING links stay materialized while this one restores.
-    super::install::install_command(None, None, None, false, None, Some(links::LinksMode::Apply)).await?;
+    super::install::install_command(None, None, None, false, None, Some(links::LinksMode::Apply), false).await?;
     success(&format!(
         "Restored {} package{} from the registry.",
         removed.len(),

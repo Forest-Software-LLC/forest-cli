@@ -56,6 +56,8 @@ The `forest` command-line package manager for **forestpm** (Roblox + UEFN/Verse 
 
 Install-related env knobs: `FOREST_CACHE_DIR`, `FOREST_NO_CACHE=1`, `FOREST_NO_UPDATE_CHECK=1` (used by [scripts/bench.ps1](scripts/bench.ps1)), `FOREST_NO_SETTLE=1` (skip the rojo settle wait).
 
+`FOREST_TOKEN` ([src/api_token.rs](src/api_token.rs)): a read-only API token for CI. Wins over `~/.forest_tokens.json` (which is then never read), never refreshed; a 401 with it set is a hard error naming the server's reason. `whoami` describes it via `GET v1/auth/token`, `publish` refuses to run with it. With no credential at all, the download pool fails up front on uncached private packages instead of 404ing mid-install. `install --frozen` errors instead of re-resolving when forest-lock.json is missing or no longer satisfies forest.json.
+
 ## Build / release
 ```bash
 cargo build --release      # target/release/forest(.exe)

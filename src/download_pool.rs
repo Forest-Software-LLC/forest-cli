@@ -57,12 +57,6 @@ pub async fn download_all<E: Send + 'static>(
     }
     let tarball_cache = TarballCache::open_default();
 
-    for job in &jobs {
-        if !job.dir.exists() {
-            std::fs::create_dir_all(&job.dir)?;
-        }
-    }
-
     // Private tarballs sit behind the CDN worker's HMAC gate and their
     // signed URLs expire in minutes, so they are never stored in the
     // lockfile; fetch fresh ones now (integrity cross-check inside
@@ -74,6 +68,23 @@ pub async fn download_all<E: Send + 'static>(
         .filter(|j| tarball_cache.as_ref().map_or(true, |c| c.lookup(&j.integrity).is_none()))
         .map(|j| (j.name.clone(), j.version.clone(), j.integrity.clone()))
         .collect();
+
+    // Every private download would 404 anonymously; say why up front.
+    if !private_entries.is_empty() && !crate::api_token::has_credential() {
+        let names: Vec<&str> = private_entries.iter().take(3).map(|(name, _, _)| name.as_str()).collect();
+        let more = private_entries.len().saturating_sub(names.len());
+        return Err(anyhow!(
+            "This project has private dependencies ({}{}). Run `forest login`, or set FOREST_TOKEN to an API token in CI.",
+            names.join(", "),
+            if more > 0 { format!(" and {} more", more) } else { String::new() }
+        ));
+    }
+
+    for job in &jobs {
+        if !job.dir.exists() {
+            std::fs::create_dir_all(&job.dir)?;
+        }
+    }
     let mut private_iter = private_entries.into_iter();
     if let Some((pkg, ver, integrity)) = private_iter.next() {
         // These round-trips run with the install spinner paused; a counter

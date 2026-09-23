@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod tokens;
+mod api_token;
 mod http;
 mod cache;
 mod links;
@@ -92,6 +93,12 @@ enum Commands {
         /// Default: ignore under CI, apply otherwise.
         #[arg(long = "links", value_name = "MODE")]
         links: Option<links::LinksMode>,
+
+        /// Install exactly what forest-lock.json pins. Fails instead of
+        /// updating the lockfile when it is missing or no longer matches
+        /// forest.json. For CI.
+        #[arg(long = "frozen")]
+        frozen: bool,
     },
 
     /// Remove a package from the project
@@ -232,8 +239,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init { platform, project, packages_dir } => {
             init_command(platform, project, packages_dir).await?;
         }
-        Commands::Install { package, version, alias, force, init, links } => {
-            install_command(package, version, alias, force, init, links).await?;
+        Commands::Install { package, version, alias, force, init, links, frozen } => {
+            install_command(package, version, alias, force, init, links, frozen).await?;
         }
         Commands::Remove { package } => {
             remove_command(package).await?;
