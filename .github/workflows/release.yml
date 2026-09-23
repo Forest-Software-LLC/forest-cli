@@ -137,6 +137,8 @@ jobs:
       # Rokit installs from GitHub Release assets and only unpacks archives,
       # so wrap each binary with the plain `forest` name inside. Archive names
       # keep the target triple, which rokit's OS/arch matcher parses.
+      # Zip for every target: rokit < 1.2.0 has a broken tarball extractor
+      # (fixed in their changelog for 1.2.0), zips work on all versions.
       - name: Package archives for rokit
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
@@ -150,14 +152,11 @@ jobs:
             esac
             base="${name%.exe}"
             stage="$(mktemp -d)"
-            if [[ "$name" == *.exe ]]; then
-              cp "$f" "$stage/${BIN_NAME}.exe"
-              (cd "$stage" && python3 -m zipfile -c "${GITHUB_WORKSPACE}/archives/${base}.zip" "${BIN_NAME}.exe")
-            else
-              cp "$f" "$stage/${BIN_NAME}"
-              chmod 755 "$stage/${BIN_NAME}"
-              tar -czf "archives/${base}.tar.gz" -C "$stage" "${BIN_NAME}"
-            fi
+            inner="${BIN_NAME}"
+            if [[ "$name" == *.exe ]]; then inner="${BIN_NAME}.exe"; fi
+            cp "$f" "$stage/$inner"
+            chmod 755 "$stage/$inner"
+            (cd "$stage" && zip -q -X "${GITHUB_WORKSPACE}/archives/${base}.zip" "$inner")
             rm -rf "$stage"
           done
           ls -l archives
