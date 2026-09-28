@@ -62,7 +62,7 @@ fn walk(container: &Path, container_str: &str, tree: &mut TreeScan) {
         if is_pointer_dir(&path) {
             tree.pointer_dirs.push(path_str.clone());
         } else if let Some(receipt) = read_receipt(&path) {
-            if crate::roblox::validate_packages_dir(&receipt.container).is_ok() {
+            if crate::mounts::validate_folder_name(&receipt.container).is_ok() {
                 nested_name = receipt.container.clone();
             }
             tree.receipts.insert(path_str.clone(), receipt);
@@ -77,7 +77,7 @@ fn walk(container: &Path, container_str: &str, tree: &mut TreeScan) {
 /// A pointer dir is recognized by the generated header in its init.lua. A
 /// package that impersonates one could at worst get itself deleted and
 /// reinstalled on the next run; never kept wrongly.
-fn is_pointer_dir(dir: &Path) -> bool {
+pub(crate) fn is_pointer_dir(dir: &Path) -> bool {
     fs::read_to_string(dir.join("init.lua"))
         .map(|s| s.starts_with(POINTER_HEADER))
         .unwrap_or(false)

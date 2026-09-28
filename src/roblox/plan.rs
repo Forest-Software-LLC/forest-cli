@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use urlencoding::encode;
 
-use crate::lockfile_gen::LockFile;
+use crate::lockfile::LockSection;
 use crate::lockfile_solver::DepSpec;
 use crate::utils::get_ci;
 
@@ -53,17 +53,17 @@ pub struct InstallPlan {
 /// path, which must match what physical_path/scan/prune derive from the
 /// same manifest.
 pub fn plan_install(
-    lockfile: &LockFile,
+    lockfile: &LockSection,
     root_deps: &HashMap<String, DepSpec>,
     consumer_container: &str,
 ) -> Result<InstallPlan> {
     // Container names flow into filesystem paths. Lockfile entries come
     // from the registry, so reject bad names before any path is built.
-    crate::roblox::validate_packages_dir(consumer_container)
+    crate::mounts::validate_folder_name(consumer_container)
         .map_err(|reason| anyhow!("Invalid packagesDir in forest.json: {}", reason))?;
     for (pkg_name, versions) in &lockfile.packages {
         for version_data in versions {
-            crate::roblox::validate_packages_dir(&version_data.packages_dir).map_err(|reason| {
+            crate::mounts::validate_folder_name(&version_data.packages_dir).map_err(|reason| {
                 anyhow!(
                     "Invalid packagesDir for {}@{} in forest-lock.json: {}",
                     pkg_name, version_data.version, reason
@@ -200,7 +200,7 @@ pub fn plan_install(
 /// directory name. Never empty on success. The caller uses each hop's
 /// identity to look up that hop's container name for the interleaved path.
 fn backtrack_chain(
-    lockfile: &LockFile,
+    lockfile: &LockSection,
     dep_name: &str,
     dep_version: &str,
     end_goal: &str,
@@ -249,7 +249,7 @@ fn backtrack_chain(
 
 /// A lockfile entry's own container name (`packagesDir`), for interleaving
 /// per-hop containers into plan paths.
-fn entry_packages_dir<'a>(lockfile: &'a LockFile, pkg: &str, version: &str) -> Result<&'a str> {
+fn entry_packages_dir<'a>(lockfile: &'a LockSection, pkg: &str, version: &str) -> Result<&'a str> {
     let entries = get_ci(&lockfile.packages, pkg)
         .ok_or_else(|| anyhow!("Dependency {} not found", pkg))?;
     let entry = entries
@@ -417,7 +417,7 @@ mod tests {
     }
 
     /// Root Knit (nested dep Comm, hoisted dep Promise), root Promise.
-    fn synthetic_lockfile() -> (LockFile, HashMap<String, DepSpec>) {
+    fn synthetic_lockfile() -> (LockSection, HashMap<String, DepSpec>) {
         let mut packages = HashMap::new();
         packages.insert(
             "acme/knit".to_string(),
@@ -449,7 +449,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        (LockFile { file_version: 2, overrides: HashMap::new(), excludes: HashMap::new(), packages }, root_deps)
+        (LockSection { overrides: HashMap::new(), excludes: HashMap::new(), packages }, root_deps)
     }
 
     #[test]
@@ -531,7 +531,7 @@ mod tests {
         );
         let root_deps: HashMap<String, DepSpec> =
             [dep("acme/a", "A", "^1.0.0"), dep("acme/c", "C", "^1.0.0")].into_iter().collect();
-        let lockfile = LockFile { file_version: 2, overrides: HashMap::new(), excludes: HashMap::new(), packages };
+        let lockfile = LockSection { overrides: HashMap::new(), excludes: HashMap::new(), packages };
 
         let plan = plan_install(&lockfile, &root_deps, "Packages").unwrap();
 
@@ -552,7 +552,7 @@ mod tests {
 
     /// Same shape as synthetic_lockfile, but the consumer renamed its mount
     /// and Knit/Comm each publish their own container names.
-    fn renamed_lockfile() -> (LockFile, HashMap<String, DepSpec>) {
+    fn renamed_lockfile() -> (LockSection, HashMap<String, DepSpec>) {
         let mut packages = HashMap::new();
         packages.insert(
             "acme/knit".to_string(),
@@ -586,7 +586,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        (LockFile { file_version: 2, overrides: HashMap::new(), excludes: HashMap::new(), packages }, root_deps)
+        (LockSection { overrides: HashMap::new(), excludes: HashMap::new(), packages }, root_deps)
     }
 
     #[test]
@@ -669,7 +669,7 @@ mod tests {
         );
         let root_deps: HashMap<String, DepSpec> =
             [dep("acme/a", "A", "^1.0.0")].into_iter().collect();
-        let lockfile = LockFile { file_version: 2, overrides: HashMap::new(), excludes: HashMap::new(), packages };
+        let lockfile = LockSection { overrides: HashMap::new(), excludes: HashMap::new(), packages };
 
         let plan = plan_install(&lockfile, &root_deps, "Packages").unwrap();
         let c = plan.packages.iter().find(|p| p.name == "acme/c").unwrap();
@@ -687,8 +687,7 @@ mod tests {
                 .get_mut("acme/knit")
                 .unwrap()[0]
                 .packages_dir = bad.to_string();
-            let poisoned = LockFile {
-                file_version: 2,
+            let poisoned = LockSection {
                 overrides: HashMap::new(),
                 excludes: HashMap::new(),
                 packages: poisoned_packages,

@@ -20,8 +20,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::lockfile_gen::{InstallSummary, LockFile};
+use crate::lockfile::LockSection;
+use crate::lockfile_gen::InstallSummary;
 use crate::lockfile_solver::DepSpec;
+use crate::mounts::Mount;
 
 /// Outcome of a platform's publish preflight.
 pub enum Preflight {
@@ -166,20 +168,82 @@ impl Platform {
         }
     }
 
-    /// Execute an install plan: layout, extraction, bookkeeping, and
-    /// post-install UX are wholly owned by the platform module. The manifest
-    /// rides along because layout can depend on it (Roblox mounts Packages/
-    /// inside the `root` dir); UEFN ignores it.
+    /// Execute one mount's install plan: layout, extraction, bookkeeping, and
+    /// post-install UX are wholly owned by the platform module. UEFN has a
+    /// single fixed mount and ignores `mount`.
     pub async fn install(
         &self,
-        lockfile: &LockFile,
+        section: &LockSection,
         root_deps: HashMap<String, DepSpec>,
-        manifest: &Value,
+        mount: &Mount,
         force: bool,
     ) -> Result<InstallSummary> {
         match self {
-            Platform::Roblox => crate::roblox::install::make_directories_roblox(lockfile, root_deps, manifest, force).await,
-            Platform::Uefn => crate::uefn::install::make_directories_uefn(lockfile, root_deps, force).await,
+            Platform::Roblox => crate::roblox::install::make_directories_roblox(section, root_deps, mount, force).await,
+            Platform::Uefn => crate::uefn::install::make_directories_uefn(section, root_deps, force).await,
+        }
+    }
+
+    /// Checks an install run makes once across every mount before touching
+    /// any (Roblox: dependency folders left behind by a moved mount).
+    /// `orphaned` are paths already reported as no longer declared.
+    pub fn check_mounts(&self, mounts: &[Mount], orphaned: &[String]) {
+        match self {
+            Platform::Roblox => crate::roblox::install::warn_abandoned_mounts(mounts, orphaned),
+            Platform::Uefn => {}
+        }
+    }
+
+    /// Where the default mount (forest.json's top-level `dependencies`)
+    /// installs, relative to the manifest dir. Roblox: next to the root
+    /// file, named by `packagesDir`. UEFN: the shared ForestPackages mount.
+    pub fn default_mount_path(&self, manifest: &Value) -> String {
+        match self {
+            Platform::Roblox => crate::roblox::packages_base(manifest),
+            Platform::Uefn => crate::contracts::verse_rules().packages_mount.clone(),
+        }
+    }
+
+    /// Whether forest.json may declare extra mounts. UEFN's one mount name
+    /// is compiled into every package's source.
+    pub fn supports_mounts(&self) -> bool {
+        matches!(self, Platform::Roblox)
+    }
+
+    /// Rename the default mount's folder in the manifest. Its parent is
+    /// fixed, only the name moves.
+    pub fn set_default_mount_name(&self, manifest: &mut Value, name: &str) -> Result<()> {
+        match self {
+            Platform::Roblox => {
+                crate::roblox::set_packages_container(manifest, name);
+                Ok(())
+            }
+            Platform::Uefn => Err(anyhow!("The UEFN packages folder can't be renamed.")),
+        }
+    }
+
+    /// Delete a mount's folder (`forest mount remove`).
+    pub fn remove_mount_dir(&self, path: &str) -> Result<()> {
+        match self {
+            Platform::Roblox => crate::roblox::mount_dirs::remove_mount_dir(path),
+            Platform::Uefn => Err(anyhow!("Mounts are not supported on UEFN.")),
+        }
+    }
+
+    /// Move a mount's folder (`forest mount rename`).
+    pub fn move_mount_dir(&self, from: &str, to: &str) -> Result<()> {
+        match self {
+            Platform::Roblox => crate::roblox::mount_dirs::move_mount_dir(from, to),
+            Platform::Uefn => Err(anyhow!("Mounts are not supported on UEFN.")),
+        }
+    }
+
+    /// What a new mount at `dir` would delete that no package manager put
+    /// there; `forest mount create` refuses such a folder.
+    pub fn foreign_mount_entries(&self, dir: &Path) -> Vec<String> {
+        match self {
+            Platform::Roblox => crate::roblox::mount_dirs::foreign_entries(dir),
+            Platform::Uefn => Vec::new(),
         }
     }
 
@@ -227,11 +291,11 @@ impl Platform {
 
     /// Ignore patterns force-appended to the publish matcher AFTER
     /// .gitignore/.forestignore, so they can't be un-ignored. Roblox excludes
-    /// the `Packages/` mount and `forest-lock.json` once the manifest
-    /// declares dependencies.
-    pub fn publish_ignores(&self, forest_json: &Value) -> Vec<String> {
+    /// every mount and `forest-lock.json` once any mount declares
+    /// dependencies.
+    pub fn publish_ignores(&self, mounts: &[Mount]) -> Vec<String> {
         match self {
-            Platform::Roblox => crate::roblox::publish::publish_ignores(forest_json),
+            Platform::Roblox => crate::roblox::publish::publish_ignores(mounts),
             Platform::Uefn => Vec::new(),
         }
     }

@@ -5,11 +5,11 @@ use dialoguer::{theme::ColorfulTheme, Input};
 use semver::{Version, VersionReq};
 
 use crate::commands::overrides::{
-    confirm, fetch_versions, installed_versions, join_versions, lockfile_package_keys,
+    all_direct_deps, confirm, fetch_versions, installed_versions, join_versions, lockfile_package_keys,
     match_override_key, reinstall_or_rollback, remove_map_entry, write_map_entry,
 };
 use crate::message;
-use crate::utils::{normalize_forest_deps, normalize_forest_excludes, resolve_dep_ref, DepRef};
+use crate::utils::{normalize_forest_excludes, resolve_dep_ref, DepRef};
 
 /// What an exclusion range would do to a package's published versions.
 struct ExcludeCheck {
@@ -74,7 +74,7 @@ pub async fn exclude_command(
     // is a fact about the package, not about who depends on it. Resolution
     // order: existing exclusion key, declared root key, typed scope/name,
     // unique bare name in the lockfile.
-    let roots = normalize_forest_deps(&manifest);
+    let roots = all_direct_deps(&manifest, project.platform)?;
     let full_name = match match_override_key(&excludes, &reference) {
         Some(key) => key,
         None => match resolve_dep_ref(&roots, &reference) {

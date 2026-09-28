@@ -1,7 +1,6 @@
 //! UEFN install executor.
 //!
-//! Reached only via the platform dispatch at the top of
-//! lockfile_gen::make_directories. The flow mirrors the Roblox executor
+//! Reached only via `Platform::install`. The flow mirrors the Roblox executor
 //! (plan → scan → reconcile → clean → download → bookkeeping) but against
 //! the flat mount with the 3-way ownership taxonomy (installed / authored /
 //! unknown) and Verse marker regeneration instead of pointer files.
@@ -14,7 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 
 use crate::download_pool::DownloadJob;
-use crate::lockfile_gen::{InstallSummary, LockFile};
+use crate::lockfile::LockSection;
+use crate::lockfile_gen::InstallSummary;
 use crate::fetch_and_extract::fetch_and_extract_verbatim;
 use crate::lockfile_solver::DepSpec;
 use crate::message::{info, warn};
@@ -23,7 +23,7 @@ use crate::receipts;
 use super::plan::plan_install_uefn;
 
 pub async fn make_directories_uefn(
-    lockfile: &LockFile,
+    lockfile: &LockSection,
     root_deps: HashMap<String, DepSpec>,
     force: bool,
 ) -> Result<InstallSummary> {

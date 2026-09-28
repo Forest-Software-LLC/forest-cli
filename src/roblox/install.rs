@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 
 use crate::download_pool::DownloadJob;
-use crate::lockfile_gen::{InstallSummary, LockFile};
+use crate::lockfile::LockSection;
+use crate::lockfile_gen::InstallSummary;
 use crate::lockfile_solver::DepSpec;
+use crate::mounts::Mount;
 use crate::receipts;
 use crate::roblox::extract::fetch_and_extract;
 use crate::roblox::plan::plan_install;
@@ -107,10 +109,47 @@ struct RobloxExtra {
     container: String,
 }
 
+/// A renamed `packagesDir`, a root move within the same parent, or a mount
+/// dropped from forest.json leaves a tree behind. Receipts prove which
+/// leftovers are forest's and those get a direct warning; a receipt-less
+/// literal `Packages/` (pre-receipt forest, or Wally's) keeps the softer
+/// legacy warning. Un-nesting the root moves the old mount out of the
+/// scanned parents, so that case stays silent. Runs once per install across
+/// every mount, so a sibling mount is never mistaken for an old one.
+/// `orphaned` were just reported by the caller.
+pub fn warn_abandoned_mounts(mounts: &[Mount], orphaned: &[String]) {
+    let Some(default) = mounts.iter().find(|m| m.is_default()) else { return };
+    let known: Vec<String> = mounts
+        .iter()
+        .map(|m| m.path.to_ascii_lowercase())
+        .chain(orphaned.iter().map(|p| p.to_ascii_lowercase()))
+        .collect();
+    let abandoned = find_abandoned_mounts(Path::new("."), &default.path, &known);
+    if !abandoned.is_empty() {
+        let list = abandoned
+            .iter()
+            .map(|d| format!("{}/", d))
+            .collect::<Vec<_>>()
+            .join(", ");
+        crate::message::warn(&format!(
+            "Found dependency folder(s) forest no longer manages: {}. Delete them if you don't need them.",
+            list
+        ));
+    }
+    let legacy_already_flagged = abandoned.iter().any(|d| d.eq_ignore_ascii_case(PACKAGES_DIR));
+    let legacy_is_a_mount = known.iter().any(|p| p.eq_ignore_ascii_case(PACKAGES_DIR));
+    if !legacy_is_a_mount && !legacy_already_flagged && Path::new(PACKAGES_DIR).is_dir() {
+        crate::message::warn(&format!(
+            "Dependencies now install to {}/; the old {}/ directory is no longer managed and can be deleted if unused.",
+            default.path, PACKAGES_DIR
+        ));
+    }
+}
+
 pub async fn make_directories_roblox(
-    lockfile: &LockFile,
+    section: &LockSection,
     root_deps: HashMap<String, DepSpec>,
-    manifest: &serde_json::Value,
+    mount: &Mount,
     force: bool,
 ) -> Result<InstallSummary> {
     // The receipt scan and type pass skip `_`/`.` entries, so a package
@@ -126,45 +165,19 @@ pub async fn make_directories_roblox(
 
     // All path/pointer computation is pure and lives in roblox/plan.rs; plan
     // paths stay in the virtual `./<container>/...` format and are mapped
-    // onto the physical mount (derived from the manifest's `root` and
-    // `packagesDir`) only here. One manifest read feeds the planner's root
-    // prefix, physical_path, the receipt scan, and prune_top_level, so their
-    // prefixes can never mismatch.
-    let container = crate::roblox::packages_container(manifest);
-    let plan = plan_install(lockfile, &root_deps, &container)?;
-    let base = crate::roblox::packages_base(manifest);
+    // onto the physical mount only here. The mount's folder name is the
+    // container prefix and its path the base, so the planner's root prefix,
+    // physical_path, the receipt scan, and prune_top_level can never
+    // disagree.
+    let container = mount.name().to_string();
+    let plan = plan_install(section, &root_deps, &container)?;
+    let base = mount.path.clone();
 
     // All mount deletions below go through the bin (see TrashBin) so a live
     // `rojo serve` never sees a child removal under an already-gone parent.
     let ScratchDirs { trash: trash_dir, staging: staging_dir } = scratch_dirs();
     let mut trash = TrashBin::new(trash_dir);
     crate::roblox::scratch::sweep_leftovers();
-
-    // A renamed `packagesDir` or a root move within the same parent leaves
-    // the old tree behind. Receipts prove which leftovers are forest's and
-    // those get a direct warning; a receipt-less literal `Packages/`
-    // (pre-receipt forest, or Wally's) keeps the softer legacy warning.
-    // Un-nesting the root moves the old mount out of the scanned parents,
-    // so that case stays silent.
-    let abandoned = find_abandoned_mounts(Path::new("."), &base);
-    if !abandoned.is_empty() {
-        let list = abandoned
-            .iter()
-            .map(|d| format!("{}/", d))
-            .collect::<Vec<_>>()
-            .join(", ");
-        crate::message::warn(&format!(
-            "Found old dependency folder(s) no longer managed by forest: {}. Dependencies now install to {}/. The old folder(s) can be deleted.",
-            list, base
-        ));
-    }
-    let legacy_already_flagged = abandoned.iter().any(|d| d.eq_ignore_ascii_case(PACKAGES_DIR));
-    if base != PACKAGES_DIR && !legacy_already_flagged && Path::new(PACKAGES_DIR).is_dir() {
-        crate::message::warn(&format!(
-            "Dependencies now install to {}/; the old {}/ directory is no longer managed and can be deleted if unused.",
-            base, PACKAGES_DIR
-        ));
-    }
 
     if !Path::new(&base).exists() {
         fs::create_dir_all(&base)?;
@@ -188,7 +201,7 @@ pub async fn make_directories_roblox(
     // is installed, deleted, or pointer-written, since writes there would
     // reach the developer's working tree through the junction. The overlay
     // itself is applied after extraction, below.
-    let link_res = crate::links::resolve_active(&root_deps);
+    let link_res = crate::links::resolve_active(&root_deps, mount);
     for warning in &link_res.warnings {
         crate::message::warn(warning);
     }
@@ -422,7 +435,7 @@ pub async fn make_directories_roblox(
         // Deps the linked working tree declares beyond the pinned registry
         // version come from ITS OWN tree; surface the drift explicitly.
         for link in &link_res.active {
-            let pinned_deps = lockfile
+            let pinned_deps = section
                 .root_entry(&link.name)
                 .map(|e| e.dependencies.clone())
                 .unwrap_or_default();
@@ -434,7 +447,7 @@ pub async fn make_directories_roblox(
             }
         }
         crate::links::print_banner(&link_res.active, |name| {
-            lockfile.pinned_version(name).map(str::to_string)
+            section.pinned_version(name).map(str::to_string)
         });
     }
 
@@ -536,15 +549,14 @@ fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, containe
     Ok(foreign)
 }
 
-/// Find abandoned forest-managed mounts near the current one: an immediate
-/// subdirectory of the project top level or of the mount's parent, not the
-/// mount itself, whose immediate children carry receipts. Returns relative
-/// paths with forward slashes. Comparison against the mount is
-/// case-insensitive so the current mount is never listed on case-folding
-/// filesystems.
-fn find_abandoned_mounts(manifest_dir: &Path, base: &str) -> Vec<String> {
+/// Find abandoned forest-managed mounts near the default one: an immediate
+/// subdirectory of the project top level or of the default mount's parent,
+/// not one of `known` (every declared mount, lowercased), whose immediate
+/// children carry receipts. Returns relative paths with forward slashes.
+/// The comparison is case-insensitive so a current mount is never listed on
+/// case-folding filesystems.
+fn find_abandoned_mounts(manifest_dir: &Path, base: &str, known: &[String]) -> Vec<String> {
     let base_norm = base.replace('\\', "/");
-    let mount = base_norm.to_ascii_lowercase();
     let mut parents: Vec<String> = vec![String::new()];
     if let Some((parent, _)) = base_norm.rsplit_once('/') {
         if !parent.is_empty() {
@@ -575,7 +587,7 @@ fn find_abandoned_mounts(manifest_dir: &Path, base: &str) -> Vec<String> {
             } else {
                 format!("{}/{}", parent, name)
             };
-            if rel.to_ascii_lowercase() == mount {
+            if known.contains(&rel.to_ascii_lowercase()) {
                 continue;
             }
             if has_receipt_child(&entry.path()) {
@@ -797,9 +809,28 @@ mod tests {
         let project = abandoned_fixture("rename", "OldName");
         fs::create_dir_all(project.join("NewName")).unwrap();
 
-        let found = find_abandoned_mounts(&project, "NewName");
+        let found = find_abandoned_mounts(&project, "NewName", &known(&["NewName"]));
 
         assert_eq!(found, vec!["OldName".to_string()]);
+        let _ = fs::remove_dir_all(&project);
+    }
+
+    fn known(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| p.to_ascii_lowercase()).collect()
+    }
+
+    #[test]
+    fn abandoned_never_lists_a_sibling_mount() {
+        // DevPackages holds receipts too, but it is a declared mount.
+        let project = abandoned_fixture("sibling", "DevPackages");
+        fs::create_dir_all(project.join("Packages")).unwrap();
+
+        assert!(find_abandoned_mounts(&project, "Packages", &known(&["Packages", "DevPackages"])).is_empty());
+        assert_eq!(
+            find_abandoned_mounts(&project, "Packages", &known(&["Packages"])),
+            vec!["DevPackages".to_string()],
+            "the same folder is abandoned once the mount is gone"
+        );
         let _ = fs::remove_dir_all(&project);
     }
 
@@ -808,7 +839,7 @@ mod tests {
         let project = abandoned_fixture("nested", "src/OldName");
         fs::create_dir_all(project.join("src").join("NewName")).unwrap();
 
-        let found = find_abandoned_mounts(&project, "src/NewName");
+        let found = find_abandoned_mounts(&project, "src/NewName", &known(&["src/NewName"]));
 
         assert_eq!(found, vec!["src/OldName".to_string()]);
         let _ = fs::remove_dir_all(&project);
@@ -820,7 +851,7 @@ mod tests {
         let project = abandoned_fixture("legacy", "NewName");
         fs::create_dir_all(project.join("Packages").join("Knit")).unwrap();
 
-        let found = find_abandoned_mounts(&project, "NewName");
+        let found = find_abandoned_mounts(&project, "NewName", &known(&["NewName"]));
 
         assert!(found.is_empty(), "no receipts means not provably forest's: {:?}", found);
         let _ = fs::remove_dir_all(&project);
@@ -830,9 +861,9 @@ mod tests {
     fn abandoned_never_lists_the_current_mount() {
         let project = abandoned_fixture("current", "Packages");
 
-        assert!(find_abandoned_mounts(&project, "Packages").is_empty());
+        assert!(find_abandoned_mounts(&project, "Packages", &known(&["Packages"])).is_empty());
         // Casing differences on a case-insensitive filesystem still match.
-        assert!(find_abandoned_mounts(&project, "packages").is_empty());
+        assert!(find_abandoned_mounts(&project, "packages", &known(&["packages"])).is_empty());
         let _ = fs::remove_dir_all(&project);
     }
 
@@ -842,7 +873,7 @@ mod tests {
         fs::create_dir_all(project.join("assets").join("textures")).unwrap();
         fs::write(project.join("assets").join("readme.txt"), "x").unwrap();
 
-        let found = find_abandoned_mounts(&project, "NewName");
+        let found = find_abandoned_mounts(&project, "NewName", &known(&["NewName"]));
 
         assert!(found.is_empty(), "receipt-less dirs are not mounts: {:?}", found);
         let _ = fs::remove_dir_all(&project);

@@ -6,8 +6,12 @@
 //! platform executor applies linked slots as an overlay afterwards
 //! (Roblox: src/roblox/link_overlay.rs).
 //!
-//! Core module: storage, policy, and matching stored links against the
-//! manifest's direct dependencies. Never imports platform code.
+//! Core module: storage, policy, and matching stored links against a
+//! mount's direct dependencies. Never imports platform code.
+//!
+//! Links for the default mount live under `links`, the only shape older
+//! CLIs know; links for other mounts live under `mounts`, keyed by mount
+//! path, where older CLIs never look.
 
 use std::collections::HashMap;
 use std::fs;
@@ -18,6 +22,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{Map, Value};
 
 use crate::lockfile_solver::DepSpec;
+use crate::mounts::Mount;
 use crate::utils::same_package;
 
 pub const LINKS_DIR: &str = ".forest";
@@ -70,13 +75,26 @@ fn policy() -> &'static LinkPolicy {
 // Storage. Writes round-trip through serde_json::Value so unknown fields
 // survive; the schema is versioned.
 
-/// One entry as stored on disk: the canonical dependency key it overrides
-/// and the target path exactly as the user typed it.
-#[derive(Debug, Clone)]
+/// One entry as stored on disk: the canonical dependency key it overrides,
+/// the target path exactly as the user typed it, and the mount it applies
+/// to (None for the default mount).
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoredLink {
     pub name: String,
     pub path: String,
+    pub mount: Option<String>,
 }
+
+impl StoredLink {
+    pub fn belongs_to(&self, mount: &Mount) -> bool {
+        match &self.mount {
+            None => mount.is_default(),
+            Some(path) => !mount.is_default() && path.eq_ignore_ascii_case(&mount.path),
+        }
+    }
+}
+
+const MOUNT_LINKS: &str = "mounts";
 
 fn read_file(manifest_dir: &Path) -> Option<Value> {
     let text = fs::read_to_string(manifest_dir.join(LINKS_FILE)).ok()?;
@@ -111,28 +129,67 @@ pub fn stored_links_in(manifest_dir: &Path) -> Vec<StoredLink> {
     let Some(file) = read_file(manifest_dir) else {
         return Vec::new();
     };
-    let Some(links) = file.get("links").and_then(Value::as_object) else {
-        return Vec::new();
+    let entries = |links: &Map<String, Value>, mount: Option<&String>| -> Vec<StoredLink> {
+        links
+            .iter()
+            .filter_map(|(name, entry)| {
+                let path = entry.get("path").and_then(Value::as_str)?;
+                Some(StoredLink { name: name.clone(), path: path.to_string(), mount: mount.cloned() })
+            })
+            .collect()
     };
-    let mut out: Vec<StoredLink> = links
-        .iter()
-        .filter_map(|(name, entry)| {
-            let path = entry.get("path").and_then(Value::as_str)?;
-            Some(StoredLink { name: name.clone(), path: path.to_string() })
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out: Vec<StoredLink> = file
+        .get("links")
+        .and_then(Value::as_object)
+        .map(|links| entries(links, None))
+        .unwrap_or_default();
+    if let Some(mounts) = file.get(MOUNT_LINKS).and_then(Value::as_object) {
+        for (mount, links) in mounts {
+            if let Some(links) = links.as_object() {
+                out.extend(entries(links, Some(mount)));
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.mount, &a.name).cmp(&(&b.mount, &b.name)));
     out
 }
 
-/// Add or replace the link for `name` (case-insensitive key match replaces
-/// in place, keeping the stored casing stable).
-pub fn upsert_link(manifest_dir: &Path, name: &str, path: &str) -> Result<()> {
+/// The link map a mount's entries live in (None = default), created when
+/// absent.
+fn links_map_mut<'a>(file: &'a mut Value, mount: Option<&str>) -> &'a mut Map<String, Value> {
+    let slot = match mount {
+        None => {
+            if !file.get("links").map_or(false, Value::is_object) {
+                file["links"] = Value::Object(Map::new());
+            }
+            &mut file["links"]
+        }
+        Some(mount) => {
+            if !file.get(MOUNT_LINKS).map_or(false, Value::is_object) {
+                file[MOUNT_LINKS] = Value::Object(Map::new());
+            }
+            let mounts = file[MOUNT_LINKS].as_object_mut().expect("ensured above");
+            let key = mounts
+                .keys()
+                .find(|k| k.eq_ignore_ascii_case(mount))
+                .cloned()
+                .unwrap_or_else(|| mount.to_string());
+            let slot = mounts.entry(key).or_insert_with(|| Value::Object(Map::new()));
+            if !slot.is_object() {
+                *slot = Value::Object(Map::new());
+            }
+            slot
+        }
+    };
+    slot.as_object_mut().expect("ensured above")
+}
+
+/// Add or replace the link for `name` in a mount (None = default). A
+/// case-insensitive key match replaces in place, keeping the stored casing
+/// stable.
+pub fn upsert_link(manifest_dir: &Path, name: &str, path: &str, mount: Option<&str>) -> Result<()> {
     let mut file = read_file(manifest_dir).unwrap_or_else(|| Value::Object(Map::new()));
-    if !file.get("links").map_or(false, Value::is_object) {
-        file["links"] = Value::Object(Map::new());
-    }
-    let links = file["links"].as_object_mut().expect("links is an object");
+    let links = links_map_mut(&mut file, mount);
     let key = links
         .keys()
         .find(|k| same_package(k, name))
@@ -153,54 +210,101 @@ pub fn upsert_link(manifest_dir: &Path, name: &str, path: &str) -> Result<()> {
     write_file(manifest_dir, file)
 }
 
-/// Remove one link, matched by package name (case-insensitive) or by the
-/// stored path (verbatim or resolving to the same location). Returns the
-/// removed key, or None when nothing matched.
-pub fn remove_link(manifest_dir: &Path, reference: &str) -> Result<Option<String>> {
-    let Some(mut file) = read_file(manifest_dir) else {
-        return Ok(None);
-    };
-    let Some(links) = file.get_mut("links").and_then(Value::as_object_mut) else {
-        return Ok(None);
-    };
+/// The stored links a reference names: by package (scope/name or bare
+/// name, case-insensitive) or by the stored path (verbatim or resolving to
+/// the same location).
+pub fn matching_links(manifest_dir: &Path, stored: &[StoredLink], reference: &str) -> Vec<StoredLink> {
     let ref_resolved = fs::canonicalize(manifest_dir.join(reference)).ok();
-    let key = links
+    stored
         .iter()
-        .find(|(name, entry)| {
-            if same_package(name, reference)
-                || name.rsplit('/').next().map_or(false, |n| n.eq_ignore_ascii_case(reference))
-            {
-                return true;
-            }
-            let Some(stored_path) = entry.get("path").and_then(Value::as_str) else {
-                return false;
-            };
-            stored_path == reference
+        .filter(|link| {
+            same_package(&link.name, reference)
+                || link.name.rsplit('/').next().map_or(false, |n| n.eq_ignore_ascii_case(reference))
+                || link.path == reference
                 || (ref_resolved.is_some()
-                    && fs::canonicalize(manifest_dir.join(stored_path)).ok() == ref_resolved)
+                    && fs::canonicalize(manifest_dir.join(&link.path)).ok() == ref_resolved)
         })
-        .map(|(name, _)| name.clone());
-    if let Some(key) = &key {
-        links.remove(key);
-        write_file(manifest_dir, file)?;
-    }
-    Ok(key)
+        .cloned()
+        .collect()
 }
 
-/// Remove every link. Returns the removed keys.
-pub fn remove_all(manifest_dir: &Path) -> Result<Vec<String>> {
+/// Remove exactly one stored link.
+pub fn remove_stored(manifest_dir: &Path, link: &StoredLink) -> Result<()> {
+    let Some(mut file) = read_file(manifest_dir) else {
+        return Ok(());
+    };
+    let links = links_map_mut(&mut file, link.mount.as_deref());
+    let key = links.keys().find(|k| same_package(k, &link.name)).cloned();
+    if let Some(key) = key {
+        links.remove(&key);
+    }
+    drop_empty_mounts(&mut file);
+    write_file(manifest_dir, file)
+}
+
+/// Remove every link in every mount. Returns what was removed.
+pub fn remove_all(manifest_dir: &Path) -> Result<Vec<StoredLink>> {
+    let removed = stored_links_in(manifest_dir);
     let Some(mut file) = read_file(manifest_dir) else {
         return Ok(Vec::new());
     };
-    let Some(links) = file.get_mut("links").and_then(Value::as_object_mut) else {
-        return Ok(Vec::new());
-    };
-    let keys: Vec<String> = links.keys().cloned().collect();
-    if !keys.is_empty() {
-        links.clear();
+    if !removed.is_empty() {
+        file["links"] = Value::Object(Map::new());
+        if let Some(obj) = file.as_object_mut() {
+            obj.remove(MOUNT_LINKS);
+        }
         write_file(manifest_dir, file)?;
     }
-    Ok(keys)
+    Ok(removed)
+}
+
+/// Follow a mount rename: its links move with it.
+pub fn rename_mount_links(manifest_dir: &Path, old_path: &str, new_path: &str) -> Result<()> {
+    let Some(mut file) = read_file(manifest_dir) else {
+        return Ok(());
+    };
+    let Some(mounts) = file.get_mut(MOUNT_LINKS).and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let Some(key) = mounts.keys().find(|k| k.eq_ignore_ascii_case(old_path)).cloned() else {
+        return Ok(());
+    };
+    let entry = mounts.remove(&key).expect("key came from the map");
+    mounts.insert(new_path.to_string(), entry);
+    write_file(manifest_dir, file)
+}
+
+/// Forget a removed mount's links. Returns what was dropped.
+pub fn drop_mount_links(manifest_dir: &Path, mount_path: &str) -> Result<Vec<StoredLink>> {
+    let dropped: Vec<StoredLink> = stored_links_in(manifest_dir)
+        .into_iter()
+        .filter(|l| l.mount.as_deref().map_or(false, |m| m.eq_ignore_ascii_case(mount_path)))
+        .collect();
+    if dropped.is_empty() {
+        return Ok(dropped);
+    }
+    let Some(mut file) = read_file(manifest_dir) else {
+        return Ok(Vec::new());
+    };
+    if let Some(mounts) = file.get_mut(MOUNT_LINKS).and_then(Value::as_object_mut) {
+        mounts.retain(|k, _| !k.eq_ignore_ascii_case(mount_path));
+    }
+    drop_empty_mounts(&mut file);
+    write_file(manifest_dir, file)?;
+    Ok(dropped)
+}
+
+/// Keep the file tidy: no empty per-mount maps, no empty `mounts` field.
+fn drop_empty_mounts(file: &mut Value) {
+    let Some(mounts) = file.get_mut(MOUNT_LINKS).and_then(Value::as_object_mut) else {
+        return;
+    };
+    mounts.retain(|_, links| links.as_object().map_or(false, |l| !l.is_empty()));
+    if mounts.is_empty() {
+        if let Some(obj) = file.as_object_mut() {
+            obj.remove(MOUNT_LINKS);
+        }
+    }
 }
 
 // Resolution against the manifest's direct dependencies.
@@ -292,12 +396,12 @@ fn resolve_one(link: &StoredLink, alias: &str, dep_key: &str) -> std::result::Re
     })
 }
 
-/// Match the stored links against the manifest's direct dependencies and
-/// check each target is still readable. Links that don't match a dependency
-/// or whose target is gone become warnings, never errors; install must keep
+/// Match a mount's stored links against its direct dependencies and check
+/// each target is still readable. Links that don't match a dependency or
+/// whose target is gone become warnings, never errors; install must keep
 /// working with the registry graph.
-pub fn resolve_active(root_deps: &HashMap<String, DepSpec>) -> LinkResolution {
-    let stored = stored_links();
+pub fn resolve_active(root_deps: &HashMap<String, DepSpec>, mount: &Mount) -> LinkResolution {
+    let stored: Vec<StoredLink> = stored_links().into_iter().filter(|l| l.belongs_to(mount)).collect();
     if stored.is_empty() {
         return LinkResolution::default();
     }
@@ -315,9 +419,13 @@ pub fn resolve_active(root_deps: &HashMap<String, DepSpec>) -> LinkResolution {
             .iter()
             .find(|(k, _)| same_package(k, &link.name))
         else {
+            let (place, flag) = match &link.mount {
+                None => (String::new(), String::new()),
+                Some(path) => (format!(" of mount {}", path), format!(" --mount {}", path)),
+            };
             res.warnings.push(format!(
-                "Link for {} no longer matches a dependency in forest.json; run `forest unlink {}` to clean it up.",
-                link.name, link.name
+                "Link for {} no longer matches a dependency{} in forest.json; run `forest unlink {}{}` to clean it up.",
+                link.name, place, link.name, flag
             ));
             continue;
         };
@@ -446,7 +554,7 @@ mod tests {
         )
         .unwrap();
 
-        upsert_link(&dir, "acme/promise", "../promise").unwrap();
+        upsert_link(&dir, "acme/promise", "../promise", None).unwrap();
 
         let file: Value = serde_json::from_str(&fs::read_to_string(dir.join(LINKS_FILE)).unwrap()).unwrap();
         assert_eq!(file["futureField"]["keep"], Value::Bool(true), "unknown top-level fields survive");
@@ -456,7 +564,7 @@ mod tests {
         assert_eq!(file["_comment"], Value::from(LINKS_COMMENT), "comment is normalized on write");
 
         // Case-insensitive upsert replaces in place, keeping the stored casing.
-        upsert_link(&dir, "ACME/Knit", "../knit2").unwrap();
+        upsert_link(&dir, "ACME/Knit", "../knit2", None).unwrap();
         let links = stored_links_in(&dir);
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].name, "acme/knit");
@@ -466,19 +574,49 @@ mod tests {
     }
 
     #[test]
-    fn remove_matches_name_bare_name_and_path() {
+    fn matching_finds_links_by_name_bare_name_and_path() {
         let dir = fixture("remove");
-        upsert_link(&dir, "acme/knit", "../knit").unwrap();
-        upsert_link(&dir, "acme/promise", "../promise").unwrap();
+        upsert_link(&dir, "acme/knit", "../knit", None).unwrap();
+        upsert_link(&dir, "acme/promise", "../promise", None).unwrap();
+        let stored = stored_links_in(&dir);
+        let names = |refr: &str| -> Vec<String> {
+            matching_links(&dir, &stored, refr).into_iter().map(|l| l.name).collect()
+        };
 
-        assert_eq!(remove_link(&dir, "ACME/KNIT").unwrap(), Some("acme/knit".to_string()));
-        assert_eq!(remove_link(&dir, "promise").unwrap(), Some("acme/promise".to_string()));
-        assert_eq!(remove_link(&dir, "acme/gone").unwrap(), None, "unknown reference is a no-op");
+        assert_eq!(names("ACME/KNIT"), vec!["acme/knit"]);
+        assert_eq!(names("promise"), vec!["acme/promise"]);
+        assert_eq!(names("../knit"), vec!["acme/knit"], "verbatim path matches");
+        assert!(names("acme/gone").is_empty());
 
-        upsert_link(&dir, "acme/knit", "../knit").unwrap();
-        assert_eq!(remove_link(&dir, "../knit").unwrap(), Some("acme/knit".to_string()), "verbatim path matches");
-        assert!(stored_links_in(&dir).is_empty());
+        remove_stored(&dir, &matching_links(&dir, &stored, "knit")[0]).unwrap();
+        assert_eq!(stored_links_in(&dir).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
+    #[test]
+    fn mount_links_live_apart_from_default_links() {
+        let dir = fixture("mount-links");
+        upsert_link(&dir, "acme/signal", "../signal", None).unwrap();
+        upsert_link(&dir, "acme/signal", "../signal-dev", Some("DevPackages")).unwrap();
+
+        let file: Value = serde_json::from_str(&fs::read_to_string(dir.join(LINKS_FILE)).unwrap()).unwrap();
+        assert_eq!(file["links"]["acme/signal"]["path"], "../signal", "older CLIs keep seeing the default link");
+        assert_eq!(file["mounts"]["DevPackages"]["acme/signal"]["path"], "../signal-dev");
+
+        let stored = stored_links_in(&dir);
+        assert_eq!(stored.len(), 2);
+        let both = matching_links(&dir, &stored, "signal");
+        assert_eq!(both.len(), 2, "the same package linked in two mounts");
+
+        rename_mount_links(&dir, "devpackages", "tools/Dev").unwrap();
+        let moved = stored_links_in(&dir);
+        assert!(moved.iter().any(|l| l.mount.as_deref() == Some("tools/Dev")));
+
+        let dropped = drop_mount_links(&dir, "tools/Dev").unwrap();
+        assert_eq!(dropped.len(), 1);
+        let file: Value = serde_json::from_str(&fs::read_to_string(dir.join(LINKS_FILE)).unwrap()).unwrap();
+        assert!(file.get("mounts").is_none(), "an emptied mounts map is dropped");
+        assert_eq!(stored_links_in(&dir).len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -486,10 +624,9 @@ mod tests {
     fn remove_all_clears_and_reports() {
         let dir = fixture("remove-all");
         assert!(remove_all(&dir).unwrap().is_empty(), "no file is a clean no-op");
-        upsert_link(&dir, "a/x", "../x").unwrap();
-        upsert_link(&dir, "b/y", "../y").unwrap();
-        let mut removed = remove_all(&dir).unwrap();
-        removed.sort();
+        upsert_link(&dir, "a/x", "../x", None).unwrap();
+        upsert_link(&dir, "b/y", "../y", Some("DevPackages")).unwrap();
+        let removed: Vec<String> = remove_all(&dir).unwrap().into_iter().map(|l| l.name).collect();
         assert_eq!(removed, vec!["a/x".to_string(), "b/y".to_string()]);
         assert!(stored_links_in(&dir).is_empty());
         let _ = fs::remove_dir_all(&dir);

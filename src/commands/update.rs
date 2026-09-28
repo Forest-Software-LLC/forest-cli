@@ -8,13 +8,14 @@
 //! first-ever install would put them.
 
 use std::collections::BTreeMap;
-use std::fs;
 
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::lockfile_gen::lockfile_gen;
+use crate::lockfile::{LockFile, LockSection};
+use crate::lockfile_gen::{sync, Refresh, SyncOptions};
 use crate::message::{self, Message};
+use crate::mounts::Mount;
 
 /// Package name -> sorted resolved versions (usually one; conflict buckets
 /// can hold several), taken from a lockfile's `packages` map.
@@ -66,39 +67,61 @@ fn diff_locked(
     lines
 }
 
-pub async fn update_command() -> Result<()> {
+/// A mount's section as the version map the diff compares.
+fn section_versions(section: Option<&LockSection>) -> Result<BTreeMap<String, Vec<String>>> {
+    Ok(match section {
+        Some(section) => locked_version_map(&serde_json::to_value(section)?),
+        None => BTreeMap::new(),
+    })
+}
+
+pub async fn update_command(mount: Option<String>) -> Result<()> {
     let Some(project) = super::context::load_project()? else {
         crate::message::fail("No forest.json found. Run `forest init` to create a new package.");
         return Ok(());
     };
-    let mut msg = Message::new("Updating dependencies...");
     let info = project.manifest;
+    let mounts = crate::mounts::project_mounts(&info, project.platform)?;
+    let scope = mount.as_deref().map(|r| crate::mounts::find_mount(&mounts, r)).transpose()?;
+    let in_run: Vec<&Mount> = mounts.iter().filter(|m| scope.map_or(true, |s| s.path == m.path)).collect();
+    let mut msg = Message::new("Updating dependencies...");
 
     // Read only for the before/after report.
-    let old_versions = fs::read_to_string("forest-lock.json")
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .map(|lock| locked_version_map(&lock))
-        .unwrap_or_default();
+    let old = LockFile::load();
+    let mut old_versions = Vec::new();
+    for mount in &in_run {
+        old_versions.push(section_versions(old.as_ref().and_then(|lf| lf.section(mount)))?);
+    }
 
-    let lockfile = lockfile_gen(&info, &mut msg, false).await?;
-    fs::write("forest-lock.json", lockfile.to_json_pretty()?)?;
-
-    let new_versions = locked_version_map(&serde_json::to_value(&lockfile)?);
-    let changes = diff_locked(&old_versions, &new_versions);
+    let opts = SyncOptions::new(scope.map(|m| m.path.clone()), Refresh::All);
+    let outcome = sync(&info, &mut msg, &opts).await?;
 
     msg.destroy();
-    if changes.is_empty() {
+    let mut total = 0;
+    for (mount, old) in in_run.iter().zip(&old_versions) {
+        let changes = diff_locked(old, &section_versions(outcome.lockfile.section(mount))?);
+        if changes.is_empty() {
+            continue;
+        }
+        let indent = if mounts.len() > 1 {
+            message::info(&format!("{}:", mount.label()));
+            "    "
+        } else {
+            "  "
+        };
+        for line in &changes {
+            message::info(&format!("{}{}", indent, line));
+        }
+        total += changes.len();
+    }
+    if total == 0 {
         message::success("All dependencies are already at their newest allowed versions!");
         message::info("Newer majors may exist outside your declared ranges - see `forest audit`.");
     } else {
-        for line in &changes {
-            message::info(&format!("  {}", line));
-        }
         message::success(&format!(
             "Updated {} package{} within the declared ranges!",
-            changes.len(),
-            if changes.len() == 1 { "" } else { "s" }
+            total,
+            if total == 1 { "" } else { "s" }
         ));
     }
 

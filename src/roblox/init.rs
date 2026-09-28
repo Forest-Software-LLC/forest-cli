@@ -7,8 +7,10 @@
 //! install's create-on-install path) writes the bare consuming manifest.
 //! When a `wally.toml` is present, both modes offer to convert from Wally by
 //! importing its dependencies (they resolve as-is: every wally package is
-//! mirrored on the Forest registry under the same scope/name). Reached only
-//! through the `Platform` seam.
+//! mirrored on the Forest registry under the same scope/name). Server and
+//! dev dependencies become the ServerPackages and DevPackages mounts, the
+//! folders Wally already used, and wally.lock goes. Reached only through the
+//! `Platform` seam.
 
 use anyhow::Result;
 use dialoguer::{theme::ColorfulTheme, Input};
@@ -16,7 +18,30 @@ use serde_json::{json, Map, Value};
 use std::{fs, path::Path};
 
 use crate::message::{info, success, warn};
-use crate::platform::InitMode;
+use crate::platform::{InitMode, Platform};
+use crate::roblox::wally::{WallyDep, DEV_PACKAGES, SERVER_PACKAGES};
+
+/// What a Wally conversion brings into the new manifest.
+#[derive(Default)]
+struct Imported {
+    dependencies: Map<String, Value>,
+    /// Extra mounts by folder path.
+    mounts: Vec<(String, Map<String, Value>)>,
+    license: Option<String>,
+    from_wally: bool,
+}
+
+fn dep_map(deps: &[WallyDep]) -> Map<String, Value> {
+    deps.iter()
+        .map(|dep| {
+            let value = match &dep.alias {
+                Some(alias) => json!({ "version": dep.version, "alias": alias }),
+                None => Value::String(dep.version.clone()),
+            };
+            (dep.full_name.clone(), value)
+        })
+        .collect()
+}
 
 pub fn init(cwd: &Path, mode: InitMode, packages_dir: Option<&str>) -> Result<()> {
     if cwd.join("forest.json").exists() {
@@ -28,8 +53,7 @@ pub fn init(cwd: &Path, mode: InitMode, packages_dir: Option<&str>) -> Result<()
     let packages_dir = resolve_packages_dir(packages_dir)?;
 
     // Wally conversion offer: pull the deps straight into forest.json.
-    let mut dependencies = Map::new();
-    let mut license: Option<String> = None;
+    let mut imported = Imported::default();
     let wally_path = cwd.join("wally.toml");
     if wally_path.is_file() {
         let convert = dialoguer::Select::with_theme(&ColorfulTheme::default())
@@ -47,25 +71,16 @@ pub fn init(cwd: &Path, mode: InitMode, packages_dir: Option<&str>) -> Result<()
                     for skipped in &import.skipped_malformed {
                         warn(&format!("wally.toml: skipped {}", skipped));
                     }
-                    for dep in &import.dependencies {
-                        let value = match &dep.alias {
-                            Some(alias) => json!({ "version": dep.version, "alias": alias }),
-                            None => Value::String(dep.version.clone()),
-                        };
-                        dependencies.insert(dep.full_name.clone(), value);
-                    }
-                    license = import.license;
-                    let mut summary = format!(
-                        "Imported {} dependencies from wally.toml.",
-                        import.dependencies.len()
-                    );
-                    if import.skipped_dev > 0 {
-                        summary.push_str(&format!(
-                            " ({} dev-dependencies skipped: forest manifests don't model them yet.)",
-                            import.skipped_dev
-                        ));
-                    }
-                    info(&summary);
+                    imported = Imported {
+                        dependencies: dep_map(&import.dependencies),
+                        mounts: [(SERVER_PACKAGES, &import.server_dependencies), (DEV_PACKAGES, &import.dev_dependencies)]
+                            .into_iter()
+                            .filter(|(_, deps)| !deps.is_empty())
+                            .map(|(folder, deps)| (folder.to_string(), dep_map(deps)))
+                            .collect(),
+                        license: import.license,
+                        from_wally: true,
+                    };
                 }
                 Err(err) => warn(&format!(
                     "Could not read wally.toml ({}). Initializing without imported dependencies.",
@@ -77,7 +92,8 @@ pub fn init(cwd: &Path, mode: InitMode, packages_dir: Option<&str>) -> Result<()
 
     match mode {
         InitMode::Project { from_install } => {
-            scaffold_project(cwd, &packages_dir, dependencies, license)?;
+            let manifest = scaffold_project(cwd, &packages_dir, &imported)?;
+            report_wally_import(cwd, &manifest, &imported)?;
             success(&format!("Initialized a new project in {}", cwd.display()));
             if !from_install {
                 info("You can now run `forest install` to install dependencies!");
@@ -111,7 +127,8 @@ pub fn init(cwd: &Path, mode: InitMode, packages_dir: Option<&str>) -> Result<()
                 .interact_text()?;
             let root = normalize_root(&root);
 
-            let manifest = scaffold_package(cwd, &name, &root, &packages_dir, dependencies, license)?;
+            let manifest = scaffold_package(cwd, &name, &root, &packages_dir, &imported)?;
+            report_wally_import(cwd, &manifest, &imported)?;
 
             success(&format!("Initialized package \"{}\" in {}", name, cwd.display()));
             info(&format!(
@@ -131,7 +148,7 @@ fn resolve_packages_dir(flag: Option<&str>) -> Result<String> {
     match flag {
         Some(raw) => {
             let trimmed = raw.trim();
-            crate::roblox::validate_packages_dir(trimmed)
+            crate::mounts::validate_folder_name(trimmed)
                 .map_err(|reason| anyhow::anyhow!("Invalid --packages-dir: {}", reason))?;
             Ok(trimmed.to_string())
         }
@@ -139,27 +156,69 @@ fn resolve_packages_dir(flag: Option<&str>) -> Result<String> {
     }
 }
 
-/// Bare consuming manifest + the top-level dependency mount (install's
+/// After a Wally conversion: say where everything went, and drop
+/// wally.lock, which forest-lock.json replaces.
+fn report_wally_import(cwd: &Path, manifest: &Value, imported: &Imported) -> Result<()> {
+    if !imported.from_wally {
+        return Ok(());
+    }
+    let mounts = crate::mounts::project_mounts(manifest, Platform::Roblox)?;
+    let filled: Vec<&str> = mounts.iter().filter(|m| !m.deps.is_empty()).map(|m| m.path.as_str()).collect();
+    let count: usize = mounts.iter().map(|m| m.deps.len()).sum();
+    if filled.is_empty() {
+        info("wally.toml declares no dependencies.");
+    } else {
+        info(&format!(
+            "Imported {} dependenc{} from wally.toml into {}.",
+            count,
+            if count == 1 { "y" } else { "ies" },
+            filled.join(", ")
+        ));
+    }
+    let lock = cwd.join("wally.lock");
+    if lock.is_file() {
+        fs::remove_file(&lock)?;
+        info("Removed wally.lock; forest-lock.json takes its place.");
+    }
+    info("The next `forest install` fills those folders and removes Wally's leftovers there. wally.toml is no longer used and can be deleted.");
+    Ok(())
+}
+
+/// Write the manifest and create every mount folder, after the same checks
+/// install runs (a --packages-dir that collides with a Wally folder fails
+/// here, before anything is written).
+fn write_manifest(cwd: &Path, manifest: &Value) -> Result<()> {
+    for mount in crate::mounts::project_mounts(manifest, Platform::Roblox)? {
+        let dir = cwd.join(&mount.path);
+        if !dir.exists() {
+            fs::create_dir_all(&dir)?;
+        }
+    }
+    fs::write(cwd.join("forest.json"), serde_json::to_string_pretty(manifest)?)?;
+    Ok(())
+}
+
+/// Bare consuming manifest + its dependency mounts (install's
 /// create-on-install scaffold; must never prompt). `packages_dir` must
 /// already be validated; written only when non-default.
-fn scaffold_project(cwd: &Path, packages_dir: &str, dependencies: Map<String, Value>, license: Option<String>) -> Result<()> {
+fn scaffold_project(cwd: &Path, packages_dir: &str, imported: &Imported) -> Result<Value> {
     let mut manifest = json!({
-        "dependencies": dependencies,
+        "dependencies": imported.dependencies,
         "platform": "roblox",
     });
     if packages_dir != crate::roblox::PACKAGES_DIR {
         manifest["packagesDir"] = Value::String(packages_dir.to_string());
     }
-    if let Some(license) = license {
-        manifest["license"] = Value::String(license);
+    if let Some(license) = &imported.license {
+        manifest["license"] = Value::String(license.clone());
     }
+    for (path, deps) in &imported.mounts {
+        crate::mounts::insert_mount(&mut manifest, path, deps.clone());
+    }
+    crate::mounts::project_mounts(&manifest, Platform::Roblox)?;
 
-    let mount = cwd.join(crate::roblox::packages_base(&manifest));
-    if !mount.exists() {
-        fs::create_dir_all(&mount)?;
-    }
-    fs::write(cwd.join("forest.json"), serde_json::to_string_pretty(&manifest)?)?;
-    Ok(())
+    write_manifest(cwd, &manifest)?;
+    Ok(manifest)
 }
 
 /// Package-authoring scaffold: manifest with name/version/root, a starter
@@ -173,22 +232,25 @@ fn scaffold_package(
     name: &str,
     root: &str,
     packages_dir: &str,
-    dependencies: Map<String, Value>,
-    license: Option<String>,
+    imported: &Imported,
 ) -> Result<Value> {
     let mut manifest = json!({
         "name": name,
         "version": "0.1.0",
-        "dependencies": dependencies,
+        "dependencies": imported.dependencies,
         "platform": "roblox",
         "root": root,
     });
     if packages_dir != crate::roblox::PACKAGES_DIR {
         manifest["packagesDir"] = Value::String(packages_dir.to_string());
     }
-    if let Some(license) = license {
-        manifest["license"] = Value::String(license);
+    if let Some(license) = &imported.license {
+        manifest["license"] = Value::String(license.clone());
     }
+    for (path, deps) in &imported.mounts {
+        crate::mounts::insert_mount(&mut manifest, path, deps.clone());
+    }
+    crate::mounts::project_mounts(&manifest, Platform::Roblox)?;
 
     let root_path = cwd.join(root);
     if !root_path.exists() {
@@ -205,12 +267,7 @@ fn scaffold_package(
         )?;
     }
 
-    let packages_dir = cwd.join(crate::roblox::packages_base(&manifest));
-    if !packages_dir.exists() {
-        fs::create_dir_all(&packages_dir)?;
-    }
-
-    fs::write(cwd.join("forest.json"), serde_json::to_string_pretty(&manifest)?)?;
+    write_manifest(cwd, &manifest)?;
     Ok(manifest)
 }
 
@@ -267,7 +324,7 @@ mod tests {
     #[test]
     fn package_scaffold_writes_manifest_starter_and_nested_mount() {
         let base = fixture("pkg");
-        let manifest = scaffold_package(&base, "MyPkg", "src/init.luau", "Packages", Map::new(), None).unwrap();
+        let manifest = scaffold_package(&base, "MyPkg", "src/init.luau", "Packages", &Imported::default()).unwrap();
 
         let on_disk: Value =
             serde_json::from_str(&fs::read_to_string(base.join("forest.json")).unwrap()).unwrap();
@@ -297,7 +354,7 @@ mod tests {
         fs::create_dir_all(base.join("src")).unwrap();
         fs::write(base.join("src").join("init.luau"), "return \"existing\"").unwrap();
 
-        scaffold_package(&base, "MyPkg", "src/init.luau", "Packages", Map::new(), None).unwrap();
+        scaffold_package(&base, "MyPkg", "src/init.luau", "Packages", &Imported::default()).unwrap();
 
         assert_eq!(
             fs::read_to_string(base.join("src").join("init.luau")).unwrap(),
@@ -309,7 +366,7 @@ mod tests {
     #[test]
     fn package_scaffold_pascals_hyphenated_names_in_the_starter() {
         let base = fixture("hyphen");
-        scaffold_package(&base, "nav-mesh", "init.luau", "Packages", Map::new(), None).unwrap();
+        scaffold_package(&base, "nav-mesh", "init.luau", "Packages", &Imported::default()).unwrap();
 
         let starter = fs::read_to_string(base.join("init.luau")).unwrap();
         assert!(starter.contains("local NavMesh = {}"), "hyphens aren't valid in Luau identifiers");
@@ -321,7 +378,7 @@ mod tests {
     fn package_scaffold_writes_a_custom_container_and_mounts_it() {
         let base = fixture("custom-container");
         let manifest =
-            scaffold_package(&base, "MyPkg", "src/init.luau", "roblox_packages", Map::new(), None).unwrap();
+            scaffold_package(&base, "MyPkg", "src/init.luau", "roblox_packages", &Imported::default()).unwrap();
 
         let on_disk: Value =
             serde_json::from_str(&fs::read_to_string(base.join("forest.json")).unwrap()).unwrap();
@@ -338,7 +395,7 @@ mod tests {
     #[test]
     fn project_scaffold_stays_bare() {
         let base = fixture("proj");
-        scaffold_project(&base, "Packages", Map::new(), None).unwrap();
+        scaffold_project(&base, "Packages", &Imported::default()).unwrap();
 
         let manifest: Value =
             serde_json::from_str(&fs::read_to_string(base.join("forest.json")).unwrap()).unwrap();
@@ -354,13 +411,58 @@ mod tests {
     #[test]
     fn project_scaffold_writes_a_custom_container_and_mounts_it() {
         let base = fixture("proj-container");
-        scaffold_project(&base, "roblox_packages", Map::new(), None).unwrap();
+        scaffold_project(&base, "roblox_packages", &Imported::default()).unwrap();
 
         let manifest: Value =
             serde_json::from_str(&fs::read_to_string(base.join("forest.json")).unwrap()).unwrap();
         assert_eq!(manifest["packagesDir"], "roblox_packages");
         assert!(base.join("roblox_packages").is_dir());
         assert!(!base.join("Packages").exists(), "no default-named mount");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    fn wally_import() -> Imported {
+        let import = crate::roblox::wally::parse_wally_manifest(
+            "[dependencies]\nPromise = \"evaera/promise@4.0.0\"\n\n[server-dependencies]\nProfileService = \"loleris/profileservice@1.0.0\"\n\n[dev-dependencies]\nTestEZ = \"roblox/testez@0.4.1\"\n",
+        )
+        .unwrap();
+        Imported {
+            dependencies: dep_map(&import.dependencies),
+            mounts: vec![
+                (SERVER_PACKAGES.to_string(), dep_map(&import.server_dependencies)),
+                (DEV_PACKAGES.to_string(), dep_map(&import.dev_dependencies)),
+            ],
+            license: None,
+            from_wally: true,
+        }
+    }
+
+    #[test]
+    fn wally_groups_become_mounts_in_wallys_folders() {
+        let base = fixture("wally-mounts");
+        fs::create_dir_all(base.join("Packages").join("_Index")).unwrap();
+        fs::write(base.join("wally.lock"), "# lock").unwrap();
+
+        let manifest = scaffold_project(&base, "Packages", &wally_import()).unwrap();
+        report_wally_import(&base, &manifest, &wally_import()).unwrap();
+
+        let on_disk: Value =
+            serde_json::from_str(&fs::read_to_string(base.join("forest.json")).unwrap()).unwrap();
+        assert_eq!(on_disk["dependencies"]["evaera/promise"]["alias"], "Promise");
+        assert_eq!(on_disk["mounts"]["ServerPackages"]["dependencies"]["loleris/profileservice"]["version"], "^1.0.0");
+        assert_eq!(on_disk["mounts"]["DevPackages"]["dependencies"]["roblox/testez"]["alias"], "TestEZ");
+        assert!(base.join("ServerPackages").is_dir());
+        assert!(base.join("DevPackages").is_dir());
+        assert!(!base.join("wally.lock").exists(), "forest-lock.json replaces it");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_packages_dir_colliding_with_a_wally_folder_fails_before_writing() {
+        let base = fixture("wally-collide");
+        let err = scaffold_project(&base, "DevPackages", &wally_import()).unwrap_err();
+        assert!(err.to_string().contains("declared twice"), "{}", err);
+        assert!(!base.join("forest.json").exists());
         let _ = fs::remove_dir_all(&base);
     }
 

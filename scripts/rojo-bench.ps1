@@ -11,7 +11,8 @@ watcher event path, so any transient state where an event's path no longer
 resolves kills the server. This bench is the regression net for forest's
 rename-based mount mutation strategy (see src/roblox/install.rs). The
 project starts from a Wally install's leftovers, which the first install
-into each folder must take over.
+into each folder must take over. The second half repeats the exercise
+across several mounts, moving and removing whole mounts too.
 
 .EXAMPLE
 .\scripts\rojo-bench.ps1                       # downloads rojo 7.7.0, uses target\release\forest.exe
@@ -67,6 +68,7 @@ function Write-WallyLeftovers([string]$Folder, [string]$Scope, [string]$Name, [s
     [System.IO.File]::WriteAllText((Join-Path $Folder "$Link.lua"), "return require(script.Parent._Index[`"$($Scope)_$Name@$Version`"][`"$Name`"])")
 }
 Write-WallyLeftovers (Join-Path $Project "Packages") "sleitnick" "knit" "1.7.0" "Knit"
+Write-WallyLeftovers (Join-Path $Project "ServerPackages") "sleitnick" "signal" "2.0.3" "Signal"
 
 # WriteAllText: UTF-8 without BOM (Out-File's BOM breaks rojo's JSON parser)
 [System.IO.File]::WriteAllText((Join-Path $Project "forest.json"), @'
@@ -78,6 +80,8 @@ Write-WallyLeftovers (Join-Path $Project "Packages") "sleitnick" "knit" "1.7.0" 
 '@)
 
 # servePort lets forest's rojo probe find this server on the custom port.
+# DevPackages and the scratch mounts stay unmapped: rojo still sees their
+# events (it watches the whole project root), which is what the bench tests.
 [System.IO.File]::WriteAllText((Join-Path $Project "default.project.json"), @"
 {
   "name": "rojo-bench",
@@ -87,6 +91,10 @@ Write-WallyLeftovers (Join-Path $Project "Packages") "sleitnick" "knit" "1.7.0" 
     "ReplicatedStorage": {
       "`$className": "ReplicatedStorage",
       "Packages": { "`$path": "Packages" }
+    },
+    "ServerScriptService": {
+      "`$className": "ServerScriptService",
+      "Packages": { "`$path": "ServerPackages" }
     }
   }
 }
@@ -159,6 +167,27 @@ $scenarios = @(
         @("remove", "sleitnick/knit"), @("install", "sleitnick/knit"),
         @("remove", "sleitnick/knit"), @("install", "sleitnick/knit"),
         @("install", "--force"), @("remove", "sleitnick/knit"), @("install", "sleitnick/knit")
+    ) },
+    # Mounts: each is its own install, all sharing one watcher.
+    @{ Name = "13-mount-create-takeover"; Cmds = @(,@("mount", "create", "ServerPackages")) },
+    @{ Name = "14-mount-installs"; Cmds = @(
+        @("install", "sleitnick/signal", "--mount", "ServerPackages"),
+        @("install", "sleitnick/knit", "-m", "ServerPackages")
+    ) },
+    @{ Name = "15-dev-mount"; Cmds = @(
+        @("mount", "create", "DevPackages"), @("install", "evaera/promise", "-m", "DevPackages")
+    ) },
+    @{ Name = "16-mounts-noop"; Cmds = @(,@("install")) },
+    @{ Name = "17-mount-remove-leaf"; Cmds = @(,@("remove", "sleitnick/signal")) },
+    @{ Name = "18-mounts-force"; Cmds = @(,@("install", "--force")) },
+    @{ Name = "19-mounts-update"; Cmds = @(,@("update")) },
+    @{ Name = "20-mount-rename"; Cmds = @(,@("mount", "rename", "DevPackages", "tools/DevPackages")) },
+    @{ Name = "21-mount-remove"; Cmds = @(,@("mount", "remove", "tools/DevPackages", "-y")) },
+    @{ Name = "22-mount-rapid-cycles"; Cmds = @(
+        @("install", "sleitnick/trove", "-m", "ServerPackages"), @("remove", "sleitnick/trove", "-m", "ServerPackages"),
+        @("mount", "create", "Tmp"), @("install", "evaera/promise", "-m", "Tmp"),
+        @("mount", "rename", "Tmp", "Tmp2"), @("install", "--force"),
+        @("mount", "remove", "Tmp2", "-y"), @("install", "sleitnick/trove", "-m", "ServerPackages")
     ) }
 )
 foreach ($s in $scenarios) {
