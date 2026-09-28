@@ -150,7 +150,8 @@ pub async fn make_directories_uefn(
             }
         })
         .collect();
-    crate::download_pool::download_all(jobs, "uefn", |job, url, on_bytes, cache| {
+    // Refused private packages get no dir, so the next install retries them.
+    let denied = crate::download_pool::download_all(jobs, "uefn", |job, url, on_bytes, cache| {
         // Receipt only after ITS dir extracted - per-package atomicity.
         fetch_and_extract_verbatim(url, &job.integrity, &job.dir, on_bytes, cache).and_then(|_| {
             receipts::write(
@@ -190,7 +191,12 @@ pub async fn make_directories_uefn(
         info("UEFN appears to be running: reopen the project, then Build Verse Code, so it picks up the changes.");
     }
 
-    Ok(InstallSummary { installed: rec.to_install.len(), kept: rec.kept })
+    let skipped = rec
+        .to_install
+        .iter()
+        .filter(|&&i| denied.iter().any(|d| d.name == plan.packages[i].name && d.version == plan.packages[i].version))
+        .count();
+    Ok(InstallSummary { installed: rec.to_install.len() - skipped, kept: rec.kept })
 }
 
 /// Write every desired marker; delete-by-header any previously scanned marker

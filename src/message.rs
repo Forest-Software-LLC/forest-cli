@@ -7,6 +7,9 @@ use std::time::Duration;
 /// finished state; all our bars finish_and_clear, so it never shows.
 pub const TICK_STRINGS: &[&str] = &["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
 
+/// Appended to registry 404s, which also mean "not shared with you".
+pub const PRIVATE_404_HINT: &str = "If this is a private package, you will need to be authorized by the package maintainer.";
+
 /// A simple spinner-based message utility, similar to Ora in JS.
 pub struct Message {
     spinner: ProgressBar,

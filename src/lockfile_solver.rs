@@ -217,6 +217,23 @@ pub struct SolveReport {
     /// Excludes that removed nothing any range would have picked; natural
     /// resolution already lands outside the banned set.
     pub exclude_inert: Vec<String>,
+    /// Private packages the registry refused (no access to the scope) that
+    /// were resolved from forest-lock.json's pins instead, as `name@version`.
+    pub locked_private: Vec<String>,
+}
+
+/// Private packages from the current forest-lock.json, keyed lowercased.
+/// Resolution falls back to these pins when the registry refuses access.
+pub type LockedPrivate = HashMap<String, (String, Vec<LockfileEntry>)>;
+
+pub fn locked_private(packages: &LockfilePackages) -> LockedPrivate {
+    packages
+        .iter()
+        .filter_map(|(name, entries)| {
+            let private: Vec<LockfileEntry> = entries.iter().filter(|e| !e.public).cloned().collect();
+            (!private.is_empty()).then(|| (name.to_lowercase(), (name.clone(), private)))
+        })
+        .collect()
 }
 
 /// Resolves the dependency graph. Also returns license-safety issues for any
@@ -229,20 +246,20 @@ pub struct SolveReport {
 /// `use_meta_cache: false` (install --force) resolves everything from the
 /// network. When the cache IS used and its confirmation pass finds a stale
 /// or tampered entry, resolution transparently re-runs without the cache.
-pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, platform : String, msg: &mut Message, use_meta_cache: bool) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>, SolveReport)> {
-    match resolve_lockfile_packages(root_deps.clone(), overrides, excludes, platform.clone(), msg, use_meta_cache).await {
+pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, locked_private: &LockedPrivate, platform : String, msg: &mut Message, use_meta_cache: bool) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>, SolveReport)> {
+    match resolve_lockfile_packages(root_deps.clone(), overrides, excludes, locked_private, platform.clone(), msg, use_meta_cache).await {
         Err(err) if err.downcast_ref::<MetaCacheMismatch>().is_some() => {
             msg.emit(
                 MessageType::Warn,
                 &format!("{} Re-resolving from the registry.", err),
             );
-            resolve_lockfile_packages(root_deps, overrides, excludes, platform, msg, false).await
+            resolve_lockfile_packages(root_deps, overrides, excludes, locked_private, platform, msg, false).await
         }
         result => result,
     }
 }
 
-async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, platform : String, msg: &mut Message, use_meta_cache: bool) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>, SolveReport)> {
+async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, locked_private: &LockedPrivate, platform : String, msg: &mut Message, use_meta_cache: bool) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>, SolveReport)> {
     let mut resolved: ResolvedVersions = HashMap::new();
     let mut license_warnings: Vec<LicenseInfo> = Vec::new();
 
@@ -255,6 +272,8 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
     // One __fresh version-list retry per package, for ranges a stale edge
     // cache can't satisfy (publish then install).
     let mut fresh_retried: HashSet<String> = HashSet::new();
+    // Lowercased keys resolved from forest-lock.json pins (see LockedPrivate).
+    let mut carried: HashSet<String> = HashSet::new();
 
     // Overrides force every transitive edge to a package onto one range,
     // replacing the parent's declared range. Root deps are never rewritten:
@@ -330,66 +349,20 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
                 }
             };
 
-            if !versions_status.is_success() {
-                let hint = version_data.get("hint")
-                    .and_then(|h| h.get("message"))
-                    .and_then(|m| m.as_str());
-                Err(match hint {
-                    Some(hint) => anyhow::anyhow!(
-                        "Failed to fetch package info for {}: HTTP {}\n  {}",
-                        name.full_name, versions_status, hint
-                    ),
-                    None => anyhow::anyhow!(
-                        "Failed to fetch package info for {}: HTTP {}",
-                        name.full_name, versions_status
-                    ),
-                })?;
-            }
-
-            // The response carries the canonical (stored) casing, which is
-            // what the lockfile keys are written as. Fall back to the casing we
-            // queried with if a response ever lacks the fields.
-            let canonical = match (
-                version_data.get("scope").and_then(|v| v.as_str()),
-                version_data.get("name").and_then(|v| v.as_str()),
-            ) {
-                (Some(scope), Some(pkg_name)) => format!("{}/{}", scope, pkg_name),
-                _ => name.full_name.clone(),
+            let state = if versions_status.is_success() {
+                package_state_from_list(&version_data, &name.full_name)?
+            } else {
+                // Refused, but the lockfile pins it: resolve from the pins.
+                let refused = crate::install_report::DenyReason::from_status(versions_status).is_some();
+                match locked_private.get(&key).filter(|_| refused) {
+                    Some((canonical, entries)) => {
+                        carried.insert(key.clone());
+                        carried_package_state(canonical, entries)
+                    }
+                    None => return Err(version_list_error(&name.full_name, versions_status, &version_data)),
+                }
             };
-
-            let versions = version_data.get("versions")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| anyhow::anyhow!("Invalid versions data for {}", name.full_name))?;
-
-            // Fat responses carry `public` at package level; inject it into
-            // each version's trimmed block so every metadata source shares
-            // one shape. Slim responses (old backend, stale cache) have no
-            // install blocks and those versions fall back per-version.
-            let pkg_public = version_data.get("public").and_then(|v| v.as_bool());
-
-            let pkg_state = resolved.entry(key.clone())
-                .or_insert_with(|| PackageState {
-                    canonical,
-                    buckets: HashMap::new(),
-                    versions: HashMap::new(),
-                });
-
-            for ver_info in versions {
-                let ver = ver_info.get("version")
-                    .ok_or_else(|| anyhow::anyhow!("Missing version field for {}", name.full_name))?
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid version field for {}", name.full_name))?.to_string();
-
-                let prefetched = ver_info.get("install")
-                    .filter(|block| block.is_object())
-                    .map(|block| crate::meta_cache::trim_install_meta(block, pkg_public));
-
-                //println!("Found version {} for package {}", ver, name.full_name);
-                pkg_state.versions.insert(
-                    ver,
-                    VersionState { resolved: false, prefetched, dependencies: HashMap::new(), integrity: String::new(), public: false, archive_root: String::new(), packages_dir: default_packages_dir() }
-                );
-            }
+            resolved.insert(key.clone(), state);
         }
 
         let pkg_state = resolved.get_mut(&key)
@@ -411,6 +384,14 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
             .filter(|v| !version_excluded(exclude_req, v))
             .cloned()
             .collect();
+        if matches.is_empty() && carried.contains(&key) {
+            let mut locked: Vec<&str> = pkg_state.versions.keys().map(String::as_str).collect();
+            locked.sort();
+            anyhow::bail!(
+                "No access to private package {}, and the version forest-lock.json pins ({}) doesn't match {}. {}",
+                name.full_name, locked.join(", "), version_range, crate::message::PRIVATE_404_HINT
+            );
+        }
         if matches.is_empty() {
             // The edge cache may be serving a pre-publish version list.
             // Refetch once with a __fresh cache-buster (the shim skips its
@@ -501,8 +482,8 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
 
             if !status.is_success() {
                 return Err(anyhow::anyhow!(
-                    "Failed to fetch package info for {}@{}: HTTP {}",
-                    name.full_name, agreed, status
+                    "Failed to fetch package info for {}@{}: HTTP {}{}",
+                    name.full_name, agreed, status, not_found_hint(status)
                 ));
             }
             let trimmed = trim_install_meta(&response, None);
@@ -829,12 +810,125 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
             report.exclude_inert.push(key.clone());
         }
     }
+    for key in &carried {
+        let state = &resolved[key];
+        for v in state.buckets.keys() {
+            report.locked_private.push(format!("{}@{}", state.canonical, v));
+        }
+    }
+    report.locked_private.sort();
     report.override_unused.sort();
     report.override_unnecessary.sort();
     report.exclude_unused.sort();
     report.exclude_inert.sort();
 
     Ok((lockfile, license_warnings, root_renames, report))
+}
+
+/// A package's state from its registry version list. Versions start
+/// unresolved; the fat response's inlined install blocks ride along as
+/// `prefetched` so most resolve without another request.
+fn package_state_from_list(version_data: &serde_json::Value, full_name: &str) -> Result<PackageState> {
+    // The response carries the canonical (stored) casing, which is
+    // what the lockfile keys are written as. Fall back to the casing we
+    // queried with if a response ever lacks the fields.
+    let canonical = match (
+        version_data.get("scope").and_then(|v| v.as_str()),
+        version_data.get("name").and_then(|v| v.as_str()),
+    ) {
+        (Some(scope), Some(pkg_name)) => format!("{}/{}", scope, pkg_name),
+        _ => full_name.to_string(),
+    };
+
+    let versions = version_data.get("versions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("Invalid versions data for {}", full_name))?;
+
+    // Fat responses carry `public` at package level; inject it into
+    // each version's trimmed block so every metadata source shares
+    // one shape. Slim responses (old backend, stale cache) have no
+    // install blocks and those versions fall back per-version.
+    let pkg_public = version_data.get("public").and_then(|v| v.as_bool());
+
+    let mut state = PackageState {
+        canonical,
+        buckets: HashMap::new(),
+        versions: HashMap::new(),
+    };
+    for ver_info in versions {
+        let ver = ver_info.get("version")
+            .ok_or_else(|| anyhow::anyhow!("Missing version field for {}", full_name))?
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid version field for {}", full_name))?.to_string();
+
+        let prefetched = ver_info.get("install")
+            .filter(|block| block.is_object())
+            .map(|block| trim_install_meta(block, pkg_public));
+
+        state.versions.insert(
+            ver,
+            VersionState { resolved: false, prefetched, dependencies: HashMap::new(), integrity: String::new(), public: false, archive_root: String::new(), packages_dir: default_packages_dir() }
+        );
+    }
+    Ok(state)
+}
+
+/// A refused private package's state from its lockfile entries. Only the
+/// pinned versions are candidates, each with its locked metadata prefetched,
+/// so the registry is never asked again.
+fn carried_package_state(canonical: &str, entries: &[LockfileEntry]) -> PackageState {
+    let mut state = PackageState {
+        canonical: canonical.to_string(),
+        buckets: HashMap::new(),
+        versions: HashMap::new(),
+    };
+    for entry in entries {
+        state.versions.insert(
+            entry.version.clone(),
+            VersionState { resolved: false, prefetched: Some(locked_install_meta(entry)), dependencies: HashMap::new(), integrity: String::new(), public: false, archive_root: String::new(), packages_dir: default_packages_dir() }
+        );
+    }
+    state
+}
+
+/// A lockfile entry in the trimmed install-metadata shape. Deps pin exactly
+/// (`=x.y.z`): the lockfile holds resolved versions, not declared ranges.
+fn locked_install_meta(entry: &LockfileEntry) -> serde_json::Value {
+    let deps: serde_json::Map<String, serde_json::Value> = entry.dependencies.iter()
+        .map(|(dep, spec)| {
+            (dep.clone(), serde_json::json!({ "alias": spec.alias, "version": format!("={}", spec.version) }))
+        })
+        .collect();
+    serde_json::json!({
+        "dependencies": deps,
+        "integrity": entry.integrity,
+        "public": entry.public,
+        "archiveRoot": entry.root,
+        "packagesDir": entry.packages_dir,
+    })
+}
+
+/// Version-list failure: the registry's hint when it sends one, plus the
+/// private-package note on a 404.
+fn version_list_error(full_name: &str, status: reqwest::StatusCode, version_data: &serde_json::Value) -> anyhow::Error {
+    let hint = version_data.get("hint")
+        .and_then(|h| h.get("message"))
+        .and_then(|m| m.as_str())
+        .map(|hint| format!("\n  {}", hint))
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "Failed to fetch package info for {}: HTTP {}{}{}",
+        full_name, status, hint, not_found_hint(status)
+    )
+}
+
+/// The private-package note appended to a 404, empty otherwise.
+pub(crate) fn not_found_hint(status: reqwest::StatusCode) -> String {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        format!("\n  {}", crate::message::PRIVATE_404_HINT)
+    } else {
+        String::new()
+    }
 }
 
 /// True when the version string parses and the exclusion range bans it.

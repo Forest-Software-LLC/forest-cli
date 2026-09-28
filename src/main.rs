@@ -6,6 +6,8 @@ mod http;
 mod cache;
 mod links;
 mod download_pool;
+mod install_report;
+mod ci;
 mod contracts;
 mod message;
 mod lockfile_gen;
@@ -44,7 +46,12 @@ enum Commands {
     Whoami,
 
     /// Publish a package
-    Publish,
+    Publish {
+        /// Publish without prompts, reading everything from forest.json
+        /// (missing fields are errors). Implied when CI is set.
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
 
     /// Start development on a new package
     Init {
@@ -222,8 +229,27 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let is_upgrade = matches!(cli.command, Commands::Upgrade { .. });
+    let result = run(cli.command).await;
 
-    match cli.command {
+    // Best-effort, throttled nudge if a newer forest exists (skipped during an
+    // explicit upgrade, in CI, and in non-interactive shells).
+    if result.is_ok() && !is_upgrade {
+        maybe_notify_update().await;
+    }
+
+    // Skipped private packages print even when a later step failed, and
+    // always fail the run so CI can't pass on a partial tree.
+    let skipped = install_report::report();
+    result?;
+    if skipped {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn run(command: Commands) -> anyhow::Result<()> {
+    match command {
         Commands::Login => {
             login_command().await?;
         }
@@ -233,8 +259,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Whoami => {
             whoami_command().await?;
         }
-        Commands::Publish => {
-            publish_command().await?;
+        Commands::Publish { yes } => {
+            publish_command(yes).await?;
         }
         Commands::Init { platform, project, packages_dir } => {
             init_command(platform, project, packages_dir).await?;
@@ -274,12 +300,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Unlink { reference, all } => {
             unlink_command(reference, all).await?;
         }
-    }
-
-    // Best-effort, throttled nudge if a newer forest exists (skipped during an
-    // explicit upgrade, in CI, and in non-interactive shells).
-    if !is_upgrade {
-        maybe_notify_update().await;
     }
 
     Ok(())

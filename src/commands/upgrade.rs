@@ -301,7 +301,7 @@ fn record_check(latest_version: &str) {
 pub async fn maybe_notify_update() {
     use std::io::IsTerminal;
 
-    if std::env::var("CI").is_ok() || std::env::var("FOREST_NO_UPDATE_CHECK").is_ok() {
+    if crate::ci::is_ci() || std::env::var("FOREST_NO_UPDATE_CHECK").is_ok() {
         return;
     }
     if !std::io::stderr().is_terminal() {

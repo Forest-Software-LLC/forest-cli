@@ -205,11 +205,7 @@ pub async fn make_directories_roblox(
         .iter()
         .map(|l| crate::roblox::link_overlay::slot_plan_path(&container, &l.alias))
         .collect();
-    let under_link = |path: &str| {
-        linked_slots
-            .iter()
-            .any(|slot| path == slot || path.starts_with(&format!("{}/", slot)))
-    };
+    let under_link = |path: &str| at_or_under(path, &linked_slots);
     to_install.retain(|&i| !under_link(&plan.packages[i].path));
     stale_dirs.retain(|dir| !under_link(dir));
 
@@ -249,6 +245,8 @@ pub async fn make_directories_roblox(
     // Pointer dirs written into a staged unit below, skipped by the in-place
     // pointer pass at the end.
     let mut staged_pointers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Refused private packages. Their slots and everything under them stay empty.
+    let mut denied_paths: Vec<String> = Vec::new();
 
     // Download + extract only what reconciliation says is missing or
     // changed; the shared pool owns prefetch, bars, and error draining.
@@ -281,7 +279,7 @@ pub async fn make_directories_roblox(
         // On a pool error nothing has landed in the mount: staged dirs vanish
         // with `staging`, and the tarball cache makes the retry's redownloads
         // free.
-        crate::download_pool::download_all(jobs, "roblox", move |job, url, on_bytes, cache| {
+        let denied = crate::download_pool::download_all(jobs, "roblox", move |job, url, on_bytes, cache| {
             // The receipt is written into the staged dir after its extraction
             // succeeds, so what renames into the mount is always a complete,
             // receipted package.
@@ -301,6 +299,16 @@ pub async fn make_directories_roblox(
             })
         })
         .await?;
+
+        // Refused packages never extracted. Drop them and everything under
+        // them, or a receipt-less folder of nested deps lands in the mount.
+        denied_paths = to_install
+            .iter()
+            .map(|&i| &plan.packages[i])
+            .filter(|p| denied.iter().any(|d| d.name == p.name && d.version == p.version))
+            .map(|p| p.path.clone())
+            .collect();
+        placements.retain(|(path, _, _)| !at_or_under(path, &denied_paths));
 
         let mut findings = script_findings.lock().expect("script findings lock").split_off(0);
         findings.sort();
@@ -349,6 +357,9 @@ pub async fn make_directories_roblox(
                 .iter()
                 .filter(|(a, _, _)| pointer.dir.starts_with(&format!("{}/", a)))
                 .min_by_key(|(a, _, _)| a.len());
+            if at_or_under(&pointer.dir, &denied_paths) {
+                continue;
+            }
             if let Some((a_path, a_stage, _)) = topmost {
                 let target = a_stage.join(Path::new(&pointer.dir[a_path.len() + 1..]));
                 write_pointer(&target, &pointer.init_lua, &mut trash)?;
@@ -380,7 +391,10 @@ pub async fn make_directories_roblox(
     // other branches INTO a linked subtree keep their targets and resolve
     // through the link.
     for pointer in &plan.pointers {
-        if staged_pointers.contains(&pointer.dir) || under_link(&pointer.dir) {
+        if staged_pointers.contains(&pointer.dir)
+            || under_link(&pointer.dir)
+            || at_or_under(&pointer.dir, &denied_paths)
+        {
             continue;
         }
         write_pointer(&crate::roblox::physical_path(&base, &container, &pointer.dir), &pointer.init_lua, &mut trash)?;
@@ -420,7 +434,18 @@ pub async fn make_directories_roblox(
     // Luau doesn't carry `export type` through `return require(...)`, so we re-export the types
     crate::roblox::type_link::relink_types(Path::new(&base));
 
-    Ok(InstallSummary { installed: to_install.len(), kept })
+    let skipped = to_install
+        .iter()
+        .filter(|&&i| at_or_under(&plan.packages[i].path, &denied_paths))
+        .count();
+    Ok(InstallSummary { installed: to_install.len() - skipped, kept })
+}
+
+/// Whether a plan path is one of `roots` or nested inside one.
+fn at_or_under(path: &str, roots: &[String]) -> bool {
+    roots
+        .iter()
+        .any(|root| path == root || path.starts_with(&format!("{}/", root)))
 }
 
 /// Write a pointer module into its dir. A dir that held the physical package
@@ -565,6 +590,17 @@ mod tests {
     /// TrashBin pointed at a unique temp dir so tests never touch the cwd.
     fn test_trash(tag: &str) -> TrashBin {
         TrashBin::new(std::env::temp_dir().join(format!("forest-trash-test-{}-{}", tag, std::process::id())))
+    }
+
+    #[test]
+    fn at_or_under_matches_whole_path_segments_only() {
+        let roots = vec!["./Packages/Knit".to_string()];
+        assert!(at_or_under("./Packages/Knit", &roots));
+        assert!(at_or_under("./Packages/Knit/Packages/Promise", &roots));
+        // A sibling that merely shares the prefix is not inside the slot.
+        assert!(!at_or_under("./Packages/KnitUtils", &roots));
+        assert!(!at_or_under("./Packages/Promise", &roots));
+        assert!(!at_or_under("./Packages/Knit", &[]));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use reqwest::Method;
 
 use crate::http::{api_request, packages_api_request};
 use crate::message::{Message, MessageType};
-use crate::lockfile_gen::{lockfile_gen, lockfile_satisfies_manifest, make_directories, LockFile};
+use crate::lockfile_gen::{lockfile_gen, lockfile_gen_or_restore, lockfile_satisfies_manifest, make_directories, LockFile};
 use crate::utils::{normalize_forest_deps, normalize_forest_excludes, normalize_forest_overrides};
 
 /// Install dependencies for a forest package.
@@ -84,11 +84,10 @@ pub async fn install_command(
         }
         msg.resume();
         if project.is_none() {
-            msg.emit(
-                MessageType::Fail,
-                "No forest.json found. Run `forest init` to create a new package, or pass --init <platform>.",
-            );
-            return Ok(());
+            msg.destroy();
+            return Err(anyhow::anyhow!(
+                "No forest.json found. Run `forest init` to create a new package, or pass --init <platform>."
+            ));
         }
     } else if init_platform.is_some() {
         msg.emit(
@@ -118,8 +117,8 @@ pub async fn install_command(
     // this for manifest-declared aliases.
     if alias.is_some() {
         if let Some(reason) = plat.alias_error() {
-            msg.finish(MessageType::Fail, &reason);
-            return Ok(());
+            msg.destroy();
+            return Err(anyhow::anyhow!(reason));
         }
     }
 
@@ -135,12 +134,9 @@ pub async fn install_command(
 
 
         if package_identifiers.len() != 2 {
-            msg.finish(
-                MessageType::Fail,
-                "Invalid package identifier. Use format: <scope>/<name> -v [version]",
-            );
-            return Ok(());
-        }        
+            msg.destroy();
+            return Err(anyhow::anyhow!("Invalid package identifier. Use format: <scope>/<name> -v [version]"));
+        }
 
         // Validate alias
         if let Some(a) = &alias {
@@ -148,21 +144,15 @@ pub async fn install_command(
             // cleanup (e.g. Wally's `_Index`), so aliases must not claim
             // those names.
             if a.starts_with('_') || a.starts_with('.') {
-                msg.finish(
-                    MessageType::Fail,
-                    &format!("Alias {} cannot start with '_' or '.'", a),
-                );
-                return Ok(());
+                msg.destroy();
+                return Err(anyhow::anyhow!("Alias {} cannot start with '_' or '.'", a));
             }
 
             // Aliases become folder names (and `require` identifiers); path
             // separators would nest directories and break pointer files.
             if a.contains('/') || a.contains('\\') {
-                msg.finish(
-                    MessageType::Fail,
-                    &format!("Alias {} cannot contain '/' or '\\'", a),
-                );
-                return Ok(());
+                msg.destroy();
+                return Err(anyhow::anyhow!("Alias {} cannot contain '/' or '\\'", a));
             }
         }
 
@@ -178,11 +168,8 @@ pub async fn install_command(
         let (package_info, status_code) = match packages_api_request(&endpoint, Method::GET, None, None).await {
             Ok(data) => data,
             Err(e) => {
-                msg.emit(
-                    MessageType::Fail,
-                    &format!("Failed to fetch package information: {}", e),
-                );
-                return Ok(());
+                msg.destroy();
+                return Err(e.context("Failed to fetch package information"));
             }
         };
 
@@ -209,18 +196,15 @@ pub async fn install_command(
             } else {
                 None
             };
-            let text = match hint {
-                Some(hint) => format!(
-                    "Failed to fetch package information for {}: HTTP {}\n  {}",
-                    pkg, status_code, hint
-                ),
-                None => format!(
-                    "Failed to fetch package information for {}: HTTP {}",
-                    pkg, status_code
-                ),
-            };
-            msg.emit(MessageType::Fail, &text);
-            return Ok(());
+            let text = format!(
+                "Failed to fetch package information for {}: HTTP {}{}{}",
+                pkg,
+                status_code,
+                hint.map(|hint| format!("\n  {}", hint)).unwrap_or_default(),
+                crate::lockfile_solver::not_found_hint(status_code)
+            );
+            msg.destroy();
+            return Err(anyhow::anyhow!(text));
         }
 
         // fall back to what was typed if fields are missing in the response
@@ -284,11 +268,8 @@ pub async fn install_command(
         // would silently merge into one directory.
         if normalized_root_deps.values().any(|spec| spec.alias.eq_ignore_ascii_case(&resolved_name)) {
             //TODO: Prompt for a new alias.
-            msg.emit(
-                MessageType::Fail,
-                &format!("Alias {} is already in use by another package.", resolved_name),
-            );
-            return Ok(());
+            msg.destroy();
+            return Err(anyhow::anyhow!("Alias {} is already in use by another package.", resolved_name));
         }
 
         // Add dependency
@@ -309,11 +290,10 @@ pub async fn install_command(
         } else {
             deps.insert(canonical_full.clone(), Value::String(format!("^{}", pkg_version)));
         }
+        let manifest_before = fs::read_to_string("forest.json")?;
         fs::write("forest.json", serde_json::to_string_pretty(&info)?)?;
 
-        // Generate and write lockfile using blocking context
-        let info_clone = info.clone();
-        let lockfile_content = lockfile_gen(&info_clone, &mut msg, force).await?;
+        let lockfile_content = lockfile_gen_or_restore(&info, &manifest_before, &mut msg, force).await?;
         fs::write("forest-lock.json", lockfile_content.to_json_pretty()?)?;
 
         msg.finish(
@@ -404,7 +384,10 @@ async fn sync_from_lockfile(
         let summary = make_directories(&lockfile, normalize_forest_deps(&info.clone()), info, force).await?;
 
         msg = Message::new("");
-        if summary.installed == 0 {
+        let installed = format!("{} package{}", summary.installed, if summary.installed == 1 { "" } else { "s" });
+        if let Some(note) = skipped_summary(&installed) {
+            msg.finish(MessageType::Warn, &note);
+        } else if summary.installed == 0 {
             msg.finish(MessageType::Success, "Already up to date!");
         } else {
             msg.finish(MessageType::Success, &format!(
@@ -420,6 +403,21 @@ async fn sync_from_lockfile(
     let lockfile_content = lockfile_gen(&info_clone, &mut msg, force).await?;
     fs::write("forest-lock.json", lockfile_content.to_json_pretty()?)?;
 
-    msg.finish(MessageType::Success, "Installed all dependencies!");
+    match skipped_summary("dependencies") {
+        Some(note) => msg.finish(MessageType::Warn, &note),
+        None => msg.finish(MessageType::Success, "Installed all dependencies!"),
+    }
     Ok(())
+}
+
+/// The finish line when the pool skipped private packages. main lists which
+/// and why once the command returns.
+fn skipped_summary(installed: &str) -> Option<String> {
+    let skipped = crate::install_report::count();
+    (skipped > 0).then(|| format!(
+        "Installed {}; {} private package{} skipped.",
+        installed,
+        skipped,
+        if skipped == 1 { " was" } else { "s were" }
+    ))
 }

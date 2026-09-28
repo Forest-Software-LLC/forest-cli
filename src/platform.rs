@@ -190,9 +190,10 @@ impl Platform {
         cwd: &Path,
         forest_json: &mut Value,
         metadata: &mut Value,
+        interactive: bool,
     ) -> Result<Preflight> {
         match self {
-            Platform::Roblox => crate::roblox::publish::publish_preflight(cwd, forest_json),
+            Platform::Roblox => crate::roblox::publish::publish_preflight(cwd, forest_json, interactive),
             Platform::Uefn => crate::uefn::publish::publish_preflight(cwd, forest_json, metadata),
         }
     }
