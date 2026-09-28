@@ -15,7 +15,7 @@ use reqwest::Method;
 use crate::http::packages_api_request;
 use crate::platform::Platform;
 use crate::utils::{digest_package_name, get_ci, normalize_forest_deps, normalize_forest_excludes, normalize_forest_overrides};
-use crate::lockfile_solver::{get_lockfile_packages, DepSpec, LockfileEntry};
+use crate::lockfile_solver::{get_lockfile_packages, locked_private, DepSpec, LockfileEntry};
 use crate::message::{Message, MessageType};
 
 
@@ -129,7 +129,8 @@ pub(crate) fn cdn_base() -> String {
 
 /// Fetch the short-lived signed download URL for one private package version,
 /// cross-checking the registry's integrity hash against the lockfile's before
-/// anything is downloaded.
+/// anything is downloaded. A refusal comes back as an
+/// `install_report::DeniedPackage` error so the pool can skip it.
 pub(crate) async fn fetch_signed_url(
     pkg_name: String,
     version: String,
@@ -152,6 +153,9 @@ pub(crate) async fn fetch_signed_url(
     let (info, status) = packages_api_request(&path, Method::GET, None, None).await
         .with_context(|| format!("Failed to fetch access URL for {}@{}", pkg_name, version))?;
     if !status.is_success() {
+        if let Some(denied) = crate::install_report::DeniedPackage::from_status(&pkg_name, &version, status) {
+            return Err(denied.into());
+        }
         return Err(anyhow!(
             "Failed to fetch access URL for {}@{}: HTTP {}",
             pkg_name, version, status
@@ -204,10 +208,25 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
     let overrides = normalize_forest_overrides(forest_json);
     let excludes = normalize_forest_excludes(forest_json);
 
+    // Fallback pins for private packages the registry refuses.
+    let locked = LockFile::load()
+        .map(|lf| locked_private(&lf.packages))
+        .unwrap_or_default();
+
     msg.update("Resolving dependencies...");
     // --force also bypasses the metadata disk cache, like receipts at install.
-    let (lockfile_packages, license_warnings, root_renames, solve_report) = get_lockfile_packages(roots.clone(), &overrides, &excludes, platform.clone(), msg, !force).await
+    let (lockfile_packages, license_warnings, root_renames, solve_report) = get_lockfile_packages(roots.clone(), &overrides, &excludes, &locked, platform.clone(), msg, !force).await
         .context("Failed to resolve lockfile packages")?;
+
+    for pinned in &solve_report.locked_private {
+        msg.emit(
+            MessageType::Warn,
+            &format!(
+                "No access to private package {}; kept the version pinned in forest-lock.json. You need to be authorized by the package maintainer to update it.",
+                pinned
+            ),
+        );
+    }
 
     if solve_report.override_edges > 0 {
         msg.emit(
@@ -315,6 +334,25 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
     msg.resume();
 
     Ok(lockfile)
+}
+
+/// `lockfile_gen` after a command wrote its manifest edit. On failure
+/// forest.json goes back to `manifest_before`. The edit has to be on disk
+/// first because claimed-scope renames rewrite the file.
+pub async fn lockfile_gen_or_restore(
+    forest_json: &Value,
+    manifest_before: &str,
+    msg: &mut Message,
+    force: bool,
+) -> Result<LockFile> {
+    match lockfile_gen(forest_json, msg, force).await {
+        Ok(lockfile) => Ok(lockfile),
+        Err(e) => {
+            msg.pause();
+            std::fs::write("forest.json", manifest_before).context("Failed to restore forest.json")?;
+            Err(e.context("Couldn't apply the change, so forest.json was left as it was"))
+        }
+    }
 }
 
 /// One claimed-scope rename actually applied to the local manifest.

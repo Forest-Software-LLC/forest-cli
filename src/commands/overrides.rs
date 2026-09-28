@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use urlencoding::encode;
 
 use crate::http::api_request;
-use crate::lockfile_gen::lockfile_gen;
+use crate::lockfile_gen::lockfile_gen_or_restore;
 use crate::message::{self, Message, MessageType};
 use crate::utils::{
     digest_package_name, normalize_forest_deps, normalize_forest_excludes,
@@ -241,7 +241,7 @@ pub(crate) async fn fetch_versions(full_name: &str, platform: &str) -> Result<Op
     if !status.is_success() {
         msg.finish(
             MessageType::Fail,
-            &format!("Failed to fetch package info for {}: HTTP {}", full_name, status),
+            &format!("Failed to fetch package info for {}: HTTP {}{}", full_name, status, crate::lockfile_solver::not_found_hint(status)),
         );
         return Ok(None);
     }
@@ -462,7 +462,7 @@ pub(crate) fn lockfile_package_keys() -> Vec<String> {
 /// the caller should stop after a `false` return.
 pub(crate) async fn reinstall_or_rollback(manifest: &Value, manifest_before: &str) -> Result<bool> {
     let mut msg = Message::new("Updating packages...");
-    match lockfile_gen(manifest, &mut msg, false).await {
+    match lockfile_gen_or_restore(manifest, manifest_before, &mut msg, false).await {
         Ok(lockfile) => {
             fs::write("forest-lock.json", lockfile.to_json_pretty()?)?;
             msg.destroy();
@@ -470,8 +470,7 @@ pub(crate) async fn reinstall_or_rollback(manifest: &Value, manifest_before: &st
         }
         Err(e) => {
             msg.destroy();
-            fs::write("forest.json", manifest_before)?;
-            message::fail(&format!("Change rolled back, resolution failed: {:#}", e));
+            message::fail(&format!("{:#}", e));
             Ok(false)
         }
     }

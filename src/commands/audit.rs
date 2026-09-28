@@ -8,7 +8,7 @@ use urlencoding::encode;
 
 use crate::http::api_request;
 use crate::license_helper::{extract_license_info, LicenseInfo};
-use crate::lockfile_gen::lockfile_gen;
+use crate::lockfile_gen::lockfile_gen_or_restore;
 use crate::lockfile_solver::DepSpec;
 use crate::message::{self, Message, MessageType};
 use crate::utils::{digest_package_name, get_ci, normalize_forest_deps, resolve_dep_ref, DepRef};
@@ -258,7 +258,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
         if !status.is_success() {
             msg.emit(
                 MessageType::Warn,
-                &format!("Failed to fetch package info for {}: HTTP {}", name, status),
+                &format!("Failed to fetch package info for {}: HTTP {}{}", name, status, crate::lockfile_solver::not_found_hint(status)),
             );
             continue;
         }
@@ -569,12 +569,12 @@ pub async fn audit_command(target_package: Option<String>, update: bool) -> Resu
             }
         }
     }
+    let manifest_before = fs::read_to_string("forest.json")?;
     fs::write("forest.json", serde_json::to_string_pretty(&info)?)?;
 
     // Re-resolve and reinstall with the new ranges
     let mut msg = Message::new("Updating packages...");
-    let info_clone = info.clone();
-    let lockfile_content = lockfile_gen(&info_clone, &mut msg, false).await?;
+    let lockfile_content = lockfile_gen_or_restore(&info, &manifest_before, &mut msg, false).await?;
     fs::write("forest-lock.json", lockfile_content.to_json_pretty()?)?;
 
     msg.finish(

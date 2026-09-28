@@ -5,7 +5,7 @@
 //! and the drain-everything-before-the-first-error semantics, so the two
 //! executors cannot drift apart.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -14,6 +14,7 @@ use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
 use crate::cache::TarballCache;
 use crate::fetch_and_extract::OnBytes;
+use crate::install_report::{DeniedPackage, DenyReason};
 use crate::lockfile_gen::{cdn_base, fetch_signed_url};
 
 /// How many tarballs download (and signed URLs prefetch) at once. Bounded so
@@ -42,6 +43,10 @@ pub struct DownloadJob<E> {
 /// private entries skip the round-trip entirely (the lockfile hash is the
 /// trust anchor; cached bytes are re-verified on read).
 ///
+/// A private package the registry refuses is skipped, not fatal. It's
+/// recorded in install_report for main's error and returned so the executor
+/// leaves its slot empty.
+///
 /// All jobs run to completion before the first error is reported, so every
 /// bar is cleared and no partial state hides behind an early return.
 pub async fn download_all<E: Send + 'static>(
@@ -51,40 +56,35 @@ pub async fn download_all<E: Send + 'static>(
         + Send
         + Sync
         + 'static,
-) -> Result<()> {
+) -> Result<Vec<DeniedPackage>> {
     if jobs.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let tarball_cache = TarballCache::open_default();
 
     // Private tarballs sit behind the CDN worker's HMAC gate and their
     // signed URLs expire in minutes, so they are never stored in the
     // lockfile; fetch fresh ones now (integrity cross-check inside
-    // fetch_signed_url).
+    // fetch_signed_url). One request per version, even at several paths.
     let mut private_urls: HashMap<(String, String), String> = HashMap::new();
-    let private_entries: Vec<(String, String, String)> = jobs
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut private_entries: Vec<(String, String, String)> = jobs
         .iter()
         .filter(|j| !j.public)
         .filter(|j| tarball_cache.as_ref().map_or(true, |c| c.lookup(&j.integrity).is_none()))
+        .filter(|j| seen.insert((j.name.clone(), j.version.clone())))
         .map(|j| (j.name.clone(), j.version.clone(), j.integrity.clone()))
         .collect();
 
-    // Every private download would 404 anonymously; say why up front.
+    // Anonymous requests for private packages always 404, so don't ask.
+    let mut denied: Vec<DeniedPackage> = Vec::new();
     if !private_entries.is_empty() && !crate::api_token::has_credential() {
-        let names: Vec<&str> = private_entries.iter().take(3).map(|(name, _, _)| name.as_str()).collect();
-        let more = private_entries.len().saturating_sub(names.len());
-        return Err(anyhow!(
-            "This project has private dependencies ({}{}). Run `forest login`, or set FOREST_TOKEN to an API token in CI.",
-            names.join(", "),
-            if more > 0 { format!(" and {} more", more) } else { String::new() }
-        ));
+        denied = private_entries
+            .drain(..)
+            .map(|(name, version, _)| DeniedPackage { name, version, reason: DenyReason::NotLoggedIn })
+            .collect();
     }
 
-    for job in &jobs {
-        if !job.dir.exists() {
-            std::fs::create_dir_all(&job.dir)?;
-        }
-    }
     let mut private_iter = private_entries.into_iter();
     if let Some((pkg, ver, integrity)) = private_iter.next() {
         // These round-trips run with the install spinner paused; a counter
@@ -100,8 +100,8 @@ pub async fn download_all<E: Send + 'static>(
         // any error message prints under it.
         let platform_owned = platform.to_string();
         let prefetch: Result<()> = async {
-            let (key, url) = fetch_signed_url(pkg, ver, integrity, platform_owned.clone()).await?;
-            private_urls.insert(key, url);
+            let first = fetch_signed_url(pkg, ver, integrity, platform_owned.clone()).await;
+            file_signed_url(first, &mut private_urls, &mut denied)?;
             auth_bar.inc(1);
 
             let semaphore = Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_WORKERS));
@@ -115,8 +115,8 @@ pub async fn download_all<E: Send + 'static>(
                 });
             }
             while let Some(joined) = tasks.join_next().await {
-                let (key, url) = joined.map_err(|e| anyhow!("Signed-URL task panicked: {e}"))??;
-                private_urls.insert(key, url);
+                let result = joined.map_err(|e| anyhow!("Signed-URL task panicked: {e}"))?;
+                file_signed_url(result, &mut private_urls, &mut denied)?;
                 auth_bar.inc(1);
             }
             Ok(())
@@ -124,6 +124,22 @@ pub async fn download_all<E: Send + 'static>(
         .await;
         auth_bar.finish_and_clear();
         prefetch?;
+    }
+
+    crate::install_report::record(&denied);
+    let denied_keys: HashSet<(String, String)> =
+        denied.iter().map(|d| (d.name.clone(), d.version.clone())).collect();
+    let jobs: Vec<DownloadJob<E>> = jobs
+        .into_iter()
+        .filter(|j| !denied_keys.contains(&(j.name.clone(), j.version.clone())))
+        .collect();
+    if jobs.is_empty() {
+        return Ok(denied);
+    }
+    for job in &jobs {
+        if !job.dir.exists() {
+            std::fs::create_dir_all(&job.dir)?;
+        }
     }
 
     // One line for the whole phase: package count plus a downloaded-bytes
@@ -208,5 +224,24 @@ pub async fn download_all<E: Send + 'static>(
     if let Some(e) = pool_err {
         return Err(e);
     }
-    Ok(())
+    Ok(denied)
+}
+
+/// File one signed-URL result: the URL, a refusal to skip, or a hard error
+/// (integrity mismatch, network, 5xx) that still aborts the install.
+fn file_signed_url(
+    result: Result<((String, String), String)>,
+    urls: &mut HashMap<(String, String), String>,
+    denied: &mut Vec<DeniedPackage>,
+) -> Result<()> {
+    match result {
+        Ok((key, url)) => {
+            urls.insert(key, url);
+            Ok(())
+        }
+        Err(e) => {
+            denied.push(e.downcast::<DeniedPackage>()?);
+            Ok(())
+        }
+    }
 }

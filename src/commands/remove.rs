@@ -3,7 +3,7 @@ use anyhow::Result;
 use serde_json::{Value, Map};
 
 use crate::message::{Message, MessageType};
-use crate::lockfile_gen::{lockfile_gen};
+use crate::lockfile_gen::lockfile_gen_or_restore;
 use crate::utils::{normalize_forest_deps, resolve_dep_ref, DepRef};
 
 /// Remove a dependency from a forest package.
@@ -50,11 +50,10 @@ pub async fn remove_command(
 
     info["dependencies"] = Value::Object(deps.clone());
 
+    let manifest_before = fs::read_to_string("forest.json")?;
     fs::write("forest.json", serde_json::to_string_pretty(&info)?)?;
 
-    // Generate and write lockfile using blocking context
-    let info_clone = info.clone();
-    let lockfile_content = lockfile_gen(&info_clone, &mut msg, false).await?;
+    let lockfile_content = lockfile_gen_or_restore(&info, &manifest_before, &mut msg, false).await?;
     fs::write("forest-lock.json", lockfile_content.to_json_pretty()?)?;
 
     msg.finish(

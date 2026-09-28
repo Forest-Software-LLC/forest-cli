@@ -13,7 +13,9 @@ use crate::platform::Preflight;
 /// Resolve the package's `root` (its init file): honor an explicit
 /// forest.json value, auto-detect at the first or second directory level,
 /// or prompt. Always writes `forest_json["root"]`; never aborts.
-pub fn publish_preflight(cwd: &Path, forest_json: &mut Value) -> Result<Preflight> {
+/// `interactive: false` (publish --yes / CI) turns the root-file prompt into
+/// a hard error.
+pub fn publish_preflight(cwd: &Path, forest_json: &mut Value, interactive: bool) -> Result<Preflight> {
     // Validate `packagesDir` first: it ships as registry metadata and
     // becomes a folder name in every consumer's tree.
     if let Some(value) = forest_json.get("packagesDir") {
@@ -66,6 +68,11 @@ pub fn publish_preflight(cwd: &Path, forest_json: &mut Value) -> Result<Prefligh
         }
     }
 
+    if !init_lua_path.exists() && !interactive {
+        anyhow::bail!(
+            "Couldn't find the root module (init.luau or init.lua). Set \"root\" in forest.json to its path, e.g. \"src/init.luau\"."
+        );
+    }
     if !init_lua_path.exists() {
         warn("Failed to resolve root for init.luau/init.lua");
         let cwd_owned = cwd.to_path_buf();
@@ -239,7 +246,7 @@ mod tests {
         for bad in [serde_json::json!(".."), serde_json::json!("CON"), serde_json::json!(7)] {
             let mut manifest = serde_json::json!({ "root": "init.luau", "packagesDir": bad });
             // Preflight doesn't derive Debug, so match instead of unwrap_err.
-            let err = match publish_preflight(&dir, &mut manifest) {
+            let err = match publish_preflight(&dir, &mut manifest, false) {
                 Err(e) => e.to_string(),
                 Ok(_) => panic!("{:?} must be rejected", bad),
             };
@@ -248,9 +255,25 @@ mod tests {
 
         // A valid rename and the absent default both pass.
         let mut ok = serde_json::json!({ "root": "init.luau", "packagesDir": "roblox_packages" });
-        assert!(publish_preflight(&dir, &mut ok).is_ok());
+        assert!(publish_preflight(&dir, &mut ok, false).is_ok());
         let mut absent = serde_json::json!({ "root": "init.luau" });
-        assert!(publish_preflight(&dir, &mut absent).is_ok());
+        assert!(publish_preflight(&dir, &mut absent, false).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preflight_without_prompts_errors_on_a_missing_root() {
+        let dir = std::env::temp_dir().join(format!("forest-preflight-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut manifest = serde_json::json!({ "root": "src/init.luau" });
+        let err = match publish_preflight(&dir, &mut manifest, false) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a missing root must be an error without prompts"),
+        };
+        assert!(err.contains("\"root\""), "{}", err);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

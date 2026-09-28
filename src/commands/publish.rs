@@ -1,4 +1,4 @@
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Result};
 use std::{env, fs, path::Path, sync::Arc};
 use serde_json::Value;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -77,6 +77,10 @@ fn find_readme(directory: &Path) -> Option<std::path::PathBuf> {
         is_readme.then_some(path)
     })
 }
+
+/// License for a private package with no license file. npm's proprietary
+/// marker, not the SPDX `Unlicense`.
+const PRIVATE_DEFAULT_LICENSE: &str = "UNLICENSED";
 
 /// Scaffold README that publish offers to create.
 const README_SCAFFOLD: &str = "# Package README\n\nThis is the README for the package.";
@@ -174,12 +178,18 @@ fn create_tarball_buffer(dir: &Path, matcher: &Gitignore) -> Result<Vec<u8>> {
 }
 
 /// Publish a forest package: tar up, multipart-post, and report via spinner.
-pub async fn publish_command() -> Result<()> {
+///
+/// `yes` (or CI) skips every prompt: fields come from forest.json, and
+/// anything a prompt would fill in is an error.
+pub async fn publish_command(yes: bool) -> Result<()> {
+    let interactive = !yes && !crate::ci::is_ci();
     let cwd = env::current_dir().context("Failed to get current directory")?;
 
     if crate::api_token::env_api_token().is_some() {
-        fail("API tokens are read only. Unset FOREST_TOKEN to publish with your login.");
-        return Ok(());
+        anyhow::bail!("API tokens are read only. Unset FOREST_TOKEN to publish with your login.");
+    }
+    if !interactive {
+        info("Publishing without prompts (--yes or CI): everything is read from forest.json.");
     }
 
     // The spinner is destroyed before every prompt or printed line below -
@@ -190,8 +200,7 @@ pub async fn publish_command() -> Result<()> {
     let (session_resp, status_code) = session_result.context("Failed to get session information")?;
 
     if status_code == StatusCode::UNAUTHORIZED {
-        fail("You must be logged in to publish a package. Please run `forest login`.");
-        return Ok(());
+        anyhow::bail!("You must be logged in to publish a package. Please run `forest login`.");
     }
 
     // get user from user.username
@@ -203,13 +212,14 @@ pub async fn publish_command() -> Result<()> {
     // Ensure manifest exists
     let manifest_path = cwd.join("forest.json");
     if !manifest_path.exists() {
-        fail("No forest.json found in the current directory. Please run `forest init`.");
-        return Ok(());
+        anyhow::bail!("No forest.json found in the current directory. Please run `forest init`.");
     }
 
     // Read and parse manifest
     let mut forest_json: Value = serde_json::from_str(&fs::read_to_string(&manifest_path)?)
         .context("Failed to parse forest.json")?;
+    // Compared before the final write-back.
+    let manifest_on_disk = forest_json.clone();
 
     // Overrides/excludes only apply to the project that declares them (the
     // registry strips the fields), so consumers of this package will resolve
@@ -256,14 +266,12 @@ pub async fn publish_command() -> Result<()> {
 
     });
 
-    match platform.publish_preflight(&cwd, &mut forest_json, &mut metadata)? {
+    match platform.publish_preflight(&cwd, &mut forest_json, &mut metadata, interactive)? {
         Preflight::Continue => {}
-        Preflight::Abort(reason) => {
-            fail(&reason);
-            return Ok(());
-        }
+        Preflight::Abort(reason) => anyhow::bail!(reason),
     }
 
+    let declared_public = declared_visibility(&forest_json)?;
 
     // Fetch user info from API to see what orgs they are allowed to publish to.
 
@@ -280,7 +288,7 @@ pub async fn publish_command() -> Result<()> {
     for org in org_authors {
         let org_name = org.get("name").and_then(Value::as_str).unwrap();
         let org_rank  = org.get("rank").and_then(Value::as_str).unwrap();
-        
+
         // TODO: actually check write permissions if not admin/owner
 
         if org_rank == "admin" || org_rank == "owner" {
@@ -291,6 +299,9 @@ pub async fn publish_command() -> Result<()> {
 
     let mut did_set_name_or_author = false;
     if !forest_json["name"].is_string() {
+        if !interactive {
+            return Err(missing_field("name"));
+        }
         // Naming rules are platform-owned (Verse identifiers on UEFN, the
         // classic letter/alnum/_/- rule on Roblox).
         let name: String = Input::with_theme(&ColorfulTheme::default())
@@ -310,8 +321,11 @@ pub async fn publish_command() -> Result<()> {
     if let Some(note) = forest_json["name"].as_str().and_then(|n| platform.name_advisory(n)) {
         println!("{}", note);
     }
-    
+
     if !forest_json["author"].is_string() {
+        if !interactive {
+            return Err(missing_field("author"));
+        }
         let authors = author_options;
         let author = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Author name")
@@ -333,12 +347,14 @@ pub async fn publish_command() -> Result<()> {
     // agrees with it (platform-owned; UEFN checks the parent scope folder).
     if let Some(author) = forest_json["author"].as_str() {
         if let Err(reason) = platform.validate_publish_author(&cwd, author) {
-            fail(&reason);
-            return Ok(());
+            anyhow::bail!(reason);
         }
     }
 
     if !forest_json["description"].is_string() {
+        if !interactive {
+            return Err(missing_field("description"));
+        }
         // Prompt for description with default
         let description: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("Project description")
@@ -348,7 +364,15 @@ pub async fn publish_command() -> Result<()> {
         forest_json["description"] = Value::String(description);
     }
 
+    let package_label = format!(
+        "@{}/{}",
+        forest_json["author"].as_str().unwrap_or_default(),
+        forest_json["name"].as_str().unwrap_or_default()
+    );
+
     let mut versions = vec![];
+    // An unchanged license skips the confirm prompt.
+    let mut published_license: Option<String> = None;
     if forest_json["name"].is_string() {
         let platform = platform.as_str();
         let name = forest_json["name"].as_str().unwrap().to_string();
@@ -376,15 +400,28 @@ pub async fn publish_command() -> Result<()> {
 
         if status_code.is_success() {
             metadata["public"] = latest_package_data["public"].clone();
+            published_license = latest_package_data
+                .get("license")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from);
             if let Some(public) = metadata["public"].as_bool() {
                 info(&format!(
                     "Existing package is {}; this version will keep that visibility.",
-                    if public { "public" } else { "private" }
+                    visibility_word(public)
                 ));
+                // A publish never changes visibility.
+                if let Some(declared) = declared_public.filter(|&d| d != public) {
+                    anyhow::bail!(
+                        "forest.json declares visibility \"{}\", but {} is {}. A publish never changes visibility; remove the field or set it to \"{}\".",
+                        visibility_word(declared), package_label, visibility_word(public), visibility_word(public)
+                    );
+                }
             }
             if did_set_name_or_author {
                 let version_confirm = Select::with_theme(&ColorfulTheme::default())
-                    .with_prompt(format!("Package @{}/{} already exists, publish package anyways?", forest_json["author"].as_str().unwrap(), forest_json["name"].as_str().unwrap()))
+                    .with_prompt(format!("Package {} already exists, publish package anyways?", package_label))
                     .default(0)
                     .items(&["Yes", "No"])
                     .interact()?;
@@ -399,56 +436,50 @@ pub async fn publish_command() -> Result<()> {
         }
     }
 
-    // First publish of a new package: the manifest version (the scaffold's
-    // 0.1.0) IS the version - the bump questionnaire only makes sense when
-    // published versions exist to bump from.
-    let mut new_version = match forest_json["version"].as_str() {
-        Some(current) if !versions.is_empty() => version_builder(current),
-        Some(current) => current.to_string(),
-        None => "0.1.0".to_string(),
-    };
-
-    let version_confirm = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!("Version will be: {} Accept this version?", new_version))
-        .default(0)
-        .items(&["Yes", "No (Manually enter version)"])
-        .interact()?;
-
-
-    if version_confirm == 1 {
-        warn("Entering a custom version is NOT recommended, as it can lead to unexpected behavior for developers using your package.");
-        let version: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("What version is this? (SemVer format, e.g. 1.0.0)")
-        .validate_with(|input: &String| {
-            if input.is_empty() {
-                Err(anyhow::anyhow!("Version cannot be empty"))
-            } else if versions.iter().any(|v| v == input) {
-                Err(anyhow::anyhow!("Version already exists. Please choose a different version."))
-            } else if semver::Version::parse(input).is_ok() {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("Invalid version. Versions should be in the SemVer format 'MAJOR.MINOR.PATCH'"))
+    let new_version = if interactive {
+        match choose_version_interactively(forest_json["version"].as_str(), &versions)? {
+            Some(version) => version,
+            None => {
+                fail("Publishing cancelled.");
+                return Ok(());
             }
-        })
-        .interact_text()?;
-
-        new_version = Value::String(version).as_str().unwrap().to_string();
-        
-    }
+        }
+    } else {
+        let Some(version) = forest_json["version"].as_str() else {
+            return Err(missing_field("version"));
+        };
+        if semver::Version::parse(version).is_err() {
+            anyhow::bail!("forest.json version {} isn't valid SemVer (MAJOR.MINOR.PATCH).", version);
+        }
+        if versions.iter().any(|v| v == version) {
+            anyhow::bail!("{}@{} is already published. Bump \"version\" in forest.json.", package_label, version);
+        }
+        warn_if_below_newest(version, &versions);
+        version.to_string()
+    };
     // Set version in forest.json
     forest_json["version"] = Value::String(new_version);
 
     // Set public flag
     if !metadata["public"].is_boolean() {
-        // Prompt for public/private
-        let public = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("What visibility should this package have?")
-            .default(0)
-            .items(&["Public", "Private"])
-            .interact()?;
-
-        metadata["public"] = Value::Bool(public == 0);
+        let public = match declared_public {
+            Some(public) => public,
+            None if interactive => {
+                let choice = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt("What visibility should this package have?")
+                    .default(0)
+                    .items(&["Public", "Private"])
+                    .interact()?;
+                choice == 0
+            }
+            None => anyhow::bail!(
+                "{} has no published visibility to keep. Set \"visibility\" to \"public\" or \"private\" in forest.json.",
+                package_label
+            ),
+        };
+        metadata["public"] = Value::Bool(public);
     }
+    let is_public = metadata["public"] == Value::Bool(true);
 
     // Must run after visibility is settled since the README requirement
     // depends on it. Any earlier and metadata["public"] is still null,
@@ -458,12 +489,14 @@ pub async fn publish_command() -> Result<()> {
             let readme_contents = fs::read_to_string(&readme_path)
                 .context("Failed to read README.md")?;
             if !readme_is_substantial(&readme_contents) {
-                fail("README.md is empty or nearly empty. Please describe what the package does and how to use it, then publish again.");
-                return Ok(());
+                anyhow::bail!("README.md is empty or nearly empty. Please describe what the package does and how to use it, then publish again.");
             }
             metadata["readme"] = Value::String(readme_contents);
         }
-        None if metadata["public"] == Value::Bool(true) => {
+        None if is_public && !interactive => {
+            anyhow::bail!("Public packages need a README.md describing what the package does and how to use it.");
+        }
+        None if is_public => {
             warn("No README.md found. It's required to include a README for public packages.");
             let create_readme = Select::with_theme(&ColorfulTheme::default())
                 .with_prompt("Would you like Forest to insert an empty README.md?")
@@ -491,34 +524,56 @@ pub async fn publish_command() -> Result<()> {
 
     // Find license file and infer license type
     // Attempt to locate a license file and infer its type, then compare with forest.json.
+    let detected = detect_license(&cwd);
 
-    if let Some((license_spdx, inferred )) = detect_license(&cwd) {
+    if !interactive {
+        let declared = forest_json["license"].as_str();
+        let license = license_without_prompts(
+            declared,
+            detected.as_ref().map(|(id, inferred)| (id.as_str(), *inferred)),
+            published_license.as_deref(),
+            is_public,
+        )
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+        forest_json["license"] = Value::String(license);
+    } else if let Some((license_spdx, inferred)) = detected {
         let mut target_spdx = license_spdx.clone();
-        if inferred {
-            let correct_license = Select::with_theme(&ColorfulTheme::default())
-                .with_prompt(format!("Detected license: '{}' Is this correct?", license_spdx))
-                .default(0)
-                .items(&["Yes", "No"])
-                .interact()?;
+        if published_license.as_deref() == Some(license_spdx.as_str()) {
+            info(&format!("License: {} (same as the published version).", license_spdx));
+        } else {
+            if inferred {
+                let correct_license = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt(format!("Detected license: '{}' Is this correct?", license_spdx))
+                    .default(0)
+                    .items(&["Yes", "No"])
+                    .interact()?;
 
-            if correct_license == 1 {
-                target_spdx.clear();
+                if correct_license == 1 {
+                    target_spdx.clear();
+                }
+            }
+
+            if target_spdx.is_empty() {
+                let identifier: String = Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Forest does not recognize the license in your license file. Please provide a valid SPDX License identifier.")
+                    .default(license_spdx.to_string())
+                    .interact_text()?;
+
+                target_spdx = sanitize_spdx(identifier.as_str()).to_string();
             }
         }
 
-        if target_spdx.is_empty() {
-            let identifier: String = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Forest does not recognize the license in your license file. Please provide a valid SPDX License identifier.")
-                .default(license_spdx.to_string())
-                .interact_text()?;
-
-            target_spdx = sanitize_spdx(identifier.as_str()).to_string();
-        }
-
         forest_json["license"] = Value::String(target_spdx);
+    } else if !is_public {
+        // No license file needed, but the registry requires the field.
+        let license = private_license(forest_json["license"].as_str()).unwrap_or_else(|| {
+            info("No license file found. Private packages don't need one, so this version is marked UNLICENSED.");
+            PRIVATE_DEFAULT_LICENSE.to_string()
+        });
+        forest_json["license"] = Value::String(license);
     } else {
         let license_option = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("No license file found. Forest requires PUBLIC packages to have a license file. What would you like to do?")
+            .with_prompt("No license file found. Forest requires public packages to have a license file. What would you like to do?")
             .default(2)
             .items(&["Generate MIT License (Permissive & minimal conditions)", "Cancel and manually add a license", "Find a license (Open in browser)"])
             .interact()?;
@@ -555,12 +610,8 @@ pub async fn publish_command() -> Result<()> {
             }
             _ => {}
         }
-        
+
     }
-
-    
-
-    
 
     let mut msg = Message::new("Got manifest, preparing tarball...");
 
@@ -600,7 +651,7 @@ pub async fn publish_command() -> Result<()> {
                     .mime_str("application/gzip")
                     .unwrap(),
             )
-            
+
     });
 
     msg.update("Uploading package...");
@@ -611,15 +662,15 @@ pub async fn publish_command() -> Result<()> {
     let (upload_response, upload_status) = packages_api_request("v1/package/upload", reqwest::Method::POST, Some(http::RequestBody::Multipart(form_builder)), Some(hdrs))
         .await
         .context("Failed to upload package")?;
-    
+
     if upload_status == StatusCode::TOO_MANY_REQUESTS {
         // The API's 429 message says why and how long until the next publish is allowed.
         let error_msg = upload_response
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("You're publishing too frequently. Please try again later.");
-        msg.finish(MessageType::Fail, error_msg);
-        return Ok(());
+        msg.destroy();
+        anyhow::bail!(error_msg.to_string());
     }
 
     if !upload_status.is_success() {
@@ -627,8 +678,8 @@ pub async fn publish_command() -> Result<()> {
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or(upload_status.as_str());
-        msg.finish(MessageType::Fail, &format!("Failed to upload package: {}", error_msg));
-        return Ok(());
+        msg.destroy();
+        anyhow::bail!("Failed to upload package: {}", error_msg);
     }
 
     // Registry lint warnings (e.g. a uefn package exporting nothing) ride
@@ -642,12 +693,175 @@ pub async fn publish_command() -> Result<()> {
 
     msg.finish(MessageType::Success, "Package uploaded successfully!");
 
-    // Write forest.json with new version
-
-    fs::write(&manifest_path, serde_json::to_string_pretty(&forest_json)?)
-        .context("Failed to write updated forest.json")?;
+    // Write back what publishing filled in (version, author, license).
+    if forest_json != manifest_on_disk {
+        fs::write(&manifest_path, serde_json::to_string_pretty(&forest_json)?)
+            .context("Failed to write updated forest.json")?;
+    }
 
     Ok(())
+}
+
+/// The error for a field a prompt would have asked for.
+fn missing_field(field: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "forest.json has no \"{}\". Publishing without prompts reads everything from forest.json; add it and publish again.",
+        field
+    )
+}
+
+fn visibility_word(public: bool) -> &'static str {
+    if public { "public" } else { "private" }
+}
+
+/// forest.json's optional `visibility`, read only by publish (the registry
+/// drops it). Settles a new package's visibility, must match an existing one.
+fn declared_visibility(forest_json: &Value) -> Result<Option<bool>> {
+    match forest_json.get("visibility") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s == "public" => Ok(Some(true)),
+        Some(Value::String(s)) if s == "private" => Ok(Some(false)),
+        Some(other) => anyhow::bail!(
+            "Invalid visibility {} in forest.json: expected \"public\" or \"private\".",
+            other
+        ),
+    }
+}
+
+/// Where an interactive publish's version comes from.
+#[derive(Debug, PartialEq)]
+enum VersionSource {
+    /// Unpublished forest.json version: confirm it as is.
+    Manifest(String),
+    /// Taken, or absent with versions published: run the bump questions.
+    BumpFrom(String),
+    /// First publish, no version in forest.json.
+    Initial,
+}
+
+fn version_source(manifest_version: Option<&str>, published: &[String]) -> VersionSource {
+    match manifest_version {
+        Some(v) if published.iter().any(|p| p == v) => VersionSource::BumpFrom(v.to_string()),
+        Some(v) => VersionSource::Manifest(v.to_string()),
+        None => newest_published(published)
+            .map(|newest| VersionSource::BumpFrom(newest.to_string()))
+            .unwrap_or(VersionSource::Initial),
+    }
+}
+
+fn newest_published(published: &[String]) -> Option<semver::Version> {
+    published.iter().filter_map(|p| semver::Version::parse(p).ok()).max()
+}
+
+/// Lower than the newest is legal (a backport) but usually a stale forest.json.
+fn warn_if_below_newest(version: &str, published: &[String]) {
+    let (Ok(version), Some(newest)) = (semver::Version::parse(version), newest_published(published)) else {
+        return;
+    };
+    if version < newest {
+        warn(&format!("{} is lower than the newest published version, {}.", version, newest));
+    }
+}
+
+/// Settle the version interactively. None means the user cancelled.
+fn choose_version_interactively(manifest_version: Option<&str>, published: &[String]) -> Result<Option<String>> {
+    let (proposed, prompt) = match version_source(manifest_version, published) {
+        VersionSource::Manifest(v) if semver::Version::parse(&v).is_err() => {
+            warn(&format!("forest.json version {} isn't valid SemVer.", v));
+            return enter_version_manually(published).map(Some);
+        }
+        VersionSource::Manifest(v) => {
+            warn_if_below_newest(&v, published);
+            let prompt = format!("forest.json version {} isn't published yet. Publish it as the new version?", v);
+            (v, prompt)
+        }
+        VersionSource::BumpFrom(v) => {
+            let bumped = version_builder(&v);
+            let prompt = format!("Version will be: {} Accept this version?", bumped);
+            (bumped, prompt)
+        }
+        VersionSource::Initial => {
+            let v = "0.1.0".to_string();
+            let prompt = format!("Version will be: {} Accept this version?", v);
+            (v, prompt)
+        }
+    };
+
+    let version_confirm = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt(prompt)
+        .default(0)
+        .items(&["Yes", "No (Manually enter version)"])
+        .interact()?;
+    if version_confirm == 0 {
+        return Ok(Some(proposed));
+    }
+    warn("Entering a custom version is NOT recommended, as it can lead to unexpected behavior for developers using your package.");
+    enter_version_manually(published).map(Some)
+}
+
+fn enter_version_manually(published: &[String]) -> Result<String> {
+    let published = published.to_vec();
+    let version: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("What version is this? (SemVer format, e.g. 1.0.0)")
+        .validate_with(move |input: &String| {
+            if input.is_empty() {
+                Err(anyhow::anyhow!("Version cannot be empty"))
+            } else if published.iter().any(|v| v == input) {
+                Err(anyhow::anyhow!("Version already exists. Please choose a different version."))
+            } else if semver::Version::parse(input).is_ok() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Invalid version. Versions should be in the SemVer format 'MAJOR.MINOR.PATCH'"))
+            }
+        })
+        .interact_text()?;
+    Ok(version)
+}
+
+/// A private package's declared license, when it has one.
+fn private_license(declared: Option<&str>) -> Option<String> {
+    declared.map(str::trim).filter(|l| !l.is_empty()).map(String::from)
+}
+
+/// License for a publish without prompts. forest.json's `license` wins, a
+/// recognized license file fills it in, anything else is an error. Two
+/// standard ids that disagree are an error too; the registry rejects them.
+fn license_without_prompts(
+    declared: Option<&str>,
+    detected: Option<(&str, bool)>,
+    published: Option<&str>,
+    is_public: bool,
+) -> Result<String, String> {
+    let declared = private_license(declared).map(|d| sanitize_spdx(&d).to_string());
+    match (declared, detected) {
+        (Some(declared), Some((file_id, true))) => {
+            let declared_is_spdx = crate::contracts::licenses().spdx_licenses.iter().any(|id| *id == declared);
+            if declared_is_spdx && declared != file_id {
+                return Err(format!(
+                    "forest.json declares license {}, but the license file looks like {}. Make them agree and publish again.",
+                    declared, file_id
+                ));
+            }
+            Ok(declared)
+        }
+        (Some(declared), _) => {
+            if detected.is_none() && is_public {
+                return Err(public_license_file_required());
+            }
+            Ok(declared)
+        }
+        (None, Some((file_id, inferred))) if inferred || published == Some(file_id) => Ok(file_id.to_string()),
+        (None, Some((file_id, _))) => Err(format!(
+            "forest.json has no \"license\" and Forest doesn't recognize the license file. Set \"license\" in forest.json to an SPDX id, or to \"{}\" for a custom license.",
+            file_id
+        )),
+        (None, None) if is_public => Err(public_license_file_required()),
+        (None, None) => Ok(PRIVATE_DEFAULT_LICENSE.to_string()),
+    }
+}
+
+fn public_license_file_required() -> String {
+    "Public packages need a license file (LICENSE, LICENSE.txt, or LICENSE.md). Add one and publish again.".to_string()
 }
 
 #[cfg(test)]
@@ -665,6 +879,60 @@ mod tests {
             .collect();
         entries.sort();
         entries
+    }
+
+    fn published(list: &[&str]) -> Vec<String> {
+        list.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn unpublished_manifest_version_skips_the_bump_questionnaire() {
+        let taken = published(&["1.0.0", "1.1.0"]);
+        assert_eq!(version_source(Some("1.2.0"), &taken), VersionSource::Manifest("1.2.0".into()));
+        assert_eq!(version_source(Some("1.1.0"), &taken), VersionSource::BumpFrom("1.1.0".into()));
+        // First publish: whatever forest.json says is the version.
+        assert_eq!(version_source(Some("0.1.0"), &[]), VersionSource::Manifest("0.1.0".into()));
+        // No manifest version: bump from the newest by SemVer, not list order.
+        assert_eq!(
+            version_source(None, &published(&["1.10.0", "1.9.0"])),
+            VersionSource::BumpFrom("1.10.0".into())
+        );
+        assert_eq!(version_source(None, &[]), VersionSource::Initial);
+    }
+
+    #[test]
+    fn visibility_field_accepts_public_or_private_only() {
+        assert_eq!(declared_visibility(&serde_json::json!({})).unwrap(), None);
+        assert_eq!(declared_visibility(&serde_json::json!({ "visibility": "public" })).unwrap(), Some(true));
+        assert_eq!(declared_visibility(&serde_json::json!({ "visibility": "private" })).unwrap(), Some(false));
+        assert!(declared_visibility(&serde_json::json!({ "visibility": "Public" })).is_err());
+        assert!(declared_visibility(&serde_json::json!({ "visibility": true })).is_err());
+    }
+
+    #[test]
+    fn license_without_prompts_prefers_the_manifest_and_errors_where_a_prompt_would_ask() {
+        // Declared wins, canonicalized; a matching recognized file is fine.
+        assert_eq!(license_without_prompts(Some("mit"), Some(("MIT", true)), None, true).unwrap(), "MIT");
+        // Two standard ids that disagree: the registry would reject it.
+        assert!(license_without_prompts(Some("Apache-2.0"), Some(("MIT", true)), None, true).is_err());
+        // A custom declaration alongside an unrecognized file stands.
+        assert_eq!(
+            license_without_prompts(Some("LicenseRef-Acme"), Some(("SEE LICENSE IN LICENSE", false)), None, true).unwrap(),
+            "LicenseRef-Acme"
+        );
+        // Undeclared: a recognized file fills it in, an unrecognized one only
+        // when it matches what's already published.
+        assert_eq!(license_without_prompts(None, Some(("MIT", true)), None, true).unwrap(), "MIT");
+        assert!(license_without_prompts(None, Some(("SEE LICENSE IN LICENSE", false)), None, true).is_err());
+        assert_eq!(
+            license_without_prompts(None, Some(("SEE LICENSE IN LICENSE", false)), Some("SEE LICENSE IN LICENSE"), true).unwrap(),
+            "SEE LICENSE IN LICENSE"
+        );
+        // No file: public is an error even with a declaration, private isn't.
+        assert!(license_without_prompts(Some("MIT"), None, None, true).is_err());
+        assert!(license_without_prompts(None, None, None, true).is_err());
+        assert_eq!(license_without_prompts(Some("MIT"), None, None, false).unwrap(), "MIT");
+        assert_eq!(license_without_prompts(None, None, None, false).unwrap(), PRIVATE_DEFAULT_LICENSE);
     }
 
     #[test]

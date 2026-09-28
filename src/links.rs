@@ -57,7 +57,7 @@ pub fn set_policy(policy: LinkPolicy) {
 
 fn policy() -> &'static LinkPolicy {
     POLICY.get_or_init(|| {
-        if std::env::var("CI").is_ok() {
+        if crate::ci::is_ci() {
             LinkPolicy::Ignore(
                 "CI environment detected; run `forest install --links apply` to apply them".to_string(),
             )
