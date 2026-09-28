@@ -143,7 +143,7 @@ pub async fn login_command() -> Result<()> {
         }
     } else {
         // Browser login flow
-        let message = Message::new("Waiting for browser login...");
+        let message = Message::new("Approve the sign-in in your browser...");
 
         let (resp, _) = api_request("v1/auth/browser", reqwest::Method::POST, None, None)
             .await
@@ -158,7 +158,8 @@ pub async fn login_command() -> Result<()> {
 
         tokio::time::sleep(tokio::time::Duration::from_secs(4)).await; // Wait before checking status
 
-        let mut retry_count : i8 = 0;
+        // The device code lives 5 minutes, and approving is an explicit click
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(300);
         loop {
             let (status_data, status_code) = api_request(&format!("v1/auth/browser?deviceCode={}", device_code), reqwest::Method::GET, None, None)
                 .await
@@ -166,7 +167,7 @@ pub async fn login_command() -> Result<()> {
 
             let status = status_data.get("status")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Invalid status format in response"))?;
+                .unwrap_or("");
 
             if status_code.is_success() {
                 if status == "authenticated" {
@@ -198,20 +199,22 @@ pub async fn login_command() -> Result<()> {
                     break;
                 }
             } else {
-                message.finish(MessageType::Fail, "Login failed, please try again.");
+                let reason = if status == "denied" {
+                    "Sign-in was denied in the browser."
+                } else {
+                    "Login failed, please try again."
+                };
+                message.finish(MessageType::Fail, reason);
                 break;
-                // Optionally, you could add a retry limit or exit condition here.
             }
 
-            if retry_count >= 10 {
+            if tokio::time::Instant::now() >= deadline {
                 message.finish(MessageType::Fail, "Login timed out. Please try again.");
                 break;
             }
 
             // Wait before checking again
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-            retry_count += 1;
         }
     }
 
