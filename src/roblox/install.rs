@@ -113,8 +113,8 @@ pub async fn make_directories_roblox(
     manifest: &serde_json::Value,
     force: bool,
 ) -> Result<InstallSummary> {
-    // `_`/`.`-prefixed folders in packages/ are exempt from install cleanup
-    // (e.g. Wally's `_Index`), so aliases must not claim those names.
+    // The receipt scan and type pass skip `_`/`.` entries, so a package
+    // installed under such a name would never be recognized as installed.
     for (pkg_name, spec) in &root_deps {
         if spec.alias.starts_with('_') || spec.alias.starts_with('.') {
             return Err(anyhow!(
@@ -223,10 +223,17 @@ pub async fn make_directories_roblox(
         }
     }
 
-    // The top level of the mount stays fully managed: any non-exempt dir that
-    // isn't a desired root alias is junk or a pre-receipt leftover. (This is
-    // also what clears old trees on --force and first-run-after-upgrade.)
-    prune_top_level(&plan, &base, &container, &mut trash)?;
+    // The top level of the mount stays fully managed: anything that isn't a
+    // desired root alias is removed. (This is also what clears old trees on
+    // --force and first-run-after-upgrade, and a Wally install's leftovers.)
+    let foreign = prune_top_level(&plan, &base, &container, &mut trash)?;
+    if !foreign.is_empty() {
+        crate::message::info(&format!(
+            "Removed {} from {}/; forest manages everything in its dependency folders.",
+            foreign.join(", "),
+            base
+        ));
+    }
 
     // A reinstall target may hold old content, clear it before extraction.
     // Parents first: renaming a parent out takes its nested targets with it,
@@ -480,17 +487,18 @@ fn write_pointer(target_dir: &Path, init_lua: &str, trash: &mut TrashBin) -> Res
 }
 
 /// Keep the top level of the mount fully managed even when installing
-/// incrementally: any non-exempt dir that isn't a desired root alias is junk
-/// or a pre-receipt leftover and gets removed. `_`/`.` entries are exempt:
-/// a project mid-migration may share this directory with Wally's own
-/// `Packages`, whose `_Index` must survive (only DIRS are removed, so
-/// wally's root link scripts survive too). Case-insensitive membership
-/// because Windows/macOS case-fold names (exact-case renames are handled by
-/// the stale/reinstall path, not here). `base` is the physical mount; plan
-/// paths stay in the virtual `./<container>/...` format. `container` must be
-/// the one the plan was built with, or every plan path gets stripped from
-/// `desired` and the whole mount is deleted.
-fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, container: &str, trash: &mut TrashBin) -> Result<()> {
+/// incrementally: anything that isn't a desired root alias is removed, files
+/// included. The mount is forest's alone, so a Wally `_Index` and Wally's
+/// link modules (`Packages/Promise.lua`, which would shadow forest's
+/// `Promise/` in Rojo) go too. Dot entries (`.gitkeep`) are never touched.
+/// Case-insensitive membership because Windows/macOS case-fold names
+/// (exact-case renames are handled by the stale/reinstall path, not here).
+/// `base` is the physical mount; plan paths stay in the virtual
+/// `./<container>/...` format. `container` must be the one the plan was
+/// built with, or every plan path gets stripped from `desired` and the whole
+/// mount is deleted. Returns the names of removed entries forest never
+/// installed (files and receipt-less dirs), for the caller to report.
+fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, container: &str, trash: &mut TrashBin) -> Result<Vec<String>> {
     let prefix = format!("./{}/", container);
     let desired: std::collections::HashSet<String> = plan.packages.iter()
         .filter_map(|p| {
@@ -499,10 +507,11 @@ fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, containe
         })
         .collect();
 
+    let mut foreign = Vec::new();
     for entry in fs::read_dir(base)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('_') || name.starts_with('.') {
+        if name.starts_with('.') {
             continue;
         }
         if desired.contains(&name.to_ascii_lowercase()) {
@@ -514,10 +523,17 @@ fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, containe
             // the link itself, never through it.
             crate::roblox::link_overlay::remove_link_path(&entry.path())?;
         } else if file_type.is_dir() {
+            if !entry.path().join(receipts::RECEIPT_FILE).is_file() {
+                foreign.push(format!("{}/", name));
+            }
             trash.remove_dir_all(&entry.path())?;
+        } else {
+            foreign.push(name);
+            trash.remove_file(&entry.path())?;
         }
     }
-    Ok(())
+    foreign.sort();
+    Ok(foreign)
 }
 
 /// Find abandoned forest-managed mounts near the current one: an immediate
@@ -549,8 +565,8 @@ fn find_abandoned_mounts(manifest_dir: &Path, base: &str) -> Vec<String> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            // `_`/`.` entries are exempt like everywhere else (and a
-            // `.forest-trash` left by a crashed run holds receipts).
+            // `_`/`.` folders are never mounts (and a `.forest-trash` left
+            // by a crashed run holds receipts).
             if name.starts_with('_') || name.starts_with('.') {
                 continue;
             }
@@ -671,20 +687,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn prune_manages_a_nested_mount_and_spares_exempt_entries() {
-        let base_dir = std::env::temp_dir().join(format!("forest-prune-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base_dir);
-        let mount = base_dir.join("src").join("Packages");
-        fs::create_dir_all(mount.join("Knit")).unwrap();
-        fs::create_dir_all(mount.join("Junk")).unwrap();
-        fs::create_dir_all(mount.join("_Index")).unwrap();
-        fs::create_dir_all(mount.join(".cache")).unwrap();
-
-        // Plan paths stay virtual ("./Packages/...") regardless of the mount.
-        let plan = InstallPlan {
+    /// A plan holding one top-level Knit under the given container.
+    fn knit_plan(container: &str) -> InstallPlan {
+        InstallPlan {
             packages: vec![PlannedPackage {
-                path: "./Packages/Knit".to_string(),
+                path: format!("./{}/Knit", container),
                 name: "acme/knit".to_string(),
                 version: "1.0.0".to_string(),
                 integrity: "aa".to_string(),
@@ -693,14 +700,61 @@ mod tests {
                 public: true,
             }],
             pointers: vec![],
-        };
+        }
+    }
 
-        prune_top_level(&plan, &mount.to_string_lossy(), "Packages", &mut test_trash("prune")).unwrap();
+    #[test]
+    fn prune_manages_a_nested_mount_and_spares_dot_entries() {
+        let base_dir = std::env::temp_dir().join(format!("forest-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base_dir);
+        let mount = base_dir.join("src").join("Packages");
+        fs::create_dir_all(mount.join("Knit")).unwrap();
+        fs::create_dir_all(mount.join("Junk")).unwrap();
+        fs::create_dir_all(mount.join(".cache")).unwrap();
+        fs::write(mount.join(".gitkeep"), "").unwrap();
+
+        // Plan paths stay virtual ("./Packages/...") regardless of the mount.
+        prune_top_level(&knit_plan("Packages"), &mount.to_string_lossy(), "Packages", &mut test_trash("prune")).unwrap();
 
         assert!(mount.join("Knit").exists(), "desired alias survives");
         assert!(!mount.join("Junk").exists(), "junk under the nested mount is pruned");
-        assert!(mount.join("_Index").exists(), "wally's _Index is exempt");
         assert!(mount.join(".cache").exists(), "dot entries are exempt");
+        assert!(mount.join(".gitkeep").exists(), "dot files too");
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn prune_takes_over_a_wally_packages_folder() {
+        // A Wally install's leftovers: the _Index store and one link module
+        // per dependency. Forest owns the folder, so all of it goes, and
+        // everything forest never installed is reported.
+        let base_dir = std::env::temp_dir().join(format!("forest-prune-wally-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base_dir);
+        let mount = base_dir.join("Packages");
+        fs::create_dir_all(mount.join("_Index").join("evaera_promise@4.0.0").join("promise")).unwrap();
+        fs::write(mount.join("Promise.lua"), "return require(script.Parent._Index[\"evaera_promise@4.0.0\"][\"promise\"])\n").unwrap();
+        fs::write(mount.join("Knit.lua"), "return require(script.Parent._Index[\"sleitnick_knit@1.7.0\"][\"knit\"])\n").unwrap();
+        fs::create_dir_all(mount.join("Knit")).unwrap();
+        // A stale forest package: pruned, but not reported as foreign.
+        let stale = mount.join("Trove");
+        fs::create_dir_all(&stale).unwrap();
+        crate::receipts::write(&stale, &crate::receipts::Receipt {
+            name: "acme/trove".into(),
+            version: "1.0.0".into(),
+            integrity: "cc".into(),
+            root: "init.luau".into(),
+            container: "Packages".into(),
+        })
+        .unwrap();
+
+        let foreign = prune_top_level(&knit_plan("Packages"), &mount.to_string_lossy(), "Packages", &mut test_trash("prune-wally")).unwrap();
+
+        assert!(mount.join("Knit").is_dir(), "the planned package stays");
+        assert!(!mount.join("_Index").exists(), "wally's store is removed");
+        assert!(!mount.join("Promise.lua").exists(), "wally link modules are removed");
+        assert!(!mount.join("Knit.lua").exists(), "including one that would shadow Knit/");
+        assert!(!stale.exists());
+        assert_eq!(foreign, vec!["Knit.lua".to_string(), "Promise.lua".to_string(), "_Index/".to_string()]);
         let _ = fs::remove_dir_all(&base_dir);
     }
 
@@ -713,26 +767,11 @@ mod tests {
         let mount = base_dir.join("roblox_packages");
         fs::create_dir_all(mount.join("Knit")).unwrap();
         fs::create_dir_all(mount.join("Junk")).unwrap();
-        fs::create_dir_all(mount.join("_Index")).unwrap();
 
-        let plan = InstallPlan {
-            packages: vec![PlannedPackage {
-                path: "./roblox_packages/Knit".to_string(),
-                name: "acme/knit".to_string(),
-                version: "1.0.0".to_string(),
-                integrity: "aa".to_string(),
-                root: "init.luau".to_string(),
-                packages_dir: "Packages".to_string(),
-                public: true,
-            }],
-            pointers: vec![],
-        };
-
-        prune_top_level(&plan, &mount.to_string_lossy(), "roblox_packages", &mut test_trash("prune-renamed")).unwrap();
+        prune_top_level(&knit_plan("roblox_packages"), &mount.to_string_lossy(), "roblox_packages", &mut test_trash("prune-renamed")).unwrap();
 
         assert!(mount.join("Knit").exists(), "desired alias survives under the renamed mount");
         assert!(!mount.join("Junk").exists(), "junk is still pruned");
-        assert!(mount.join("_Index").exists(), "exempt entries still survive");
         let _ = fs::remove_dir_all(&base_dir);
     }
 

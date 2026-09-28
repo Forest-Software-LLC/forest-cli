@@ -68,8 +68,8 @@ fn parse_dep_group(
             continue;
         }
 
-        // Forest aliases become folder names; `_`/`.`-prefixed ones are
-        // reserved by install cleanup. Drop such aliases rather than fail.
+        // Forest aliases become folder names, and install never recognizes
+        // `_`/`.`-prefixed ones. Drop such aliases rather than fail.
         let keep_alias = alias != name && !alias.starts_with('_') && !alias.starts_with('.');
         out.dependencies.push(WallyDep {
             full_name: full_name.to_string(),

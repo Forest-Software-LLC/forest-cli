@@ -77,5 +77,5 @@ cargo build --release      # target/release/forest(.exe)
 ## Gotchas
 - Install state lives ONLY inside the Packages mount (per-dir `.forest-receipt` files) — nothing is written to the project root besides forest.json/forest-lock.json. Deleting a package dir deletes its receipt with it; `install --force` reinstalls everything.
 - The mount's location follows forest.json's `root`: manifests with a nested root (package authoring) install to `<root-parent>/Packages`; root-less manifests (projects) keep `./Packages`. forest-lock.json always stays at the manifest dir.
-- Mount entries starting with `_` or `.` are never touched (Wally `_Index` coexistence).
+- The mount's top level is forest's alone: anything that isn't a planned package is removed on install, files and `_`-prefixed dirs included, so a Wally `_Index` and Wally's link modules go on the first install (reported in one line). Only `.` entries are never touched. Aliases still can't start with `_` or `.` because the receipt scan and type pass skip those names.
 - Symlinked/junction dirs in the mount are never descended into or deleted-through: the receipt scan and type-relink walk skip them, prune and slot-clearing remove the LINK only (`link_overlay::remove_slot`/`remove_link_path`). This protects `forest link` targets (real source trees) from install machinery.

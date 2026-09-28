@@ -32,11 +32,21 @@ impl TrashBin {
         TrashBin { dir, counter: 0, created: false }
     }
 
-    /// Move `path` into the bin. The rename is retried hard: a watcher
-    /// re-snapshotting the tree holds file handles inside it, and Windows
-    /// denies renaming a dir with open children. If every retry fails this
+    /// Move the dir at `path` into the bin. If every rename retry fails this
     /// falls back to deleting in place, accepting the rojo crash risk.
     pub fn remove_dir_all(&mut self, path: &Path) -> std::io::Result<()> {
+        self.move_out(path).or_else(|_| fs::remove_dir_all(path))
+    }
+
+    /// Same for a single file.
+    pub fn remove_file(&mut self, path: &Path) -> std::io::Result<()> {
+        self.move_out(path).or_else(|_| fs::remove_file(path))
+    }
+
+    /// The rename is retried hard: a watcher re-snapshotting the tree holds
+    /// file handles inside it, and Windows denies renaming a dir with open
+    /// children.
+    fn move_out(&mut self, path: &Path) -> std::io::Result<()> {
         if !self.created {
             fs::create_dir_all(&self.dir)?;
             self.created = true;
@@ -54,7 +64,7 @@ impl TrashBin {
                 return result;
             }
         }
-        result.or_else(|_| fs::remove_dir_all(path))
+        result
     }
 }
 

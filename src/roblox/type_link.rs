@@ -59,7 +59,7 @@ fn walk(dir: &Path, cache: &mut HashMap<PathBuf, Option<Vec<ExportedType>>>, qui
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        // Same exemption as install cleanup: `_`/`.` entries (probably) aren't ours.
+        // `_`/`.` entries (probably) aren't ours; no alias may start that way.
         if name.starts_with('_') || name.starts_with('.') { //NOTE: Does anyone start their lua modules files with _? If you do and you see this open an issue.
             continue;
         }

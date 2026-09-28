@@ -140,9 +140,8 @@ pub async fn install_command(
 
         // Validate alias
         if let Some(a) = &alias {
-            // `_`/`.`-prefixed folders in packages/ are exempt from install
-            // cleanup (e.g. Wally's `_Index`), so aliases must not claim
-            // those names.
+            // The receipt scan skips `_`/`.`-prefixed folders, so a package
+            // installed under such a name would never count as installed.
             if a.starts_with('_') || a.starts_with('.') {
                 msg.destroy();
                 return Err(anyhow::anyhow!("Alias {} cannot start with '_' or '.'", a));

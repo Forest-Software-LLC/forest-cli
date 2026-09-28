@@ -9,7 +9,9 @@ zero-gap cycles, checking after each command that rojo is still alive and
 panic-free. Rojo 7.7.0's change processor unwraps canonicalize() on every
 watcher event path, so any transient state where an event's path no longer
 resolves kills the server. This bench is the regression net for forest's
-rename-based mount mutation strategy (see src/roblox/install.rs).
+rename-based mount mutation strategy (see src/roblox/install.rs). The
+project starts from a Wally install's leftovers, which the first install
+into each folder must take over.
 
 .EXAMPLE
 .\scripts\rojo-bench.ps1                       # downloads rojo 7.7.0, uses target\release\forest.exe
@@ -54,7 +56,17 @@ if (Test-Path $Project) { Remove-Item -Recurse -Force $Project }
 if (Test-Path $Logs) { Remove-Item -Recurse -Force $Logs }
 New-Item -ItemType Directory -Force $Project | Out-Null
 New-Item -ItemType Directory -Force $Logs | Out-Null
-New-Item -ItemType Directory -Force (Join-Path $Project "Packages") | Out-Null
+
+# What a Wally install leaves in a folder: the _Index store plus one link
+# module per dependency. Forest takes these folders over, so the first
+# install into each must clear them under the live watcher.
+function Write-WallyLeftovers([string]$Folder, [string]$Scope, [string]$Name, [string]$Version, [string]$Link) {
+    $store = Join-Path $Folder "_Index\$($Scope)_$Name@$Version\$Name"
+    New-Item -ItemType Directory -Force $store | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $store "init.lua"), "return {}")
+    [System.IO.File]::WriteAllText((Join-Path $Folder "$Link.lua"), "return require(script.Parent._Index[`"$($Scope)_$Name@$Version`"][`"$Name`"])")
+}
+Write-WallyLeftovers (Join-Path $Project "Packages") "sleitnick" "knit" "1.7.0" "Knit"
 
 # WriteAllText: UTF-8 without BOM (Out-File's BOM breaks rojo's JSON parser)
 [System.IO.File]::WriteAllText((Join-Path $Project "forest.json"), @'

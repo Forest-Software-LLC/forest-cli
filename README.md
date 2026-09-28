@@ -34,7 +34,7 @@ forest audit                   # check dependencies for updates and license issu
 forest update                  # update the CLI itself
 ```
 
-Dependencies land in `packages/` with generated Luau pointer modules, so requiring them from your game code just works. `forest-lock.json` pins every transitive dependency to an exact version and content hash - commit it.
+Dependencies land in `Packages/` with generated Luau pointer modules, so requiring them from your game code just works. Forest owns that folder: installing removes anything it didn't put there, a Wally `_Index` included. `forest-lock.json` pins every transitive dependency to an exact version and content hash - commit it.
 
 Installs are incremental: packages already on disk that match the lockfile are skipped (each installed folder carries a tiny `.forest-receipt`, ignored by Rojo like LICENSE files), and downloaded archives are kept in a local content-addressed cache (`~/.forest/cache`, verified by SHA-256 on every read; set `FOREST_NO_CACHE=1` to disable). Forest writes nothing to your project root beyond `forest.json` and `forest-lock.json`.
 

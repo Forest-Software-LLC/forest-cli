@@ -23,7 +23,7 @@ pub struct TreeScan {
 /// and pointer signatures. `consumer_container` must match the planner's
 /// root prefix so keys are rendered in plan format regardless of where
 /// `packages_dir` physically is and reconcile can compare strings directly.
-/// `_`/`.` entries are skipped, matching the install-cleanup exemption.
+/// `_`/`.` entries are skipped; no alias may start that way.
 pub fn scan(packages_dir: &Path, consumer_container: &str) -> TreeScan {
     let mut tree = TreeScan::default();
     walk(packages_dir, &format!("./{}", consumer_container), &mut tree);
