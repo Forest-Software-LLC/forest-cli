@@ -7,6 +7,7 @@ pub mod extract;
 pub mod init;
 pub mod install;
 pub mod link_overlay;
+pub mod mount_dirs;
 pub mod plan;
 pub mod publish;
 pub mod receipts;
@@ -67,39 +68,16 @@ pub fn physical_path(base: &str, container: &str, plan_path: &str) -> std::path:
     }
 }
 
-/// `packagesDir` rule, shared by init, publish preflight, and install:
-/// `^[A-Za-z][A-Za-z0-9_-]*$`, max 64 chars, Windows reserved device names
-/// rejected case-insensitively. The letter start excludes path-traversal
-/// characters and the cleanup-exempt `_`/`.` prefixes. Install validates
-/// too because registry values flow into filesystem paths.
-pub fn validate_packages_dir(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("Dependency folder name cannot be empty.".to_string());
+/// The default mount's folder name for `forest mount rename`: `packagesDir`,
+/// written only when it differs from the default so manifests stay minimal.
+pub fn set_packages_container(manifest: &mut serde_json::Value, name: &str) {
+    if name == PACKAGES_DIR {
+        if let Some(obj) = manifest.as_object_mut() {
+            obj.remove("packagesDir");
+        }
+    } else {
+        manifest["packagesDir"] = serde_json::Value::String(name.to_string());
     }
-    if name.len() > 64 {
-        return Err("Dependency folder name cannot be longer than 64 characters.".to_string());
-    }
-    let mut chars = name.chars();
-    if !chars.next().map_or(false, |c| c.is_ascii_alphabetic()) {
-        return Err("Dependency folder name must start with a letter.".to_string());
-    }
-    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err(
-            "Dependency folder name may only contain letters, numbers, underscores, and hyphens."
-                .to_string(),
-        );
-    }
-    const WINDOWS_RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if WINDOWS_RESERVED.contains(&name.to_ascii_uppercase().as_str()) {
-        return Err(format!(
-            "Dependency folder name '{}' is a reserved Windows device name.",
-            name
-        ));
-    }
-    Ok(())
 }
 
 /// Does `start` look like a Roblox project? Signals: a Rojo
@@ -203,24 +181,11 @@ mod tests {
     }
 
     #[test]
-    fn packages_dir_rule_accepts_sane_names_only() {
-        assert!(validate_packages_dir("Packages").is_ok());
-        assert!(validate_packages_dir("roblox_packages").is_ok());
-        assert!(validate_packages_dir("my-packages").is_ok());
-        assert!(validate_packages_dir(&"a".repeat(64)).is_ok(), "64 chars is the ceiling");
-
-        assert!(validate_packages_dir("").is_err());
-        assert!(validate_packages_dir(&"a".repeat(65)).is_err());
-        assert!(validate_packages_dir("..").is_err());
-        assert!(validate_packages_dir("a/b").is_err());
-        assert!(validate_packages_dir("a\\b").is_err());
-        assert!(validate_packages_dir("_lead").is_err(), "cleanup-exempt prefix");
-        assert!(validate_packages_dir(".lead").is_err(), "cleanup-exempt prefix");
-        assert!(validate_packages_dir("1pkg").is_err(), "must start with a letter");
-        assert!(validate_packages_dir("CON").is_err(), "Windows device name");
-        assert!(validate_packages_dir("con").is_err(), "device names reject case-insensitively");
-        assert!(validate_packages_dir("Com5").is_err());
-        assert!(validate_packages_dir("lpt9").is_err());
-        assert!(validate_packages_dir("COM10").is_ok(), "only COM1-COM9 are reserved");
+    fn default_container_is_written_as_absence() {
+        let mut manifest = json!({ "packagesDir": "Deps" });
+        set_packages_container(&mut manifest, "Packages");
+        assert!(manifest.get("packagesDir").is_none());
+        set_packages_container(&mut manifest, "Deps");
+        assert_eq!(manifest["packagesDir"], "Deps");
     }
 }

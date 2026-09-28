@@ -16,7 +16,7 @@
 //! The lockfile's `location` strings are Roblox hoisting metadata and are
 //! deliberately IGNORED here.
 
-use crate::lockfile_gen::LockFile;
+use crate::lockfile::LockSection;
 use crate::lockfile_solver::DepSpec;
 use anyhow::{anyhow, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -60,7 +60,7 @@ pub struct UefnInstallPlan {
 fn canonical_name_segment(
     lock_key: &str,
     root_deps: &HashMap<String, DepSpec>,
-    lockfile: &LockFile,
+    lockfile: &LockSection,
 ) -> String {
     fn name_from<'a>(keys: impl Iterator<Item = &'a String>, lock_key: &str) -> Option<String> {
         for key in keys {
@@ -82,7 +82,7 @@ fn canonical_name_segment(
 }
 
 pub fn plan_install_uefn(
-    lockfile: &LockFile,
+    lockfile: &LockSection,
     root_deps: &HashMap<String, DepSpec>,
     verse_path: &str,
     authored: &[(String, String)], // (mapped_scope, dir_name)
@@ -233,9 +233,8 @@ mod tests {
         }
     }
 
-    fn lockfile(packages: Vec<(&str, Vec<LockfileEntry>)>) -> LockFile {
-        LockFile {
-            file_version: 2,
+    fn lockfile(packages: Vec<(&str, Vec<LockfileEntry>)>) -> LockSection {
+        LockSection {
             overrides: std::collections::HashMap::new(),
             excludes: std::collections::HashMap::new(),
             packages: packages.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),

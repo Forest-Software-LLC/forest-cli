@@ -10,9 +10,11 @@ mod install_report;
 mod ci;
 mod contracts;
 mod message;
+mod lockfile;
 mod lockfile_gen;
 mod lockfile_solver;
 mod meta_cache;
+mod mounts;
 mod roblox;
 mod receipts;
 mod fetch_and_extract;
@@ -22,7 +24,7 @@ mod platform;
 mod release_verify;
 mod uefn;
 mod utils;
-use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, upgrade_command, audit_command, tree_command, override_command, exclude_command, link_command, unlink_command, maybe_notify_update};
+use commands::{login_command, logout_command, whoami_command, install_command, init_command, publish_command, remove_command, update_command, upgrade_command, audit_command, tree_command, override_command, exclude_command, link_command, unlink_command, mount_list, mount_create, mount_remove, mount_rename, maybe_notify_update};
 
 use std::env;
 
@@ -106,6 +108,11 @@ enum Commands {
         /// forest.json. For CI.
         #[arg(long = "frozen")]
         frozen: bool,
+
+        /// Mount to add the package to, or the only mount to install
+        /// (a mount path, or enough of its end to be unique)
+        #[arg(short = 'm', long = "mount", value_name = "MOUNT")]
+        mount: Option<String>,
     },
 
     /// Remove a package from the project
@@ -113,6 +120,10 @@ enum Commands {
     Remove {
         /// Package name
         package: String,
+
+        /// Mount to remove it from, when several declare it
+        #[arg(short = 'm', long = "mount", value_name = "MOUNT")]
+        mount: Option<String>,
     },
 
     /// Update dependencies to the newest versions your declared ranges allow
@@ -120,6 +131,10 @@ enum Commands {
         /// Moved: CLI self-update is now `forest upgrade --check`
         #[arg(long = "check", hide = true)]
         check: bool,
+
+        /// Only update this mount
+        #[arg(short = 'm', long = "mount", value_name = "MOUNT")]
+        mount: Option<String>,
     },
 
     /// Update forest itself to the latest release
@@ -138,6 +153,10 @@ enum Commands {
         /// Update forest.json to the latest versions and reinstall
         #[arg(short = 'u', long = "update")]
         update: bool,
+
+        /// Only audit this mount
+        #[arg(short = 'm', long = "mount", value_name = "MOUNT")]
+        mount: Option<String>,
     },
 
     /// Show the installed dependency tree
@@ -145,6 +164,10 @@ enum Commands {
     Tree {
         /// Only show this package's subtree (e.g. scope/name, alias, or bare name)
         package: Option<String>,
+
+        /// Only show this mount
+        #[arg(short = 'm', long = "mount", value_name = "MOUNT")]
+        mount: Option<String>,
     },
 
     /// Force a transitive dependency onto a semver range (lists overrides when no package is given)
@@ -173,6 +196,10 @@ enum Commands {
         /// Show active links and their divergence from the lockfile
         #[arg(long = "list")]
         list: bool,
+
+        /// Mount whose dependency to link, when several declare it
+        #[arg(short = 'm', long = "mount", value_name = "MOUNT")]
+        mount: Option<String>,
     },
 
     /// Remove a local link and restore the registry version
@@ -183,6 +210,16 @@ enum Commands {
         /// Remove every active link
         #[arg(long = "all")]
         all: bool,
+
+        /// Only unlink in this mount
+        #[arg(short = 'm', long = "mount", value_name = "MOUNT")]
+        mount: Option<String>,
+    },
+
+    /// Manage mounts: extra dependency folders, each installed on its own (lists mounts when no action is given)
+    Mount {
+        #[command(subcommand)]
+        action: Option<MountAction>,
     },
 
     /// Ban versions of a package from ever being installed (lists exclusions when no package is given)
@@ -202,6 +239,38 @@ enum Commands {
         #[arg(long = "remove")]
         remove: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum MountAction {
+    /// Add a mount: a dependency folder at PATH, relative to forest.json
+    Create {
+        /// Folder path, e.g. ServerPackages or src/server/Packages
+        path: String,
+    },
+
+    /// Remove a mount, its dependencies, and its folder
+    Remove {
+        /// The mount's path, or enough of its end to be unique
+        mount: String,
+
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
+
+    /// Move or rename a mount's folder
+    Rename {
+        /// The mount's path, or enough of its end to be unique
+        mount: String,
+
+        /// The new folder path, relative to forest.json
+        new_path: String,
+    },
+
+    /// List the project's mounts
+    #[command(alias = "ls")]
+    List,
 }
 
 #[tokio::main]
@@ -265,28 +334,28 @@ async fn run(command: Commands) -> anyhow::Result<()> {
         Commands::Init { platform, project, packages_dir } => {
             init_command(platform, project, packages_dir).await?;
         }
-        Commands::Install { package, version, alias, force, init, links, frozen } => {
-            install_command(package, version, alias, force, init, links, frozen).await?;
+        Commands::Install { package, version, alias, force, init, links, frozen, mount } => {
+            install_command(package, version, alias, force, init, links, frozen, mount).await?;
         }
-        Commands::Remove { package } => {
-            remove_command(package).await?;
+        Commands::Remove { package, mount } => {
+            remove_command(package, mount).await?;
         }
-        Commands::Update { check } => {
+        Commands::Update { check, mount } => {
             if check {
                 // `forest update --check` was the self-update probe before v1.11.
                 crate::message::info("`forest update` now updates dependencies. For the CLI itself, run `forest upgrade --check`.");
             } else {
-                update_command().await?;
+                update_command(mount).await?;
             }
         }
         Commands::Upgrade { check } => {
             upgrade_command(check).await?;
         }
-        Commands::Audit { package, update } => {
-            audit_command(package, update).await?;
+        Commands::Audit { package, update, mount } => {
+            audit_command(package, update, mount).await?;
         }
-        Commands::Tree { package } => {
-            tree_command(package)?;
+        Commands::Tree { package, mount } => {
+            tree_command(package, mount)?;
         }
         Commands::Override { package, range, yes, remove } => {
             override_command(package, range, yes, remove).await?;
@@ -294,12 +363,18 @@ async fn run(command: Commands) -> anyhow::Result<()> {
         Commands::Exclude { package, range, yes, remove } => {
             exclude_command(package, range, yes, remove).await?;
         }
-        Commands::Link { path, list } => {
-            link_command(path, list).await?;
+        Commands::Link { path, list, mount } => {
+            link_command(path, list, mount).await?;
         }
-        Commands::Unlink { reference, all } => {
-            unlink_command(reference, all).await?;
+        Commands::Unlink { reference, all, mount } => {
+            unlink_command(reference, all, mount).await?;
         }
+        Commands::Mount { action } => match action {
+            None | Some(MountAction::List) => mount_list()?,
+            Some(MountAction::Create { path }) => mount_create(path).await?,
+            Some(MountAction::Remove { mount, yes }) => mount_remove(mount, yes).await?,
+            Some(MountAction::Rename { mount, new_path }) => mount_rename(mount, new_path).await?,
+        },
     }
 
     Ok(())

@@ -8,12 +8,28 @@ use serde_json::{Map, Value};
 use urlencoding::encode;
 
 use crate::http::api_request;
-use crate::lockfile_gen::lockfile_gen_or_restore;
+use crate::lockfile::LockFile;
+use crate::lockfile_gen::{sync_or_restore, Refresh, SyncOptions};
+use crate::lockfile_solver::DepSpec;
 use crate::message::{self, Message, MessageType};
 use crate::utils::{
-    digest_package_name, normalize_forest_deps, normalize_forest_excludes,
-    normalize_forest_overrides, resolve_dep_ref, DepRef,
+    digest_package_name, normalize_forest_excludes, normalize_forest_overrides, resolve_dep_ref,
+    DepRef,
 };
+
+/// Every mount's direct dependencies in one map, for references that are
+/// project-wide (overrides and excludes apply to every mount).
+pub(crate) fn all_direct_deps(manifest: &Value, platform: crate::platform::Platform) -> Result<HashMap<String, DepSpec>> {
+    let mut all = HashMap::new();
+    for mount in crate::mounts::project_mounts(manifest, platform)? {
+        for (key, spec) in mount.deps {
+            if !all.keys().any(|k: &String| k.eq_ignore_ascii_case(&key)) {
+                all.insert(key, spec);
+            }
+        }
+    }
+    Ok(all)
+}
 
 /// Manage dependency overrides: force every transitive occurrence of a
 /// package onto one semver range, recorded under `overrides` in forest.json.
@@ -56,11 +72,12 @@ pub async fn override_command(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing platform in forest.json"))?
         .to_string();
-    let roots = normalize_forest_deps(&manifest);
+    let roots = all_direct_deps(&manifest, project.platform)?;
 
-    // Direct dependencies are not overridden; the manifest range IS the
-    // user's own constraint. But a reference that names an existing override
-    // is an edit of that override, even if a root dep shares the bare name.
+    // Direct dependencies (of any mount) are not overridden; the manifest
+    // range IS the user's own constraint. But a reference that names an
+    // existing override is an edit of that override, even if a root dep
+    // shares the bare name.
     let existing_key = match_override_key(&overrides, &reference);
     if existing_key.is_none() {
         match resolve_dep_ref(&roots, &reference) {
@@ -413,58 +430,25 @@ pub(crate) fn match_override_key(overrides: &HashMap<String, String>, reference:
     }
 }
 
-/// Every version of the package the lockfile currently holds, sorted.
+/// Every version of the package the lockfile currently holds in any mount,
+/// sorted.
 pub(crate) fn installed_versions(name: &str) -> Vec<Version> {
-    let Ok(raw) = fs::read_to_string("forest-lock.json") else {
-        return Vec::new();
-    };
-    let Ok(lock) = serde_json::from_str::<Value>(&raw) else {
-        return Vec::new();
-    };
-    let mut versions: Vec<Version> = lock
-        .get("packages")
-        .and_then(Value::as_object)
-        .and_then(|pkgs| {
-            pkgs.iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, entries)| entries)
-        })
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|e| e.get("version").and_then(Value::as_str))
-                .filter_map(|v| Version::parse(v).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    versions.sort();
-    versions.dedup();
-    versions
+    LockFile::load().map(|lf| lf.versions_of(name)).unwrap_or_default()
 }
 
 pub(crate) fn lockfile_package_keys() -> Vec<String> {
-    let Ok(raw) = fs::read_to_string("forest-lock.json") else {
-        return Vec::new();
-    };
-    let Ok(lock) = serde_json::from_str::<Value>(&raw) else {
-        return Vec::new();
-    };
-    lock.get("packages")
-        .and_then(Value::as_object)
-        .map(|pkgs| pkgs.keys().cloned().collect())
-        .unwrap_or_default()
+    LockFile::load().map(|lf| lf.package_keys()).unwrap_or_default()
 }
 
 /// Re-resolve and reinstall under the updated manifest, like `audit --update`.
+/// The recorded overrides/excludes changed, so every mount resolves again.
 /// On failure the pre-change manifest is restored, so a constraint that
 /// can't resolve (or a network hiccup) never leaves forest.json poisoned;
 /// the caller should stop after a `false` return.
 pub(crate) async fn reinstall_or_rollback(manifest: &Value, manifest_before: &str) -> Result<bool> {
     let mut msg = Message::new("Updating packages...");
-    match lockfile_gen_or_restore(manifest, manifest_before, &mut msg, false).await {
-        Ok(lockfile) => {
-            fs::write("forest-lock.json", lockfile.to_json_pretty()?)?;
+    match sync_or_restore(manifest, manifest_before, &mut msg, &SyncOptions::new(None, Refresh::Stale)).await {
+        Ok(_) => {
             msg.destroy();
             Ok(true)
         }

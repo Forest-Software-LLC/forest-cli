@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::fs;
 use anyhow::Result;
 use serde_json::{Value, Map};
 use urlencoding::encode;
@@ -6,10 +6,13 @@ use reqwest::Method;
 
 use crate::http::{api_request, packages_api_request};
 use crate::message::{Message, MessageType};
-use crate::lockfile_gen::{lockfile_gen, lockfile_gen_or_restore, lockfile_satisfies_manifest, make_directories, LockFile};
-use crate::utils::{normalize_forest_deps, normalize_forest_excludes, normalize_forest_overrides};
+use crate::lockfile_gen::{sync, sync_or_restore, Refresh, SyncOptions};
+use crate::utils::normalize_forest_overrides;
 
-/// Install dependencies for a forest package.
+/// Install dependencies for a forest package. `mount` (a mount path or an
+/// unambiguous tail of one) is where a new package goes, and limits a bulk
+/// install to that mount.
+#[allow(clippy::too_many_arguments)]
 pub async fn install_command(
     target_package: Option<String>,
     version: Option<String>,
@@ -18,6 +21,7 @@ pub async fn install_command(
     init_platform: Option<String>,
     links_mode: Option<crate::links::LinksMode>,
     frozen: bool,
+    mount: Option<String>,
 ) -> Result<()> {
     if frozen && target_package.is_some() {
         return Err(anyhow::anyhow!("--frozen installs the lockfile as is, so it can't add a package."));
@@ -111,6 +115,21 @@ pub async fn install_command(
         .to_string();
 
     let plat = project.platform;
+    let mounts = match crate::mounts::project_mounts(&info, plat) {
+        Ok(mounts) => mounts,
+        Err(e) => {
+            msg.destroy();
+            return Err(e);
+        }
+    };
+    let target_mount = match mount.as_deref().map(|r| crate::mounts::find_mount(&mounts, r)).transpose() {
+        Ok(found) => found,
+        Err(e) => {
+            msg.destroy();
+            return Err(e);
+        }
+    };
+    let only = target_mount.map(|m| m.path.clone());
 
     // Some platforms reject aliases outright (UEFN: Verse has no cheap
     // re-export shims). Fail before any network work; the planner backstops
@@ -122,10 +141,13 @@ pub async fn install_command(
         }
     }
 
+    let bulk = SyncOptions { force, frozen, announce: true, ..SyncOptions::new(only.clone(), Refresh::Stale) };
+
     // Read before `deps` takes its mutable borrow of the manifest.
     let manifest_overrides = normalize_forest_overrides(&info);
-    let normalized_root_deps = normalize_forest_deps(&info);
-    let deps = info.get_mut("dependencies").unwrap().as_object_mut().unwrap();
+    let add_to = target_mount.unwrap_or(&mounts[0]);
+    let normalized_root_deps = add_to.deps.clone();
+    let deps = crate::mounts::deps_map_mut(&mut info, add_to)?;
 
     if let Some(pkg) = target_package {
         
@@ -140,9 +162,8 @@ pub async fn install_command(
 
         // Validate alias
         if let Some(a) = &alias {
-            // `_`/`.`-prefixed folders in packages/ are exempt from install
-            // cleanup (e.g. Wally's `_Index`), so aliases must not claim
-            // those names.
+            // The receipt scan skips `_`/`.`-prefixed folders, so a package
+            // installed under such a name would never count as installed.
             if a.starts_with('_') || a.starts_with('.') {
                 msg.destroy();
                 return Err(anyhow::anyhow!("Alias {} cannot start with '_' or '.'", a));
@@ -255,11 +276,12 @@ pub async fn install_command(
         // so materializing the lockfile below restores it. When everything
         // is present this ends in "Already up to date!".
         if let Some(existing_key) = deps.keys().find(|k| k.eq_ignore_ascii_case(&canonical_full)).cloned() {
+            let place = if mounts.len() > 1 { format!(" (mount {})", add_to.path) } else { String::new() };
             msg.emit(
                 MessageType::Info,
-                &format!("Package {} is already in forest.json. Verifying installed packages...", existing_key),
+                &format!("Package {} is already in forest.json{}. Verifying installed packages...", existing_key, place),
             );
-            sync_from_lockfile(&info, msg, force, frozen).await?;
+            install_all(&info, msg, &bulk).await?;
             return Ok(());
         }
 
@@ -293,12 +315,13 @@ pub async fn install_command(
         let manifest_before = fs::read_to_string("forest.json")?;
         fs::write("forest.json", serde_json::to_string_pretty(&info)?)?;
 
-        let lockfile_content = lockfile_gen_or_restore(&info, &manifest_before, &mut msg, force).await?;
-        fs::write("forest-lock.json", lockfile_content.to_json_pretty()?)?;
+        let opts = SyncOptions { force, ..SyncOptions::new(only, Refresh::Mounts(vec![add_to.path.clone()])) };
+        sync_or_restore(&info, &manifest_before, &mut msg, &opts).await?;
 
+        let place = if add_to.is_default() { String::new() } else { format!(" to {}", add_to.path) };
         msg.finish(
             MessageType::Success,
-            &format!("Package {} added!", canonical_full),
+            &format!("Package {} added{}!", canonical_full, place),
         );
 
         // Platform-specific usage snippet, when there is one.
@@ -307,105 +330,32 @@ pub async fn install_command(
         }
     } else {
         // No specific package: install all via lockfile
-        sync_from_lockfile(&info, msg, force, frozen).await?;
+        install_all(&info, msg, &bulk).await?;
     }
 
     Ok(())
 }
 
-/// Materialize the tree from the lockfile (regenerating it when missing or
-/// outdated). Shared tail of the bulk `forest install` and of a targeted
-/// install whose dependency is already declared - in that case this is what
-/// restores a hand-deleted package folder (its receipt died with it, so
-/// reconciliation reinstalls it).
-async fn sync_from_lockfile(
-    info: &Value,
-    mut msg: Message,
-    force: bool,
-    frozen: bool,
-) -> Result<()> {
-    let lock_content: Option<Value> = if Path::new("forest-lock.json").exists() {
-        Some(serde_json::from_str(&fs::read_to_string("forest-lock.json")?)?)
+/// Materialize every mount in the run from the lockfile, resolving the
+/// mounts whose sections are missing or outdated. Shared tail of the bulk
+/// `forest install` and of a targeted install whose dependency is already
+/// declared; in that case this is what restores a hand-deleted package
+/// folder (its receipt died with it, so reconciliation reinstalls it).
+async fn install_all(info: &Value, mut msg: Message, opts: &SyncOptions) -> Result<()> {
+    let outcome = sync(info, &mut msg, opts).await?;
+    let installed = if outcome.resolved {
+        "dependencies".to_string()
     } else {
-        msg.emit(
-            MessageType::Warn,
-            "No lockfile found. Commit forest-lock.json to avoid inconsistencies.",
-        );
-        None
+        format!("{} package{}", outcome.installed, if outcome.installed == 1 { "" } else { "s" })
     };
-
-    // Only the current format installs straight from the lockfile; anything
-    // else (older format, unknown version, unparseable) is re-resolved like a
-    // missing one.
-    let lockfile: Option<LockFile> = match &lock_content {
-        Some(c) if c.get("file_version").and_then(Value::as_u64) == Some(2) => {
-            serde_json::from_value(c.clone()).ok()
-        }
-        _ => None,
-    };
-
-    // The lockfile is only trusted while it still satisfies forest.json's
-    // declared ranges - a hand-edited range (^1.5.0 -> ^2.0.0) or a removed
-    // dependency re-resolves instead of silently keeping the old pin.
-    let lockfile = match lockfile {
-        Some(lf) => {
-            let roots = crate::platform::Platform::from_manifest(info)?
-                .resolution_roots(normalize_forest_deps(info))?;
-            if lockfile_satisfies_manifest(&lf, &roots, &normalize_forest_overrides(info), &normalize_forest_excludes(info)) {
-                Some(lf)
-            } else {
-                msg.emit(
-                    MessageType::Info,
-                    "forest.json dependencies changed; updating forest-lock.json.",
-                );
-                None
-            }
-        }
-        None => {
-            if lock_content.is_some() {
-                msg.emit(
-                    MessageType::Warn,
-                    "Lockfile format is out of date; regenerating forest-lock.json.",
-                );
-            }
-            None
-        }
-    };
-
-    if frozen && lockfile.is_none() {
-        msg.destroy();
-        return Err(anyhow::anyhow!(
-            "--frozen: forest-lock.json is missing or out of date with forest.json. Run `forest install` locally and commit the lockfile."
-        ));
-    }
-
-    if let Some(lockfile) = lockfile {
-        msg.destroy();
-        let summary = make_directories(&lockfile, normalize_forest_deps(&info.clone()), info, force).await?;
-
-        msg = Message::new("");
-        let installed = format!("{} package{}", summary.installed, if summary.installed == 1 { "" } else { "s" });
-        if let Some(note) = skipped_summary(&installed) {
-            msg.finish(MessageType::Warn, &note);
-        } else if summary.installed == 0 {
-            msg.finish(MessageType::Success, "Already up to date!");
-        } else {
-            msg.finish(MessageType::Success, &format!(
-                "Installed {} package{}!",
-                summary.installed,
-                if summary.installed == 1 { "" } else { "s" }
-            ));
-        }
-        return Ok(());
-    }
-
-    let info_clone = info.clone();
-    let lockfile_content = lockfile_gen(&info_clone, &mut msg, force).await?;
-    fs::write("forest-lock.json", lockfile_content.to_json_pretty()?)?;
-
-    match skipped_summary("dependencies") {
-        Some(note) => msg.finish(MessageType::Warn, &note),
-        None => msg.finish(MessageType::Success, "Installed all dependencies!"),
+    if let Some(note) = skipped_summary(&installed) {
+        msg.finish(MessageType::Warn, &note);
+    } else if outcome.resolved {
+        msg.finish(MessageType::Success, "Installed all dependencies!");
+    } else if outcome.installed == 0 {
+        msg.finish(MessageType::Success, "Already up to date!");
+    } else {
+        msg.finish(MessageType::Success, &format!("Installed {}!", installed));
     }
     Ok(())
 }

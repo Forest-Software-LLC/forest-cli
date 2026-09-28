@@ -240,12 +240,13 @@ pub async fn publish_command(yes: bool) -> Result<()> {
 
     // Publishing while a dependency resolves through a local link is refused
     // outright: the tested tree is not the tree consumers will get, and the
-    // linked dev version may not even be published. No override flag.
+    // linked dev version may not even be published. No override flag. Only
+    // the default mount ships, so links in other mounts don't count.
     {
         let deps = crate::utils::normalize_forest_deps(&forest_json);
         let linked: Vec<String> = crate::links::stored_links()
             .into_iter()
-            .filter(|l| deps.keys().any(|k| crate::utils::same_package(k, &l.name)))
+            .filter(|l| l.mount.is_none() && deps.keys().any(|k| crate::utils::same_package(k, &l.name)))
             .map(|l| l.name)
             .collect();
         if !linked.is_empty() {
@@ -269,6 +270,19 @@ pub async fn publish_command(yes: bool) -> Result<()> {
     match platform.publish_preflight(&cwd, &mut forest_json, &mut metadata, interactive)? {
         Preflight::Continue => {}
         Preflight::Abort(reason) => anyhow::bail!(reason),
+    }
+
+    // After preflight: the default mount's location follows the resolved
+    // `root`. Extra mounts only ever serve this project (the registry
+    // strips the field), like overrides and excludes.
+    let mounts = crate::mounts::project_mounts(&forest_json, platform)?;
+    let extra = mounts.len() - 1;
+    if extra > 0 {
+        crate::message::warn(&format!(
+            "forest.json declares {} extra mount{}; only the default mount's dependencies are published.",
+            extra,
+            if extra == 1 { "" } else { "s" }
+        ));
     }
 
     let declared_public = declared_visibility(&forest_json)?;
@@ -615,9 +629,9 @@ pub async fn publish_command(yes: bool) -> Result<()> {
 
     let mut msg = Message::new("Got manifest, preparing tarball...");
 
-    // Prepare tarball. Platform-mandated exclusions (Roblox: the Packages/
-    // mount + forest-lock.json when deps are declared) ride along here.
-    let matcher = load_forest_ignore(&cwd, &platform.publish_ignores(&forest_json));
+    // Prepare tarball. Platform-mandated exclusions (Roblox: every mount +
+    // forest-lock.json when deps are declared) ride along here.
+    let matcher = load_forest_ignore(&cwd, &platform.publish_ignores(&mounts));
 
     // Platform pre-pack lint: the gateway hard-rejects these files, but
     // warning BEFORE the upload is the better error location.
@@ -1022,7 +1036,32 @@ mod tests {
             "dependencies": { "acme/dep": "^1.0.0" },
             "root": "src/init.luau"
         });
-        let forced = crate::roblox::publish::publish_ignores(&manifest);
+        let mounts = crate::mounts::project_mounts(&manifest, Platform::Roblox).unwrap();
+        let forced = crate::roblox::publish::publish_ignores(&mounts);
+        assert_eq!(
+            tarball_entries(&base, &forced),
+            vec!["forest.json", "src/init.luau"]
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn forced_ignores_keep_a_mount_inside_the_root_dir_out_of_the_tarball() {
+        let base = std::env::temp_dir().join(format!("forest-publish-mounts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("src").join("DevPackages").join("TestEZ")).unwrap();
+        fs::write(base.join("forest.json"), "{}").unwrap();
+        fs::write(base.join("src").join("init.luau"), "return {}").unwrap();
+        fs::write(base.join("src").join("DevPackages").join("TestEZ").join("init.lua"), "return {}").unwrap();
+
+        let manifest = serde_json::json!({
+            "dependencies": {},
+            "root": "src/init.luau",
+            "mounts": { "src/DevPackages": { "dependencies": { "roblox/testez": "^0.4.0" } } }
+        });
+        let mounts = crate::mounts::project_mounts(&manifest, Platform::Roblox).unwrap();
+        let forced = crate::roblox::publish::publish_ignores(&mounts);
         assert_eq!(
             tarball_entries(&base, &forced),
             vec!["forest.json", "src/init.luau"]

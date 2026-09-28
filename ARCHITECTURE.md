@@ -23,7 +23,9 @@ src/
 
   roblox/            Everything Roblox-specific:
     plan.rs            hoisted-layout planner + pointer-file computation
-    install.rs         executor (downloads, prune, pointer regeneration)
+    install.rs         executor, one mount per call (downloads, prune,
+                       pointer regeneration)
+    mount_dirs.rs      whole-mount remove/move for `forest mount`
     extract.rs         init-rename folder-module extraction
     receipts.rs        recursive Packages/* scan + keep/stale reconcile
     publish.rs         root (entry-point) resolution + naming rules
@@ -36,8 +38,13 @@ src/
     init.rs            location-inferred scaffolds
 
   Core (platform-blind; MUST NOT import roblox/ or uefn/):
-    lockfile_gen.rs    lockfile format, resolution entry point, shared
-                       download services (CDN base, signed URLs)
+    mounts.rs          a project's mounts (default + `mounts` field): parsing,
+                       set validation, `--mount` references, the only writer
+                       of the field
+    lockfile.rs        lockfile format: one section per mount, trust check
+    lockfile_gen.rs    install orchestration per mount, the only writer of
+                       forest-lock.json, shared download services (CDN base,
+                       signed URLs)
     lockfile_solver.rs semver resolution against the registry
     fetch_and_extract.rs  trusted-byte acquisition + verbatim extraction
     receipts.rs        receipt read/write + the flat 3-way tree taxonomy
@@ -62,7 +69,11 @@ Luau is, the change is in the wrong place.
 
 | Method | What it owns |
 |---|---|
-| `install` | The entire layout/extraction/bookkeeping/post-install pipeline |
+| `install` | The entire layout/extraction/bookkeeping/post-install pipeline for one mount |
+| `check_mounts` | Once-per-install checks across every mount (Roblox: dependency folders left behind) |
+| `default_mount_path` / `supports_mounts` / `set_default_mount_name` | Where top-level `dependencies` install (Roblox: next to the root file; UEFN: the shared mount), whether extra mounts exist (Roblox only), and renaming the default one (`packagesDir`) |
+| `remove_mount_dir` / `move_mount_dir` / `foreign_mount_entries` | `forest mount`'s folder operations and its check for files no package manager put in a folder |
+| `publish_ignores` | Paths force-excluded from the tarball (Roblox: every mount + the lockfile) |
 | `resolution_roots` | What dependency resolution runs against. Roblox: the invoking manifest. UEFN: the WORKSPACE (project manifest + every authored package's manifest, constraints ANDed) — so installs land at the shared mount and one lockfile (Content/forest-lock.json) governs, no matter where install runs from |
 | `publish_preflight` | Entry-point resolution (Roblox) / name + compat checks (UEFN) |
 | `validate_package_name` | Naming rules for new packages |

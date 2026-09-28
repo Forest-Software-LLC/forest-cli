@@ -5,10 +5,11 @@ Link + rojo-safe-install composition smoke.
 With a live `rojo serve` attached: link a local working tree over a direct
 dep, install (junction applied), force-reinstall (slot cleared as a LINK,
 re-applied), CI-mode install (junction replaced by the registry dir), then
-unlink (registry restored), asserting after every step that rojo survived
-and the linked working tree was never mutated. Companion to rojo-bench.ps1
-(which covers the linkless scenarios); run both when mount mutation or link
-overlay code changes.
+unlink (registry restored), then link the same package inside a second
+mount and remove that whole mount, asserting after every step that rojo
+survived and the linked working tree was never mutated. Companion to
+rojo-bench.ps1 (which covers the linkless scenarios); run both when mount
+mutation or link overlay code changes.
 
 .EXAMPLE
 .\scripts\rojo-link-smoke.ps1        # downloads rojo 7.7.0 if needed
@@ -139,6 +140,30 @@ Assert (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "slot 
 Assert (Test-Path (Join-Path $slot "init.lua")) "registry Knit restored"
 Assert (Test-Path $devSentinel) "dev tree sentinel survives unlink"
 Assert ((Get-Content (Join-Path $Dev "src\init.luau") -Raw) -match "DEV_MARKER") "dev root module untouched"
+
+Write-Host "== link inside a second mount, then remove the mount =="
+& $ForestExe mount create ServerPackages *>> $log
+& $ForestExe install sleitnick/knit --mount ServerPackages *>> $log
+Assert ($LASTEXITCODE -eq 0) "install into ServerPackages exit 0"
+RojoAlive "second mount install"
+& $ForestExe link $Dev *>> $log
+Assert ($LASTEXITCODE -ne 0) "link refuses a package declared in two mounts"
+& $ForestExe link $Dev --mount ServerPackages *>> $log
+Assert ($LASTEXITCODE -eq 0) "link --mount exit 0"
+RojoAlive "mount link apply"
+$serverSlot = Join-Path $Project "ServerPackages\Knit"
+$item = Get-Item $serverSlot -Force
+Assert (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) "ServerPackages Knit is a junction"
+$item = Get-Item $slot -Force
+Assert (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "default Knit stays the registry copy"
+& $ForestExe mount remove ServerPackages -y *>> $log
+Assert ($LASTEXITCODE -eq 0) "mount remove exit 0"
+RojoAlive "mount remove with a live link"
+Assert (-not (Test-Path (Join-Path $Project "ServerPackages"))) "mount folder removed"
+Assert (Test-Path $devSentinel) "dev tree sentinel survives removing the mount"
+Assert ((Get-Content (Join-Path $Dev "src\init.luau") -Raw) -match "DEV_MARKER") "dev root module survives removing the mount"
+$linksFile = Join-Path $Project ".forest\links.json"
+Assert (-not ((Get-Content $linksFile -Raw -ErrorAction SilentlyContinue) -match "ServerPackages")) "mount's links dropped"
 
 Pop-Location
 $rojo.Refresh()

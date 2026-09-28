@@ -1,7 +1,8 @@
 //! Wally-to-Forest conversion: parse a `wally.toml` and translate its
 //! dependencies into forest.json form. Every wally package is mirrored on
 //! the Forest registry under the same `scope/name`, so converted
-//! dependencies resolve as-is.
+//! dependencies resolve as-is. Each wally dependency group has its own
+//! folder, and each becomes a forest mount with the same folder name.
 //!
 //! Wally dependency entries look like `Alias = "scope/name@req"`, where the
 //! requirement uses CARGO semantics: a bare `1.2.3` means caret. Forest
@@ -9,6 +10,11 @@
 //! (same rule as the registry's wally mirror pipeline).
 
 use anyhow::{Context, Result};
+
+/// Wally's folder for [server-dependencies].
+pub const SERVER_PACKAGES: &str = "ServerPackages";
+/// Wally's folder for [dev-dependencies].
+pub const DEV_PACKAGES: &str = "DevPackages";
 
 pub struct WallyDep {
     /// "scope/name"
@@ -21,12 +27,14 @@ pub struct WallyDep {
 }
 
 pub struct WallyImport {
+    /// [dependencies]: the default mount.
     pub dependencies: Vec<WallyDep>,
+    /// [server-dependencies]: the SERVER_PACKAGES mount.
+    pub server_dependencies: Vec<WallyDep>,
+    /// [dev-dependencies]: the DEV_PACKAGES mount.
+    pub dev_dependencies: Vec<WallyDep>,
     /// SPDX id from [package].license, when present.
     pub license: Option<String>,
-    /// [dev-dependencies] entries are not imported (forest manifests don't
-    /// model them yet); counted for the summary line.
-    pub skipped_dev: usize,
     /// Entries that couldn't be understood, described for warning output.
     pub skipped_malformed: Vec<String>,
 }
@@ -44,34 +52,35 @@ fn translate_req(req: &str) -> String {
 fn parse_dep_group(
     table: &toml::Value,
     group: &str,
-    out: &mut WallyImport,
+    out: &mut Vec<WallyDep>,
+    malformed: &mut Vec<String>,
 ) {
     let Some(deps) = table.get(group).and_then(toml::Value::as_table) else { return };
     for (alias, spec) in deps {
         let Some(spec) = spec.as_str() else {
-            out.skipped_malformed.push(format!("{}: non-string entry", alias));
+            malformed.push(format!("{}: non-string entry", alias));
             continue;
         };
         // "scope/name@req"; split at the LAST '@' (scopes/names can't
         // contain '@', but be defensive).
         let Some((full_name, req)) = spec.rsplit_once('@') else {
-            out.skipped_malformed.push(format!("{} = \"{}\": missing @version", alias, spec));
+            malformed.push(format!("{} = \"{}\": missing @version", alias, spec));
             continue;
         };
         let mut parts = full_name.split('/');
         let (Some(scope), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
-            out.skipped_malformed.push(format!("{} = \"{}\": expected scope/name", alias, spec));
+            malformed.push(format!("{} = \"{}\": expected scope/name", alias, spec));
             continue;
         };
         if scope.is_empty() || name.is_empty() {
-            out.skipped_malformed.push(format!("{} = \"{}\": expected scope/name", alias, spec));
+            malformed.push(format!("{} = \"{}\": expected scope/name", alias, spec));
             continue;
         }
 
-        // Forest aliases become folder names; `_`/`.`-prefixed ones are
-        // reserved by install cleanup. Drop such aliases rather than fail.
+        // Forest aliases become folder names, and install never recognizes
+        // `_`/`.`-prefixed ones. Drop such aliases rather than fail.
         let keep_alias = alias != name && !alias.starts_with('_') && !alias.starts_with('.');
-        out.dependencies.push(WallyDep {
+        out.push(WallyDep {
             full_name: full_name.to_string(),
             version: translate_req(req),
             alias: keep_alias.then(|| alias.to_string()),
@@ -83,25 +92,19 @@ pub fn parse_wally_manifest(text: &str) -> Result<WallyImport> {
     let parsed: toml::Value = text.parse().context("Failed to parse wally.toml")?;
     let mut import = WallyImport {
         dependencies: Vec::new(),
+        server_dependencies: Vec::new(),
+        dev_dependencies: Vec::new(),
         license: parsed
             .get("package")
             .and_then(|p| p.get("license"))
             .and_then(toml::Value::as_str)
             .map(str::to_string),
-        skipped_dev: 0,
         skipped_malformed: Vec::new(),
     };
 
-    // Forest has no realm split: shared and server dependencies merge into
-    // one dependency map (the same merge the registry's wally mirror does).
-    parse_dep_group(&parsed, "dependencies", &mut import);
-    parse_dep_group(&parsed, "server-dependencies", &mut import);
-
-    import.skipped_dev = parsed
-        .get("dev-dependencies")
-        .and_then(toml::Value::as_table)
-        .map(|t| t.len())
-        .unwrap_or(0);
+    parse_dep_group(&parsed, "dependencies", &mut import.dependencies, &mut import.skipped_malformed);
+    parse_dep_group(&parsed, "server-dependencies", &mut import.server_dependencies, &mut import.skipped_malformed);
+    parse_dep_group(&parsed, "dev-dependencies", &mut import.dev_dependencies, &mut import.skipped_malformed);
 
     Ok(import)
 }
@@ -133,8 +136,7 @@ TestEZ = "roblox/testez@0.4.1"
     #[test]
     fn parses_and_translates_all_groups() {
         let import = parse_wally_manifest(FIXTURE).unwrap();
-        assert_eq!(import.dependencies.len(), 4, "shared + server merge");
-        assert_eq!(import.skipped_dev, 1);
+        assert_eq!(import.dependencies.len(), 3);
         assert!(import.skipped_malformed.is_empty());
         assert_eq!(import.license.as_deref(), Some("MIT"));
 
@@ -147,8 +149,18 @@ TestEZ = "roblox/testez@0.4.1"
 
         let matter = import.dependencies.iter().find(|d| d.full_name == "matter-ecs/matter").unwrap();
         assert!(matter.alias.is_none(), "alias equal to the name segment is dropped");
+    }
 
-        assert!(import.dependencies.iter().any(|d| d.full_name == "loleris/profileservice"));
+    #[test]
+    fn server_and_dev_groups_stay_apart() {
+        // Each group keeps its own folder, so each becomes its own mount.
+        let import = parse_wally_manifest(FIXTURE).unwrap();
+        assert_eq!(import.server_dependencies.len(), 1);
+        assert_eq!(import.server_dependencies[0].full_name, "loleris/profileservice");
+        assert_eq!(import.dev_dependencies.len(), 1);
+        assert_eq!(import.dev_dependencies[0].full_name, "roblox/testez");
+        assert_eq!(import.dev_dependencies[0].alias.as_deref(), Some("TestEZ"));
+        assert!(!import.dependencies.iter().any(|d| d.full_name == "loleris/profileservice"));
     }
 
     #[test]
@@ -172,7 +184,8 @@ TestEZ = "roblox/testez@0.4.1"
     fn empty_or_missing_groups_are_fine() {
         let import = parse_wally_manifest("[package]\nname = \"a/b\"\n").unwrap();
         assert!(import.dependencies.is_empty());
-        assert_eq!(import.skipped_dev, 0);
+        assert!(import.server_dependencies.is_empty());
+        assert!(import.dev_dependencies.is_empty());
         assert!(import.license.is_none());
     }
 }

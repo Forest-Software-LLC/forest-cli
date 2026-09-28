@@ -31,10 +31,31 @@ forest install x/y --init uefn # no forest.json yet? create one for the platform
 forest remove scope/package    # remove a dependency (alias: forest chop)
 forest publish                 # publish the current package
 forest audit                   # check dependencies for updates and license issues
-forest update                  # update the CLI itself
+forest update                  # move dependencies to the newest versions their ranges allow
+forest upgrade                 # update the CLI itself
 ```
 
-Dependencies land in `packages/` with generated Luau pointer modules, so requiring them from your game code just works. `forest-lock.json` pins every transitive dependency to an exact version and content hash - commit it.
+Dependencies land in `Packages/` with generated Luau pointer modules, so requiring them from your game code just works. Forest owns that folder: installing removes anything it didn't put there, a Wally `_Index` included. `forest-lock.json` pins every transitive dependency to an exact version and content hash - commit it.
+
+## Mounts
+
+A project can keep several dependency folders, each installed on its own, for example server-only or dev-only packages next to the shared ones. On Roblox:
+
+```sh
+forest mount create ServerPackages                  # add a folder (any path inside the project)
+forest install scope/package -m ServerPackages
+forest mount                                        # list mounts
+forest mount rename ServerPackages src/server/Packages
+forest mount remove src/server/Packages
+```
+
+`-m`/`--mount` takes a folder path or any unique end of one (`server/Packages`), on `install`, `remove`, `update`, `audit`, `tree`, `link`, and `unlink`. Without it, `install` adds to the default folder (forest.json's top-level `dependencies`) and bulk commands cover every mount. Mounts never share packages, so the same package can sit in two at different versions. Only the default mount is published; the others exist for your project alone. Map each folder in your Rojo project as usual.
+
+Every mount belongs to forest the same way `Packages/` does.
+
+## Coming from Wally
+
+Run `forest init` next to your `wally.toml` and accept the import. `[dependencies]` become the default mount, and `[server-dependencies]` and `[dev-dependencies]` become the `ServerPackages` and `DevPackages` mounts, the same folders Wally used, so your Rojo project keeps working. `wally.lock` is removed. The next `forest install` fills the folders and clears out Wally's `_Index` and link modules; code that requires `Packages.Promise` keeps working.
 
 Installs are incremental: packages already on disk that match the lockfile are skipped (each installed folder carries a tiny `.forest-receipt`, ignored by Rojo like LICENSE files), and downloaded archives are kept in a local content-addressed cache (`~/.forest/cache`, verified by SHA-256 on every read; set `FOREST_NO_CACHE=1` to disable). Forest writes nothing to your project root beyond `forest.json` and `forest-lock.json`.
 

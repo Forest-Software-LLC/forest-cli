@@ -1,121 +1,27 @@
-//! Shared install orchestration: the lockfile format, dependency
-//! resolution entry point, and the services every platform executor uses
-//! (CDN base, signed-URL fetch, worker-pool sizing). The actual layout /
-//! extraction / bookkeeping work is platform-owned and reached through
-//! `Platform::install` (src/platform.rs); this module contains no
-//! platform-specific logic.
+//! Install orchestration. A run decides per mount whether its section of
+//! forest-lock.json can be installed as is or must be resolved again,
+//! resolves, reports what the solver saw, installs every mount in the run
+//! through the platform, and writes forest-lock.json (its only writer).
+//! Also the download services every platform executor shares (CDN base,
+//! signed-URL fetch). Layout, extraction, and bookkeeping are
+//! platform-owned (`Platform::install`); nothing here is platform-specific.
 
-use std::collections::{HashMap, HashSet};
-use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{Map, Value};
 use urlencoding::encode;
 
 use reqwest::Method;
 use crate::http::packages_api_request;
-use crate::platform::Platform;
-use crate::utils::{digest_package_name, get_ci, normalize_forest_deps, normalize_forest_excludes, normalize_forest_overrides};
-use crate::lockfile_solver::{get_lockfile_packages, locked_private, DepSpec, LockfileEntry};
+use crate::license_helper::LicenseInfo;
+use crate::lockfile::{LockFile, LockSection, LockState};
+use crate::lockfile_solver::{get_lockfile_packages, locked_private, DepSpec, SolveReport};
 use crate::message::{Message, MessageType};
-
-
-/// The overall lockfile structure.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LockFile {
-    pub file_version: u32,
-    /// The manifest overrides this resolution was solved under, so adding,
-    /// changing, or removing an override invalidates the lockfile. Absent
-    /// from disk when empty; pre-override lockfiles parse unchanged.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub overrides: HashMap<String, String>,
-    /// Same recording for the manifest's excludes (banned version ranges).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub excludes: HashMap<String, String>,
-    pub packages: HashMap<String, Vec<LockfileEntry>>,
-}
-
-impl LockFile {
-    /// Serialize with sorted keys. Serializing the HashMaps directly
-    /// streams them in random order; going through serde_json::Value first
-    /// sorts every object, so the same resolution writes identical bytes.
-    pub fn to_json_pretty(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string_pretty(&serde_json::to_value(self)?)?)
-    }
-
-    /// Read forest-lock.json from the current directory. None when missing,
-    /// unparseable, or not the current format. Callers that need to say WHY
-    /// it was rejected (install's messaging) keep their own read path.
-    pub fn load() -> Option<LockFile> {
-        let content: Value =
-            serde_json::from_str(&std::fs::read_to_string("forest-lock.json").ok()?).ok()?;
-        if content.get("file_version").and_then(Value::as_u64) != Some(2) {
-            return None;
-        }
-        serde_json::from_value(content).ok()
-    }
-
-    /// A root dependency's entry: the one pinned at the tree root
-    /// (location "~"). Key lookup is case-insensitive like every other
-    /// package-name map.
-    pub fn root_entry(&self, name: &str) -> Option<&LockfileEntry> {
-        get_ci(&self.packages, name)?.iter().find(|e| e.location == "~")
-    }
-
-    /// The version a root dependency is pinned to.
-    pub fn pinned_version(&self, name: &str) -> Option<&str> {
-        self.root_entry(name).map(|e| e.version.as_str())
-    }
-}
-
-/// Whether the lockfile still satisfies the manifest's declared dependencies.
-/// Root deps pin their resolved version at the tree root (`location == "~"`),
-/// so each declared range is checked against that pin, and a pin whose package
-/// is no longer declared means the dep was removed by hand. Any mismatch (or
-/// an unparseable range/version) sends install back through resolution, which
-/// reports invalid ranges properly.
-pub fn lockfile_satisfies_manifest(
-    lockfile: &LockFile,
-    roots: &HashMap<String, DepSpec>,
-    overrides: &HashMap<String, String>,
-    excludes: &HashMap<String, String>,
-) -> bool {
-    // The lockfile records the overrides/excludes it was solved under; any
-    // drift (added, changed, or removed entry) forces re-resolution. Ranges
-    // are compared verbatim; rewriting "^2.0" to "^2.0.0" is a re-solve,
-    // which lands on the same versions anyway.
-    let maps_match = |locked: &HashMap<String, String>, declared: &HashMap<String, String>| {
-        locked.len() == declared.len()
-            && declared.iter().all(|(name, range)| {
-                get_ci(locked, name).map_or(false, |l| l.trim() == range.trim())
-            })
-    };
-    if !maps_match(&lockfile.overrides, overrides) || !maps_match(&lockfile.excludes, excludes) {
-        return false;
-    }
-
-    for (name, spec) in roots {
-        let Ok(req) = semver::VersionReq::parse(&spec.version) else {
-            return false;
-        };
-        let Some(root_entry) = lockfile.root_entry(name) else {
-            return false;
-        };
-        let Ok(version) = semver::Version::parse(&root_entry.version) else {
-            return false;
-        };
-        if !req.matches(&version) {
-            return false;
-        }
-    }
-
-    for (name, entries) in &lockfile.packages {
-        if entries.iter().any(|e| e.location == "~") && get_ci(roots, name).is_none() {
-            return false;
-        }
-    }
-
-    true
-}
+use crate::mounts::Mount;
+use crate::platform::Platform;
+use crate::utils::{digest_package_name, normalize_forest_excludes, normalize_forest_overrides};
 
 /// Tarballs are content-addressed on the CDN (`/{public|private}/{sha256}.tgz`),
 /// so public download URLs are derived from the lockfile's integrity hash rather
@@ -185,123 +91,220 @@ pub struct InstallSummary {
     pub kept: usize,
 }
 
-/// Materialize a lockfile on disk. Thin dispatcher: each platform owns its
-/// entire layout/extraction/bookkeeping pipeline. Takes the whole manifest
-/// (not just the platform string) because layout can depend on other
-/// manifest fields; Roblox mounts Packages/ inside the `root` dir.
-pub async fn make_directories(lockfile: &LockFile, root_deps: HashMap<String, DepSpec>, manifest: &Value, force: bool) -> Result<InstallSummary> {
-    Platform::from_manifest(manifest)?.install(lockfile, root_deps, manifest, force).await
+/// Which mounts a run resolves from the registry even though their section
+/// of forest-lock.json still satisfies forest.json. Stale sections always
+/// resolve.
+#[derive(Debug, Clone)]
+pub enum Refresh {
+    /// Nothing beyond the stale sections (install).
+    Stale,
+    /// Every mount in the run (update).
+    All,
+    /// These mounts, by path (a command just edited their dependencies).
+    Mounts(Vec<String>),
 }
 
-/// Generate a lockfile JSON string given the forest manifest & message spinner.
-pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -> Result<LockFile> {
-    let roots = normalize_forest_deps(forest_json);
-    let platform: String = forest_json
-        .get("platform")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing platform in forest.json"))?
-        .to_string(); // clone the value so we don't hold a borrow
+impl Refresh {
+    fn covers(&self, mount: &Mount) -> bool {
+        match self {
+            Refresh::Stale => false,
+            Refresh::All => true,
+            Refresh::Mounts(paths) => paths.iter().any(|p| p.eq_ignore_ascii_case(&mount.path)),
+        }
+    }
+}
 
-    // Platforms may widen the roots beyond the invoking manifest (UEFN
-    // resolves the whole workspace: project manifest + authored packages).
-    let roots = Platform::parse(&platform)?.resolution_roots(roots)?;
-    let overrides = normalize_forest_overrides(forest_json);
-    let excludes = normalize_forest_excludes(forest_json);
+pub struct SyncOptions {
+    /// Limit the run to one mount, by path. None runs every mount.
+    pub only: Option<String>,
+    pub refresh: Refresh,
+    /// Reinstall everything, trusting no receipts and no metadata cache.
+    pub force: bool,
+    /// Fail instead of resolving anything or rewriting forest-lock.json.
+    pub frozen: bool,
+    /// Say why forest-lock.json is being regenerated (bulk install).
+    pub announce: bool,
+}
 
-    // Fallback pins for private packages the registry refuses.
-    let locked = LockFile::load()
-        .map(|lf| locked_private(&lf.packages))
+impl SyncOptions {
+    pub fn new(only: Option<String>, refresh: Refresh) -> SyncOptions {
+        SyncOptions { only, refresh, force: false, frozen: false, announce: false }
+    }
+}
+
+pub struct SyncOutcome {
+    pub lockfile: LockFile,
+    /// Some mount was resolved rather than installed straight from
+    /// forest-lock.json.
+    pub resolved: bool,
+    pub installed: usize,
+}
+
+/// One mount's part in a run.
+struct Target<'a> {
+    mount: &'a Mount,
+    /// What the mount resolves against: its dependencies, re-keyed after
+    /// claimed-scope renames.
+    roots: HashMap<String, DepSpec>,
+    section: Option<LockSection>,
+    resolved: bool,
+}
+
+/// Bring forest-lock.json and the installed mounts in line with forest.json.
+pub async fn sync(manifest: &Value, msg: &mut Message, opts: &SyncOptions) -> Result<SyncOutcome> {
+    let result = sync_mounts(manifest, msg, opts).await;
+    if result.is_err() {
+        // Clear the spinner so the error prints on a clean line.
+        msg.pause();
+    }
+    result
+}
+
+/// `sync` after a command wrote its manifest edit. On failure forest.json
+/// goes back to `manifest_before`. The edit has to be on disk first because
+/// claimed-scope renames rewrite the file.
+pub async fn sync_or_restore(
+    manifest: &Value,
+    manifest_before: &str,
+    msg: &mut Message,
+    opts: &SyncOptions,
+) -> Result<SyncOutcome> {
+    // Absolute: a UEFN install moves the working directory to Content/.
+    let manifest_path: PathBuf = std::env::current_dir()?.join("forest.json");
+    match sync(manifest, msg, opts).await {
+        Ok(outcome) => Ok(outcome),
+        Err(e) => {
+            std::fs::write(&manifest_path, manifest_before).context("Failed to restore forest.json")?;
+            Err(e.context("Couldn't apply the change, so forest.json was left as it was"))
+        }
+    }
+}
+
+async fn sync_mounts(manifest: &Value, msg: &mut Message, opts: &SyncOptions) -> Result<SyncOutcome> {
+    let platform = Platform::from_manifest(manifest)?;
+    let mounts = crate::mounts::project_mounts(manifest, platform)?;
+    let overrides = normalize_forest_overrides(manifest);
+    let excludes = normalize_forest_excludes(manifest);
+    let in_run = |mount: &Mount| opts.only.as_ref().map_or(true, |p| p.eq_ignore_ascii_case(&mount.path));
+
+    let existing = match LockFile::read()? {
+        LockState::Current(lockfile) => Some(lockfile),
+        LockState::Missing => {
+            if opts.announce {
+                msg.emit(MessageType::Warn, "No lockfile found. Commit forest-lock.json to avoid inconsistencies.");
+            }
+            None
+        }
+        LockState::Outdated => {
+            if opts.announce {
+                msg.emit(MessageType::Warn, "Lockfile format is out of date; regenerating forest-lock.json.");
+            }
+            None
+        }
+    };
+
+    // A section is only trusted while it still satisfies the mount's
+    // declared ranges: a hand-edited range (^1.5.0 -> ^2.0.0) or a removed
+    // dependency resolves again instead of silently keeping the old pin.
+    let mut targets: Vec<Target> = Vec::new();
+    let mut stale: Vec<&str> = Vec::new();
+    for mount in mounts.iter().filter(|m| in_run(m)) {
+        let roots = platform.resolution_roots(mount.deps.clone())?;
+        let section = existing.as_ref().and_then(|lf| lf.section(mount));
+        let satisfied = section.map_or(false, |s| s.satisfies(&roots, &overrides, &excludes));
+        if existing.is_some() && !satisfied {
+            stale.push(&mount.path);
+        }
+        let section = section.filter(|_| satisfied && !opts.refresh.covers(mount)).cloned();
+        targets.push(Target { mount, roots, section, resolved: false });
+    }
+
+    // Sections for mounts forest.json no longer declares. A full run drops
+    // them (the lockfile is the only record of where the folder was, so say
+    // so); a run limited to one mount leaves them alone.
+    let orphaned: Vec<String> = existing
+        .as_ref()
+        .map(|lf| {
+            lf.mounts
+                .keys()
+                .filter(|key| !mounts.iter().any(|m| !m.is_default() && m.path.eq_ignore_ascii_case(key)))
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default();
+    let drop_orphans = opts.only.is_none() && !orphaned.is_empty();
 
-    msg.update("Resolving dependencies...");
-    // --force also bypasses the metadata disk cache, like receipts at install.
-    let (lockfile_packages, license_warnings, root_renames, solve_report) = get_lockfile_packages(roots.clone(), &overrides, &excludes, &locked, platform.clone(), msg, !force).await
-        .context("Failed to resolve lockfile packages")?;
-
-    for pinned in &solve_report.locked_private {
-        msg.emit(
-            MessageType::Warn,
-            &format!(
-                "No access to private package {}; kept the version pinned in forest-lock.json. You need to be authorized by the package maintainer to update it.",
-                pinned
-            ),
-        );
+    if opts.frozen && (targets.iter().any(|t| t.section.is_none()) || drop_orphans) {
+        bail!("--frozen: forest-lock.json is missing or out of date with forest.json. Run `forest install` locally and commit the lockfile.");
     }
-
-    if solve_report.override_edges > 0 {
-        msg.emit(
-            MessageType::Info,
-            &format!(
-                "Declared overrides modified {} edge{}. Run `forest tree` to view.",
-                solve_report.override_edges,
-                if solve_report.override_edges == 1 { "" } else { "s" }
-            ),
-        );
+    if opts.announce && !stale.is_empty() {
+        let note = if mounts.len() == 1 {
+            "forest.json dependencies changed; updating forest-lock.json.".to_string()
+        } else {
+            format!("forest.json dependencies changed ({}); updating forest-lock.json.", stale.join(", "))
+        };
+        msg.emit(MessageType::Info, &note);
     }
-    for key in &solve_report.override_unused {
-        msg.emit(
-            MessageType::Warn,
-            &format!("Override for {} matched no dependency in the tree; remove it with `forest override {} --remove`.", key, key),
-        );
-    }
-    for key in &solve_report.override_unnecessary {
-        msg.emit(
-            MessageType::Info,
-            &format!("Override for {} is no longer needed; dependencies already resolve inside it. Remove it with `forest override {} --remove`.", key, key),
-        );
-    }
-    for key in &solve_report.exclude_unused {
-        msg.emit(
-            MessageType::Warn,
-            &format!("Exclusion for {} matched no dependency in the tree; remove it with `forest exclude {} --remove`.", key, key),
-        );
-    }
-    for key in &solve_report.exclude_inert {
-        msg.emit(
-            MessageType::Info,
-            &format!("Exclusion for {} no longer affects resolution; every range now picks an allowed version. Safe to remove with `forest exclude {} --remove`.", key, key),
-        );
-    }
-
-    // A claimed/renamed scope resolves under its old name but the lockfile is keyed by the canonical one. re-key the roots to match
-    let mut roots = roots;
-    if !root_renames.is_empty() {
-        let applied = rewrite_manifest_renames(&root_renames)?;
-        for a in &applied {
-            msg.emit(MessageType::Info, &a.notice);
+    if drop_orphans {
+        for path in &orphaned {
+            msg.emit(
+                MessageType::Warn,
+                &format!(
+                    "Mount {} is no longer declared in forest.json, so forest stopped managing {}/. Delete the folder if you don't need it.",
+                    path, path
+                ),
+            );
         }
-        let applied_by_key: HashMap<&str, &AppliedRename> =
-            applied.iter().map(|a| (a.rename_key.as_str(), a)).collect();
+    }
 
-        for (old_key, canonical) in &root_renames {
-            if roots.keys().any(|k| k != old_key && k.eq_ignore_ascii_case(canonical)) {
-                msg.emit(
-                    MessageType::Warn,
-                    &format!(
-                        "{} and {} are the same package; remove {} from forest.json.",
-                        old_key, canonical, old_key
-                    ),
-                );
-                continue;
+    // Resolve every target without a trusted section.
+    let multi = mounts.len() > 1;
+    let mut reports: Vec<SolveReport> = Vec::new();
+    let mut license_warnings: Vec<LicenseInfo> = Vec::new();
+    for target in targets.iter_mut().filter(|t| t.section.is_none()) {
+        // Fallback pins for private packages the registry refuses.
+        let locked = existing
+            .as_ref()
+            .and_then(|lf| lf.section(target.mount))
+            .map(|s| locked_private(&s.packages))
+            .unwrap_or_default();
+        msg.update(&if multi {
+            format!("Resolving {}...", target.mount.path)
+        } else {
+            "Resolving dependencies...".to_string()
+        });
+        // --force also bypasses the metadata disk cache, like receipts at install.
+        let (packages, warnings, renames, report) = get_lockfile_packages(
+            target.roots.clone(),
+            &overrides,
+            &excludes,
+            &locked,
+            platform.as_str().to_string(),
+            msg,
+            !opts.force,
+        )
+        .await
+        .with_context(|| {
+            if multi {
+                format!("Failed to resolve mount {}", target.mount.path)
+            } else {
+                "Failed to resolve lockfile packages".to_string()
             }
-            if let Some(mut spec) = roots.remove(old_key) {
-                // Follow the manifest rewrite's explicit-alias decision; for
-                // keys the local manifest doesn't hold (UEFN workspace roots)
-                // a default-looking alias is treated as defaulted.
-                let defaulted = applied_by_key
-                    .get(old_key.as_str())
-                    .map(|a| a.defaulted)
-                    .unwrap_or_else(|| spec.alias == digest_package_name(old_key).name);
-                if defaulted {
-                    spec.alias = digest_package_name(canonical).name;
-                }
-                roots.insert(canonical.clone(), spec);
-            }
+        })?;
+        if !renames.is_empty() {
+            apply_renames(target.mount, &mut target.roots, &renames, msg)?;
         }
+        license_warnings.extend(warnings);
+        reports.push(report);
+        target.section = Some(LockSection { overrides: overrides.clone(), excludes: excludes.clone(), packages });
+        target.resolved = true;
+    }
+    if !reports.is_empty() {
+        report_solve(&merge_reports(reports), msg);
     }
 
     // Surface registry license-safety ratings for anything caution/unsafe in
-    // the resolved tree (direct and transitive) before files land on disk.
+    // the resolved trees (direct and transitive) before files land on disk.
     // One consolidated line; per-package details live in `forest audit`.
     if !license_warnings.is_empty() {
         let flagged: HashSet<&str> = license_warnings
@@ -319,40 +322,207 @@ pub async fn lockfile_gen(forest_json: &Value, msg: &mut Message, force: bool) -
         );
     }
 
-    let lockfile : LockFile = LockFile {
-        file_version: 2,
-        overrides,
-        excludes,
-        packages: lockfile_packages
+    // The new lockfile: this run's sections, plus every other mount's
+    // carried over untouched.
+    let mut default_section: Option<LockSection> = None;
+    let mut mount_sections: BTreeMap<String, LockSection> = BTreeMap::new();
+    let mut place = |mount: &Mount, section: LockSection| {
+        if mount.is_default() {
+            default_section = Some(section);
+        } else {
+            mount_sections.insert(mount.path.clone(), section);
+        }
     };
-
-    // make_directories draws its own download bars; hide the spinner while
-    // they own the terminal, or the two draw systems leave stuck lines.
-    msg.pause();
-    make_directories(&lockfile, roots, forest_json, force).await
-        .context("Failed to create directories for lockfile packages")?;
-    msg.resume();
-
-    Ok(lockfile)
-}
-
-/// `lockfile_gen` after a command wrote its manifest edit. On failure
-/// forest.json goes back to `manifest_before`. The edit has to be on disk
-/// first because claimed-scope renames rewrite the file.
-pub async fn lockfile_gen_or_restore(
-    forest_json: &Value,
-    manifest_before: &str,
-    msg: &mut Message,
-    force: bool,
-) -> Result<LockFile> {
-    match lockfile_gen(forest_json, msg, force).await {
-        Ok(lockfile) => Ok(lockfile),
-        Err(e) => {
-            msg.pause();
-            std::fs::write("forest.json", manifest_before).context("Failed to restore forest.json")?;
-            Err(e.context("Couldn't apply the change, so forest.json was left as it was"))
+    for target in &targets {
+        place(target.mount, target.section.clone().expect("every target was kept or resolved"));
+    }
+    if let Some(lf) = &existing {
+        for mount in mounts.iter().filter(|m| !in_run(m)) {
+            if let Some(section) = lf.section(mount) {
+                place(mount, section.clone());
+            }
+        }
+        if !drop_orphans {
+            for path in &orphaned {
+                mount_sections.insert(path.clone(), lf.mounts[path].clone());
+            }
         }
     }
+    let lockfile = LockFile::new(default_section.unwrap_or_default(), mount_sections);
+
+    // Platform installs draw their own download bars; hide the spinner
+    // while they own the terminal, or the two draw systems leave stuck
+    // lines.
+    msg.pause();
+    platform.check_mounts(&mounts, &orphaned);
+    let mut installed = 0;
+    for target in &targets {
+        let section = target.section.as_ref().expect("every target was kept or resolved");
+        let summary = platform
+            .install(section, target.roots.clone(), target.mount, opts.force)
+            .await
+            .with_context(|| {
+                if multi {
+                    format!("Failed to install mount {}", target.mount.path)
+                } else {
+                    "Failed to create directories for lockfile packages".to_string()
+                }
+            })?;
+        installed += summary.installed;
+    }
+    msg.resume();
+
+    let resolved = targets.iter().any(|t| t.resolved);
+    if !opts.frozen && (resolved || drop_orphans) {
+        lockfile.save()?;
+    }
+    Ok(SyncOutcome { lockfile, resolved, installed })
+}
+
+/// Follow `forest mount rename`/`remove` in forest-lock.json without
+/// resolving anything: an extra mount's section moves to `new_path`, or
+/// goes with the mount.
+pub fn move_mount_section(old_path: &str, new_path: Option<&str>) -> Result<()> {
+    let Some(mut lockfile) = LockFile::load() else {
+        return Ok(());
+    };
+    let Some(key) = lockfile.mounts.keys().find(|k| k.eq_ignore_ascii_case(old_path)).cloned() else {
+        return Ok(());
+    };
+    let section = lockfile.mounts.remove(&key).expect("key came from the map");
+    if let Some(new_path) = new_path {
+        lockfile.mounts.insert(new_path.to_string(), section);
+    }
+    lockfile.save()
+}
+
+/// The solver's notes on overrides, excludes, and private pins, once per
+/// run however many mounts resolved.
+fn report_solve(report: &SolveReport, msg: &mut Message) {
+    for pinned in &report.locked_private {
+        msg.emit(
+            MessageType::Warn,
+            &format!(
+                "No access to private package {}; kept the version pinned in forest-lock.json. You need to be authorized by the package maintainer to update it.",
+                pinned
+            ),
+        );
+    }
+    if report.override_edges > 0 {
+        msg.emit(
+            MessageType::Info,
+            &format!(
+                "Declared overrides modified {} edge{}. Run `forest tree` to view.",
+                report.override_edges,
+                if report.override_edges == 1 { "" } else { "s" }
+            ),
+        );
+    }
+    for key in &report.override_unused {
+        msg.emit(
+            MessageType::Warn,
+            &format!("Override for {} matched no dependency in the tree; remove it with `forest override {} --remove`.", key, key),
+        );
+    }
+    for key in &report.override_unnecessary {
+        msg.emit(
+            MessageType::Info,
+            &format!("Override for {} is no longer needed; dependencies already resolve inside it. Remove it with `forest override {} --remove`.", key, key),
+        );
+    }
+    for key in &report.exclude_unused {
+        msg.emit(
+            MessageType::Warn,
+            &format!("Exclusion for {} matched no dependency in the tree; remove it with `forest exclude {} --remove`.", key, key),
+        );
+    }
+    for key in &report.exclude_inert {
+        msg.emit(
+            MessageType::Info,
+            &format!("Exclusion for {} no longer affects resolution; every range now picks an allowed version. Safe to remove with `forest exclude {} --remove`.", key, key),
+        );
+    }
+}
+
+/// One report for a run that resolved several mounts with the same
+/// overrides and excludes. One is unused only when no mount's graph reached
+/// it, and unnecessary (or inert) only when every mount that reached it
+/// agrees.
+fn merge_reports(reports: Vec<SolveReport>) -> SolveReport {
+    let in_every = |pick: fn(&SolveReport) -> &Vec<String>| -> Vec<String> {
+        let mut keys: Vec<String> = reports
+            .first()
+            .map(|first| pick(first).iter().filter(|k| reports.iter().all(|r| pick(r).contains(k))).cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    };
+    let settled = |pick: fn(&SolveReport) -> &Vec<String>, unused: fn(&SolveReport) -> &Vec<String>| -> Vec<String> {
+        let mut keys: Vec<String> = reports
+            .iter()
+            .flat_map(|r| pick(r).iter())
+            .filter(|k| reports.iter().all(|r| pick(r).contains(k) || unused(r).contains(k)))
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    };
+    let mut locked_private: Vec<String> = reports.iter().flat_map(|r| r.locked_private.iter().cloned()).collect();
+    locked_private.sort();
+    locked_private.dedup();
+    SolveReport {
+        override_edges: reports.iter().map(|r| r.override_edges).sum(),
+        override_unused: in_every(|r| &r.override_unused),
+        override_unnecessary: settled(|r| &r.override_unnecessary, |r| &r.override_unused),
+        exclude_unused: in_every(|r| &r.exclude_unused),
+        exclude_inert: settled(|r| &r.exclude_inert, |r| &r.exclude_unused),
+        locked_private,
+    }
+}
+
+/// A claimed/renamed scope resolves under its old name but the lockfile is
+/// keyed by the canonical one: rewrite the mount's manifest keys and re-key
+/// its roots to match.
+fn apply_renames(
+    mount: &Mount,
+    roots: &mut HashMap<String, DepSpec>,
+    renames: &HashMap<String, String>,
+    msg: &mut Message,
+) -> Result<()> {
+    let applied = rewrite_manifest_renames(mount, renames)?;
+    for a in &applied {
+        msg.emit(MessageType::Info, &a.notice);
+    }
+    let applied_by_key: HashMap<&str, &AppliedRename> =
+        applied.iter().map(|a| (a.rename_key.as_str(), a)).collect();
+
+    for (old_key, canonical) in renames {
+        if roots.keys().any(|k| k != old_key && k.eq_ignore_ascii_case(canonical)) {
+            msg.emit(
+                MessageType::Warn,
+                &format!(
+                    "{} and {} are the same package; remove {} from forest.json.",
+                    old_key, canonical, old_key
+                ),
+            );
+            continue;
+        }
+        if let Some(mut spec) = roots.remove(old_key) {
+            // Follow the manifest rewrite's explicit-alias decision; for
+            // keys the local manifest doesn't hold (UEFN workspace roots)
+            // a default-looking alias is treated as defaulted.
+            let defaulted = applied_by_key
+                .get(old_key.as_str())
+                .map(|a| a.defaulted)
+                .unwrap_or_else(|| spec.alias == digest_package_name(old_key).name);
+            if defaulted {
+                spec.alias = digest_package_name(canonical).name;
+            }
+            roots.insert(canonical.clone(), spec);
+        }
+    }
+    Ok(())
 }
 
 /// One claimed-scope rename actually applied to the local manifest.
@@ -365,26 +535,29 @@ pub(crate) struct AppliedRename {
     pub notice: String,
 }
 
-/// Persist claimed-scope renames into the manifest in the current directory
-/// (every command chdirs to the manifest dir before resolving). Reads the
-/// file fresh so only the dependency keys change. Keys the local manifest
-/// doesn't declare are skipped without error; under UEFN the resolution
-/// roots span other workspace manifests.
-fn rewrite_manifest_renames(renames: &HashMap<String, String>) -> Result<Vec<AppliedRename>> {
+/// Persist claimed-scope renames into a mount's dependencies in the
+/// manifest in the current directory (every command chdirs to the manifest
+/// dir before resolving). Reads the file fresh so only the dependency keys
+/// change. Keys the local manifest doesn't declare are skipped without
+/// error; under UEFN the resolution roots span other workspace manifests.
+fn rewrite_manifest_renames(mount: &Mount, renames: &HashMap<String, String>) -> Result<Vec<AppliedRename>> {
     let path = "forest.json";
     if !std::path::Path::new(path).exists() {
         return Ok(Vec::new());
     }
     let mut manifest: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-    let applied = canonicalize_manifest_deps(&mut manifest, renames);
+    let Ok(deps) = crate::mounts::deps_map_mut(&mut manifest, mount) else {
+        return Ok(Vec::new());
+    };
+    let applied = canonicalize_deps(deps, renames);
     if !applied.is_empty() {
         std::fs::write(path, serde_json::to_string_pretty(&manifest)?)?;
     }
     Ok(applied)
 }
 
-/// Re-key manifest dependencies whose registry identity is a different
-/// package name (claimed/renamed scope). Pure JSON transform.
+/// Re-key dependencies whose registry identity is a different package name
+/// (claimed/renamed scope). Pure JSON transform.
 ///
 /// A dependency without an explicit alias deliberately follows the canonical
 /// name after the rename: wally-era code requires the wally ALIAS (the
@@ -392,14 +565,11 @@ fn rewrite_manifest_renames(renames: &HashMap<String, String>) -> Result<Vec<App
 /// native package carries; the old mirrored key's lowercase name was never
 /// what that code referenced. An explicitly declared alias always survives
 /// untouched.
-pub(crate) fn canonicalize_manifest_deps(
-    manifest: &mut Value,
+pub(crate) fn canonicalize_deps(
+    deps: &mut Map<String, Value>,
     renames: &HashMap<String, String>,
 ) -> Vec<AppliedRename> {
     let mut applied = Vec::new();
-    let Some(deps) = manifest.get_mut("dependencies").and_then(Value::as_object_mut) else {
-        return applied;
-    };
 
     for (old_key, canonical) in renames {
         // The manifest's own casing of the key wins over the caller's.
@@ -440,160 +610,12 @@ mod tests {
         pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
     }
 
-    /// (package, version, location) triples -> a minimal lockfile.
-    fn lockfile(entries: &[(&str, &str, &str)]) -> LockFile {
-        let mut packages: HashMap<String, Vec<LockfileEntry>> = HashMap::new();
-        for (pkg, version, location) in entries {
-            packages.entry(pkg.to_string()).or_default().push(LockfileEntry {
-                version: version.to_string(),
-                integrity: String::new(),
-                public: true,
-                root: String::new(),
-                location: location.to_string(),
-                packages_dir: "Packages".to_string(),
-                dependencies: HashMap::new(),
-            });
-        }
-        LockFile { file_version: 2, overrides: HashMap::new(), excludes: HashMap::new(), packages }
+    fn canonicalize(manifest: &mut Value, renames: &HashMap<String, String>) -> Vec<AppliedRename> {
+        canonicalize_deps(manifest["dependencies"].as_object_mut().unwrap(), renames)
     }
 
-    fn overrides(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-    }
-
-    fn roots(pairs: &[(&str, &str)]) -> HashMap<String, DepSpec> {
-        pairs.iter()
-            .map(|(name, range)| {
-                let alias = name.split('/').last().unwrap().to_string();
-                (name.to_string(), DepSpec { alias, version: range.to_string() })
-            })
-            .collect()
-    }
-
-    #[test]
-    fn satisfied_lockfile_is_trusted() {
-        let lf = lockfile(&[("a/b", "1.5.2", "~"), ("c/d", "0.3.0", "b")]);
-        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")]), &overrides(&[]), &overrides(&[])));
-    }
-
-    #[test]
-    fn bumped_range_invalidates_the_lockfile() {
-        // The reported bug: ^1.5.0 was installed, the manifest now says
-        // ^2.0.0, and install kept saying "already up to date".
-        let lf = lockfile(&[("a/b", "1.5.2", "~")]);
-        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^2.0.0")]), &overrides(&[]), &overrides(&[])));
-    }
-
-    #[test]
-    fn newly_declared_dep_invalidates_the_lockfile() {
-        let lf = lockfile(&[("a/b", "1.5.2", "~")]);
-        assert!(!lockfile_satisfies_manifest(
-            &lf,
-            &roots(&[("a/b", "^1.5.0"), ("c/d", "^0.3.0")]),
-            &overrides(&[]),
-            &overrides(&[]),
-        ));
-    }
-
-    #[test]
-    fn removed_dep_with_lingering_root_pin_invalidates_the_lockfile() {
-        let lf = lockfile(&[("a/b", "1.5.2", "~"), ("c/d", "0.3.0", "~")]);
-        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")]), &overrides(&[]), &overrides(&[])));
-    }
-
-    #[test]
-    fn undeclared_transitive_entries_are_fine() {
-        // c/d lives inside a/b's subtree, not at the root - it's a/b's
-        // dependency, not a removed manifest entry.
-        let lf = lockfile(&[("a/b", "1.5.2", "~"), ("c/d", "0.3.0", "b")]);
-        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "^1.5.0")]), &overrides(&[]), &overrides(&[])));
-    }
-
-    #[test]
-    fn key_casing_differences_still_match() {
-        let lf = lockfile(&[("Scope/Pkg", "1.5.2", "~")]);
-        assert!(lockfile_satisfies_manifest(&lf, &roots(&[("scope/pkg", "^1.5.0")]), &overrides(&[]), &overrides(&[])));
-    }
-
-    #[test]
-    fn unparseable_range_forces_reresolution() {
-        // The solver owns range errors; the check just refuses the fast path.
-        let lf = lockfile(&[("a/b", "1.5.2", "~")]);
-        assert!(!lockfile_satisfies_manifest(&lf, &roots(&[("a/b", "not-a-range")]), &overrides(&[]), &overrides(&[])));
-    }
-
-    #[test]
-    fn added_override_invalidates_the_lockfile() {
-        let lf = lockfile(&[("a/b", "1.5.2", "~")]);
-        assert!(!lockfile_satisfies_manifest(
-            &lf,
-            &roots(&[("a/b", "^1.5.0")]),
-            &overrides(&[("c/d", "^2.0.0")]),
-            &overrides(&[]),
-        ));
-    }
-
-    #[test]
-    fn matching_override_keeps_the_lockfile_trusted() {
-        let mut lf = lockfile(&[("a/b", "1.5.2", "~")]);
-        lf.overrides = overrides(&[("c/d", "^2.0.0")]);
-        assert!(lockfile_satisfies_manifest(
-            &lf,
-            &roots(&[("a/b", "^1.5.0")]),
-            &overrides(&[("c/d", "^2.0.0")]),
-            &overrides(&[]),
-        ));
-        // Case-insensitive keys, like every other package-name map.
-        assert!(lockfile_satisfies_manifest(
-            &lf,
-            &roots(&[("a/b", "^1.5.0")]),
-            &overrides(&[("C/D", "^2.0.0")]),
-            &overrides(&[]),
-        ));
-    }
-
-    #[test]
-    fn changed_or_removed_override_invalidates_the_lockfile() {
-        let mut lf = lockfile(&[("a/b", "1.5.2", "~")]);
-        lf.overrides = overrides(&[("c/d", "^2.0.0")]);
-        assert!(!lockfile_satisfies_manifest(
-            &lf,
-            &roots(&[("a/b", "^1.5.0")]),
-            &overrides(&[("c/d", "^3.0.0")]),
-            &overrides(&[]),
-        ));
-        assert!(!lockfile_satisfies_manifest(
-            &lf,
-            &roots(&[("a/b", "^1.5.0")]),
-            &overrides(&[]),
-            &overrides(&[]),
-        ));
-    }
-
-    #[test]
-    fn exclude_drift_invalidates_the_lockfile() {
-        let mut lf = lockfile(&[("a/b", "1.5.2", "~")]);
-        lf.excludes = overrides(&[("c/d", "=1.6.0")]);
-        // Matching excludes keep the fast path.
-        assert!(lockfile_satisfies_manifest(
-            &lf,
-            &roots(&[("a/b", "^1.5.0")]),
-            &overrides(&[]),
-            &overrides(&[("C/D", "=1.6.0")]),
-        ));
-        // Changed or removed excludes re-resolve.
-        assert!(!lockfile_satisfies_manifest(
-            &lf,
-            &roots(&[("a/b", "^1.5.0")]),
-            &overrides(&[]),
-            &overrides(&[("c/d", "=1.6.1")]),
-        ));
-        assert!(!lockfile_satisfies_manifest(
-            &lf,
-            &roots(&[("a/b", "^1.5.0")]),
-            &overrides(&[]),
-            &overrides(&[]),
-        ));
+    fn keys(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
@@ -606,7 +628,7 @@ mod tests {
         let mut manifest = json!({
             "dependencies": { "michaeldougal/animnation": "^1.11.0" }
         });
-        let applied = canonicalize_manifest_deps(
+        let applied = canonicalize(
             &mut manifest,
             &renames(&[("michaeldougal/animnation", "chiefwildin/AnimNation")]),
         );
@@ -626,7 +648,7 @@ mod tests {
                 "oldscope/animnation": { "version": "^1.0.0", "alias": "Anim" }
             }
         });
-        let applied = canonicalize_manifest_deps(
+        let applied = canonicalize(
             &mut manifest,
             &renames(&[("oldscope/animnation", "newscope/AnimNation")]),
         );
@@ -646,7 +668,7 @@ mod tests {
                 "chiefwildin/AnimNation": "^1.14.0"
             }
         });
-        let applied = canonicalize_manifest_deps(
+        let applied = canonicalize(
             &mut manifest,
             &renames(&[("michaeldougal/animnation", "chiefwildin/AnimNation")]),
         );
@@ -660,8 +682,7 @@ mod tests {
         // UEFN widens resolution roots with other workspace manifests' deps;
         // those renames must not error or touch this file.
         let mut manifest = json!({ "dependencies": { "a/b": "^1.0.0" } });
-        let applied =
-            canonicalize_manifest_deps(&mut manifest, &renames(&[("x/y", "z/y")]));
+        let applied = canonicalize(&mut manifest, &renames(&[("x/y", "z/y")]));
         assert!(applied.is_empty());
         assert_eq!(manifest["dependencies"]["a/b"], json!("^1.0.0"));
     }
@@ -671,7 +692,7 @@ mod tests {
         let mut manifest = json!({
             "dependencies": { "MichaelDougal/AnimNation": "^1.11.0" }
         });
-        let applied = canonicalize_manifest_deps(
+        let applied = canonicalize(
             &mut manifest,
             &renames(&[("michaeldougal/animnation", "chiefwildin/AnimNation")]),
         );
@@ -680,5 +701,67 @@ mod tests {
             manifest["dependencies"]["chiefwildin/AnimNation"],
             json!("^1.11.0")
         );
+    }
+
+    #[test]
+    fn a_single_report_merges_to_itself() {
+        let report = SolveReport {
+            override_edges: 3,
+            override_unused: keys(&["a/unused"]),
+            override_unnecessary: keys(&["a/loose"]),
+            exclude_unused: keys(&["b/unused"]),
+            exclude_inert: keys(&["b/inert"]),
+            locked_private: keys(&["p/q@1.0.0"]),
+        };
+        let merged = merge_reports(vec![report]);
+        assert_eq!(merged.override_edges, 3);
+        assert_eq!(merged.override_unused, keys(&["a/unused"]));
+        assert_eq!(merged.override_unnecessary, keys(&["a/loose"]));
+        assert_eq!(merged.exclude_unused, keys(&["b/unused"]));
+        assert_eq!(merged.exclude_inert, keys(&["b/inert"]));
+        assert_eq!(merged.locked_private, keys(&["p/q@1.0.0"]));
+    }
+
+    #[test]
+    fn a_constraint_one_mount_uses_is_not_reported_unused() {
+        // The server mount reaches both packages; the dev mount reaches
+        // neither. Neither constraint is unused project-wide.
+        let server = SolveReport {
+            override_edges: 2,
+            override_unused: vec![],
+            exclude_unused: vec![],
+            ..SolveReport::default()
+        };
+        let dev = SolveReport {
+            override_unused: keys(&["a/sig"]),
+            exclude_unused: keys(&["b/pro"]),
+            ..SolveReport::default()
+        };
+        let merged = merge_reports(vec![server, dev]);
+        assert_eq!(merged.override_edges, 2);
+        assert!(merged.override_unused.is_empty());
+        assert!(merged.exclude_unused.is_empty());
+
+        // Unused everywhere stays unused.
+        let a = SolveReport { override_unused: keys(&["a/sig"]), ..SolveReport::default() };
+        let b = SolveReport { override_unused: keys(&["a/sig"]), ..SolveReport::default() };
+        assert_eq!(merge_reports(vec![a, b]).override_unused, keys(&["a/sig"]));
+    }
+
+    #[test]
+    fn unnecessary_and_inert_need_every_mount_that_reached_them_to_agree() {
+        // Unnecessary in one mount, unused in the other: still unnecessary.
+        let a = SolveReport { override_unnecessary: keys(&["a/sig"]), exclude_inert: keys(&["b/pro"]), ..SolveReport::default() };
+        let b = SolveReport { override_unused: keys(&["a/sig"]), exclude_unused: keys(&["b/pro"]), ..SolveReport::default() };
+        let merged = merge_reports(vec![a, b]);
+        assert_eq!(merged.override_unnecessary, keys(&["a/sig"]));
+        assert_eq!(merged.exclude_inert, keys(&["b/pro"]));
+
+        // Load-bearing in one mount: needed.
+        let a = SolveReport { override_unnecessary: keys(&["a/sig"]), exclude_inert: keys(&["b/pro"]), ..SolveReport::default() };
+        let b = SolveReport::default();
+        let merged = merge_reports(vec![a, b]);
+        assert!(merged.override_unnecessary.is_empty());
+        assert!(merged.exclude_inert.is_empty());
     }
 }

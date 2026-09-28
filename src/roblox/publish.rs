@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::message::warn;
+use crate::mounts::Mount;
 use crate::platform::Preflight;
 
 /// Resolve the package's `root` (its init file): honor an explicit
@@ -22,7 +23,7 @@ pub fn publish_preflight(cwd: &Path, forest_json: &mut Value, interactive: bool)
         let Some(dir) = value.as_str() else {
             anyhow::bail!("Invalid packagesDir in forest.json: must be a string.");
         };
-        if let Err(reason) = crate::roblox::validate_packages_dir(dir) {
+        if let Err(reason) = crate::mounts::validate_folder_name(dir) {
             anyhow::bail!("Invalid packagesDir in forest.json: {}", reason);
         }
     }
@@ -101,24 +102,20 @@ pub fn publish_preflight(cwd: &Path, forest_json: &mut Value, interactive: bool)
     Ok(Preflight::Continue)
 }
 
-/// Ignore patterns forced onto the publish matcher: when the manifest
-/// declares dependencies, the hoisted install mount and the lockfile are
-/// install artifacts, not package content; consumers regenerate both from
-/// the manifest, and packing them would ship every resolved dependency
-/// inside the tarball. The mount lives wherever the manifest's `root` puts
-/// it (e.g. `src/Packages/`), so the pattern is derived, not hardcoded.
-pub fn publish_ignores(forest_json: &Value) -> Vec<String> {
-    let has_deps = forest_json
-        .get("dependencies")
-        .and_then(Value::as_object)
-        .map_or(false, |deps| !deps.is_empty());
-    if !has_deps {
+/// Ignore patterns forced onto the publish matcher: when any mount declares
+/// dependencies, every mount and the lockfile are install artifacts, not
+/// package content; consumers regenerate the default mount from the
+/// manifest, and packing them would ship resolved dependencies inside the
+/// tarball. Mounts live wherever their paths put them (the default one
+/// follows `root`, e.g. `src/Packages/`), and one may sit inside the root
+/// dir, so every pattern is derived, not hardcoded.
+pub fn publish_ignores(mounts: &[Mount]) -> Vec<String> {
+    if mounts.iter().all(|m| m.deps.is_empty()) {
         return Vec::new();
     }
-    vec![
-        format!("/{}/", crate::roblox::packages_base(forest_json)),
-        "/forest-lock.json".to_string(),
-    ]
+    let mut patterns: Vec<String> = mounts.iter().map(|m| format!("/{}/", m.path)).collect();
+    patterns.push("/forest-lock.json".to_string());
+    patterns
 }
 
 /// Roblox package-name rule: letter start, then letters/digits/`_`/`-`.
@@ -175,17 +172,45 @@ mod tests {
         assert!(validate_package_name("a.b").is_err());
     }
 
+    fn ignores(manifest: Value) -> Vec<String> {
+        let mounts = crate::mounts::project_mounts(&manifest, crate::platform::Platform::Roblox).unwrap();
+        publish_ignores(&mounts)
+    }
+
     #[test]
     fn publish_ignores_pack_artifacts_only_when_deps_declared() {
-        let with_deps = serde_json::json!({ "dependencies": { "roads": "^1.0.0" } });
+        let with_deps = serde_json::json!({ "dependencies": { "a/roads": "^1.0.0" } });
         assert_eq!(
-            publish_ignores(&with_deps),
+            ignores(with_deps),
             vec!["/Packages/".to_string(), "/forest-lock.json".to_string()]
         );
 
         let empty_deps = serde_json::json!({ "dependencies": {} });
-        assert!(publish_ignores(&empty_deps).is_empty());
-        assert!(publish_ignores(&serde_json::json!({})).is_empty());
+        assert!(ignores(empty_deps).is_empty());
+        assert!(ignores(serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn publish_ignores_cover_every_mount() {
+        // DevPackages sits inside the root dir, so without its own pattern
+        // the tarball would ship every dev dependency.
+        let manifest = serde_json::json!({
+            "root": "src/init.luau",
+            "dependencies": {},
+            "mounts": {
+                "src/DevPackages": { "dependencies": { "roblox/testez": "^0.4.0" } },
+                "ServerPackages": {}
+            }
+        });
+        assert_eq!(
+            ignores(manifest),
+            vec![
+                "/src/Packages/".to_string(),
+                "/ServerPackages/".to_string(),
+                "/src/DevPackages/".to_string(),
+                "/forest-lock.json".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -193,20 +218,20 @@ mod tests {
         // A nested root moves the mount inside the root dir; the exclusion
         // must move with it or the tarball ships every installed dependency.
         let nested = serde_json::json!({
-            "dependencies": { "roads": "^1.0.0" },
+            "dependencies": { "a/roads": "^1.0.0" },
             "root": "src/init.luau"
         });
         assert_eq!(
-            publish_ignores(&nested),
+            ignores(nested),
             vec!["/src/Packages/".to_string(), "/forest-lock.json".to_string()]
         );
 
         let top_level = serde_json::json!({
-            "dependencies": { "roads": "^1.0.0" },
+            "dependencies": { "a/roads": "^1.0.0" },
             "root": "init.luau"
         });
         assert_eq!(
-            publish_ignores(&top_level),
+            ignores(top_level),
             vec!["/Packages/".to_string(), "/forest-lock.json".to_string()]
         );
     }
@@ -217,21 +242,21 @@ mod tests {
         // force-excluded (via packages_base) or the tarball ships every
         // resolved dependency inside the package.
         let renamed = serde_json::json!({
-            "dependencies": { "roads": "^1.0.0" },
+            "dependencies": { "a/roads": "^1.0.0" },
             "packagesDir": "roblox_packages"
         });
         assert_eq!(
-            publish_ignores(&renamed),
+            ignores(renamed),
             vec!["/roblox_packages/".to_string(), "/forest-lock.json".to_string()]
         );
 
         let nested = serde_json::json!({
-            "dependencies": { "roads": "^1.0.0" },
+            "dependencies": { "a/roads": "^1.0.0" },
             "root": "src/init.luau",
             "packagesDir": "roblox_packages"
         });
         assert_eq!(
-            publish_ignores(&nested),
+            ignores(nested),
             vec!["/src/roblox_packages/".to_string(), "/forest-lock.json".to_string()]
         );
     }

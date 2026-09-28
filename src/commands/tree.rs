@@ -1,77 +1,77 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 
 use anyhow::Result;
 use colored::Colorize;
 use serde_json::Value;
 
-use crate::lockfile_gen::{lockfile_satisfies_manifest, LockFile};
+use crate::lockfile::{LockFile, LockSection, LockState};
 use crate::lockfile_solver::{DepSpec, LockfileEntry};
 use crate::message::{info, warn};
-use crate::utils::{digest_package_name, get_ci, normalize_forest_deps, normalize_forest_excludes, normalize_forest_overrides, resolve_dep_ref, DepRef};
+use crate::mounts::Mount;
+use crate::utils::{digest_package_name, get_ci, normalize_forest_excludes, normalize_forest_overrides, resolve_dep_ref, DepRef};
 
-/// Print the dependency tree from forest-lock.json. Fully offline: the
-/// lockfile stores each entry's resolved deps with exact versions, so no
-/// registry calls are needed. With a package reference, only that root
-/// dependency's subtree is shown.
-pub fn tree_command(target_package: Option<String>) -> Result<()> {
+/// Print the dependency tree from forest-lock.json, one tree per mount.
+/// Fully offline: the lockfile stores each entry's resolved deps with exact
+/// versions, so no registry calls are needed. With a package reference,
+/// only that root dependency's subtree is shown.
+pub fn tree_command(target_package: Option<String>, mount: Option<String>) -> Result<()> {
     let Some(project) = super::context::load_project()? else {
         info("No forest.json found, nothing to show.");
         return Ok(());
     };
     let manifest = project.manifest;
-    let roots = normalize_forest_deps(&manifest);
-    if roots.is_empty() {
-        info("No dependencies declared in forest.json.");
+    let platform = project.platform;
+    let mounts = crate::mounts::project_mounts(&manifest, platform)?;
+    let scope = mount.as_deref().map(|r| crate::mounts::find_mount(&mounts, r)).transpose()?;
+    let shown: Vec<&Mount> = mounts.iter().filter(|m| scope.map_or(true, |s| s.path == m.path)).collect();
+    let multi = mounts.len() > 1;
+    if shown.iter().all(|m| m.deps.is_empty()) {
+        match scope {
+            Some(m) if multi => info(&format!("No dependencies declared in {}.", m.path)),
+            _ => info("No dependencies declared in forest.json."),
+        }
         return Ok(());
     }
 
     // The reference may be the full scope/name, the alias, or the bare name,
     // same as remove. Only the rendered roots shrink; the staleness check
-    // below still needs the full manifest set.
-    let mut display_roots = roots.clone();
-    if let Some(reference) = &target_package {
-        match resolve_dep_ref(&roots, reference) {
-            DepRef::NotFound => {
-                info(&format!("Package {} is not a dependency of this project.", reference));
-                return Ok(());
+    // below still needs each mount's full set.
+    let mut display: Vec<(&Mount, HashMap<String, DepSpec>)> = Vec::new();
+    for mount in &shown {
+        let mut roots = mount.deps.clone();
+        if let Some(reference) = &target_package {
+            match resolve_dep_ref(&mount.deps, reference) {
+                DepRef::NotFound => continue,
+                DepRef::Ambiguous(candidates) => {
+                    warn(&format!(
+                        "\"{}\" matches more than one installed package: {}. Use the full <scope>/<name>.",
+                        reference,
+                        candidates.join(", ")
+                    ));
+                    return Ok(());
+                }
+                DepRef::Match(key) => roots.retain(|k, _| *k == key),
             }
-            DepRef::Ambiguous(candidates) => {
-                warn(&format!(
-                    "\"{}\" matches more than one installed package: {}. Use the full <scope>/<name>.",
-                    reference,
-                    candidates.join(", ")
-                ));
-                return Ok(());
-            }
-            DepRef::Match(key) => display_roots.retain(|k, _| *k == key),
         }
+        display.push((mount, roots));
     }
-
-    if !Path::new("forest-lock.json").exists() {
-        info("No forest-lock.json found. Run `forest install` first.");
+    if let (Some(reference), true) = (&target_package, display.is_empty()) {
+        info(&format!("Package {} is not a dependency of this project.", reference));
         return Ok(());
     }
-    let lock_content: Value = serde_json::from_str(&fs::read_to_string("forest-lock.json")?)?;
-    if lock_content.get("file_version").and_then(Value::as_u64) != Some(2) {
-        warn("Lockfile format is out of date; run `forest install` to regenerate it.");
-        return Ok(());
-    }
-    let lockfile: LockFile = serde_json::from_value(lock_content)?;
 
-    // Active local links change what's really on disk without touching the
-    // lockfile this tree renders from; surface them before the tree.
-    let link_res = crate::links::resolve_active(&roots);
-    for warning in &link_res.warnings {
-        warn(warning);
-    }
-    crate::links::print_banner(&link_res.active, |name| {
-        lockfile.pinned_version(name).map(str::to_string)
-    });
+    let lockfile = match LockFile::read()? {
+        LockState::Current(lockfile) => lockfile,
+        LockState::Missing => {
+            info("No forest-lock.json found. Run `forest install` first.");
+            return Ok(());
+        }
+        LockState::Outdated => {
+            warn("Lockfile format is out of date; run `forest install` to regenerate it.");
+            return Ok(());
+        }
+    };
 
-    // Same trust check install uses (UEFN widens the roots to the whole
-    // workspace). A stale lockfile still prints since it's what is on disk.
     let overrides = normalize_forest_overrides(&manifest);
     let excludes = normalize_forest_excludes(&manifest);
     // A package can be both a direct dep and overridden (the override
@@ -79,20 +79,47 @@ pub fn tree_command(target_package: Option<String>) -> Result<()> {
     // edges, so call the split out instead of letting the tree imply
     // the root is pinned too.
     for key in overrides.keys() {
-        if get_ci(&roots, key).is_some() {
+        if shown.iter().any(|m| get_ci(&m.deps, key).is_some()) {
             warn(&format!(
                 "Override for {} applies only to transitive occurrences; the direct dependency keeps its declared range.",
                 key
             ));
         }
     }
-    let platform = crate::platform::Platform::from_manifest(&manifest)?;
-    let resolution_roots = platform.resolution_roots(roots)?;
-    if !lockfile_satisfies_manifest(&lockfile, &resolution_roots, &overrides, &excludes) {
-        warn("forest.json changed since the last install; run `forest install` to refresh the tree.");
-    }
 
-    print!("{}", render_tree(&project_label(&manifest), &display_roots, &lockfile, &overrides, &excludes, platform.uses_pointer_files()));
+    let label = project_label(&manifest);
+    let empty = LockSection::default();
+    for (i, (mount, display_roots)) in display.iter().enumerate() {
+        let section = lockfile.section(mount).unwrap_or(&empty);
+
+        // Active local links change what's really on disk without touching
+        // the lockfile this tree renders from; surface them before the tree.
+        let link_res = crate::links::resolve_active(&mount.deps, mount);
+        for warning in &link_res.warnings {
+            warn(warning);
+        }
+        crate::links::print_banner(&link_res.active, |name| {
+            section.pinned_version(name).map(str::to_string)
+        });
+
+        // Same trust check install uses (UEFN widens the roots to the whole
+        // workspace). A stale section still prints since it's what is on disk.
+        let resolution_roots = platform.resolution_roots(mount.deps.clone())?;
+        if !section.satisfies(&resolution_roots, &overrides, &excludes) {
+            let what = if multi { format!("{} changed", mount.path) } else { "forest.json changed".to_string() };
+            warn(&format!("{} since the last install; run `forest install` to refresh the tree.", what));
+        }
+
+        let heading = if multi { format!("{} [{}]", label, mount.label()) } else { label.clone() };
+        if i > 0 {
+            println!();
+        }
+        if display_roots.is_empty() {
+            println!("{}\n{}", heading.bold(), "(no dependencies)".dimmed());
+            continue;
+        }
+        print!("{}", render_tree(&heading, display_roots, section, &overrides, &excludes, platform.uses_pointer_files()));
+    }
     Ok(())
 }
 
@@ -109,7 +136,7 @@ fn project_label(manifest: &Value) -> String {
     label
 }
 
-fn render_tree(label: &str, roots: &HashMap<String, DepSpec>, lockfile: &LockFile, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, mark_pointers: bool) -> String {
+fn render_tree(label: &str, roots: &HashMap<String, DepSpec>, lockfile: &LockSection, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, mark_pointers: bool) -> String {
     let mut out = format!("{}\n", label.bold());
     let mut sorted: Vec<(&String, &DepSpec)> = roots.iter().collect();
     sorted.sort_by_key(|(k, _)| k.to_lowercase());
@@ -129,7 +156,7 @@ fn render_tree(label: &str, roots: &HashMap<String, DepSpec>, lockfile: &LockFil
 
 /// Root deps pin their resolved version at location "~". Fall back to a
 /// range match so a hand-edited or stale lockfile still renders something.
-fn find_root_entry<'a>(lockfile: &'a LockFile, name: &str, range: &str) -> Option<&'a LockfileEntry> {
+fn find_root_entry<'a>(lockfile: &'a LockSection, name: &str, range: &str) -> Option<&'a LockfileEntry> {
     lockfile.root_entry(name).or_else(|| {
         let req = semver::VersionReq::parse(range).ok()?;
         get_ci(&lockfile.packages, name)?
@@ -139,7 +166,7 @@ fn find_root_entry<'a>(lockfile: &'a LockFile, name: &str, range: &str) -> Optio
 }
 
 fn render_dep(
-    lockfile: &LockFile,
+    lockfile: &LockSection,
     overrides: &HashMap<String, String>,
     excludes: &HashMap<String, String>,
     name: &str,
@@ -245,9 +272,8 @@ mod tests {
         }
     }
 
-    fn lockfile(packages: Vec<(&str, Vec<LockfileEntry>)>) -> LockFile {
-        LockFile {
-            file_version: 2,
+    fn lockfile(packages: Vec<(&str, Vec<LockfileEntry>)>) -> LockSection {
+        LockSection {
             overrides: HashMap::new(),
             excludes: HashMap::new(),
             packages: packages.into_iter().map(|(n, e)| (n.to_string(), e)).collect(),
@@ -258,7 +284,7 @@ mod tests {
         pairs.iter().map(|(n, v)| dep(n, v)).collect()
     }
 
-    fn render_plain(label: &str, roots: &HashMap<String, DepSpec>, lf: &LockFile) -> String {
+    fn render_plain(label: &str, roots: &HashMap<String, DepSpec>, lf: &LockSection) -> String {
         colored::control::set_override(false);
         render_tree(label, roots, lf, &HashMap::new(), &HashMap::new(), false)
     }

@@ -10,29 +10,38 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::lockfile_gen::LockFile;
+use crate::lockfile::LockFile;
 use crate::links;
 use crate::message::{fail, info, success, warn};
+use crate::mounts::Mount;
 use crate::platform::Platform;
-use crate::utils::{normalize_forest_deps, same_package};
+use crate::utils::same_package;
 
-/// The lockfile-pinned root version for a dependency key.
-fn pinned_version(lockfile: &Option<LockFile>, name: &str) -> Option<String> {
+/// The lockfile-pinned root version for a dependency key in a mount.
+fn pinned_version(lockfile: &Option<LockFile>, mount: &Mount, name: &str) -> Option<String> {
     lockfile
         .as_ref()
-        .and_then(|lf| lf.pinned_version(name).map(str::to_string))
+        .and_then(|lf| lf.section(mount))
+        .and_then(|s| s.pinned_version(name).map(str::to_string))
 }
 
-pub async fn link_command(path: Option<String>, list: bool) -> Result<()> {
+/// How a mount is stored in links.json: None for the default.
+fn link_mount_key(mount: &Mount) -> Option<&str> {
+    (!mount.is_default()).then_some(mount.path.as_str())
+}
+
+pub async fn link_command(path: Option<String>, list: bool, mount: Option<String>) -> Result<()> {
     let Some(project) = super::context::load_project()? else {
         fail("No forest.json found. Run `forest init` first.");
         return Ok(());
     };
     let manifest = project.manifest;
     let platform = project.platform;
+    let mounts = crate::mounts::project_mounts(&manifest, platform)?;
+    let scope = mount.as_deref().map(|r| crate::mounts::find_mount(&mounts, r)).transpose()?;
 
     let Some(path) = path.filter(|_| !list) else {
-        print_links_list(&manifest);
+        print_links_list(&mounts, platform);
         return Ok(());
     };
 
@@ -84,42 +93,50 @@ pub async fn link_command(path: Option<String>, list: bool) -> Result<()> {
 
     // Identity: author/name when the linked manifest knows its author,
     // otherwise fall back to an unambiguous name-part match. A link is an
-    // OVERRIDE; the package must already be a direct dependency.
-    let root_deps = normalize_forest_deps(&manifest);
-    let dep_key = match linked.get("author").and_then(Value::as_str) {
-        Some(author) => {
-            let full = format!("{}/{}", author, linked_name);
-            root_deps.keys().find(|k| same_package(k, &full)).cloned().ok_or_else(|| {
-                anyhow!(
-                    "{} is not a dependency of this project. Add it first: `forest install {}`.",
-                    full, full
-                )
-            })
-        }
-        None => {
-            let matches: Vec<&String> = root_deps
-                .keys()
-                .filter(|k| k.rsplit('/').next().map_or(false, |n| n.eq_ignore_ascii_case(linked_name)))
-                .collect();
-            match matches.len() {
-                1 => Ok(matches[0].clone()),
-                0 => Err(anyhow!(
-                    "No dependency named {} in forest.json. Add the package first, then link it.",
-                    linked_name
-                )),
-                _ => Err(anyhow!(
-                    "{} has no `author` field and \"{}\" matches several dependencies ({}). Add `author` to the linked forest.json.",
-                    target_manifest_path.display(),
-                    linked_name,
-                    matches.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-                )),
-            }
-        }
+    // OVERRIDE; the package must already be a direct dependency, of
+    // exactly one mount unless --mount picks it.
+    let searched: Vec<&Mount> = match scope {
+        Some(m) => vec![m],
+        None => mounts.iter().collect(),
     };
-    let dep_key = match dep_key {
-        Ok(key) => key,
-        Err(e) => {
-            fail(&e.to_string());
+    let author = linked.get("author").and_then(Value::as_str);
+    let full = author.map(|a| format!("{}/{}", a, linked_name));
+    let candidates: Vec<(&Mount, String)> = searched
+        .iter()
+        .flat_map(|m| {
+            m.deps
+                .keys()
+                .filter(|k| match &full {
+                    Some(full) => same_package(k, full),
+                    None => k.rsplit('/').next().map_or(false, |n| n.eq_ignore_ascii_case(linked_name)),
+                })
+                .map(move |k| (*m, k.clone()))
+        })
+        .collect();
+    let (link_mount, dep_key) = match candidates.as_slice() {
+        [(m, key)] => (*m, key.clone()),
+        [] => {
+            let place = scope.map(|m| format!(" of {}", m.path)).unwrap_or_else(|| " of this project".to_string());
+            match &full {
+                Some(full) => fail(&format!("{} is not a dependency{}. Add it first: `forest install {}`.", full, place, full)),
+                None => fail(&format!("No dependency named {} in forest.json. Add the package first, then link it.", linked_name)),
+            }
+            return Ok(());
+        }
+        many if many.iter().all(|(_, k)| full.as_ref().map_or(false, |f| same_package(k, f))) => {
+            anyhow::bail!(
+                "{} is a dependency of several mounts: {}. Pick one with --mount.",
+                many[0].1,
+                crate::mounts::DepLocation::several_paths(many)
+            );
+        }
+        many => {
+            fail(&format!(
+                "{} has no `author` field and \"{}\" matches several dependencies ({}). Add `author` to the linked forest.json.",
+                target_manifest_path.display(),
+                linked_name,
+                many.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>().join(", ")
+            ));
             return Ok(());
         }
     };
@@ -127,7 +144,7 @@ pub async fn link_command(path: Option<String>, list: bool) -> Result<()> {
     // Range mismatch is a warning, not an error: dev versions legitimately
     // run ahead of the declared range.
     let linked_version = linked.get("version").and_then(Value::as_str).unwrap_or("");
-    if let Some(spec) = crate::utils::get_ci(&root_deps, &dep_key) {
+    if let Some(spec) = crate::utils::get_ci(&link_mount.deps, &dep_key) {
         let satisfied = semver::VersionReq::parse(&spec.version)
             .ok()
             .zip(semver::Version::parse(linked_version).ok())
@@ -143,7 +160,7 @@ pub async fn link_command(path: Option<String>, list: bool) -> Result<()> {
     // Same heads-up a registry install gives for packaged scripts.
     warn_on_runnable_scripts(target, &linked);
 
-    links::upsert_link(Path::new("."), &dep_key, &path)?;
+    links::upsert_link(Path::new("."), &dep_key, &path, link_mount_key(link_mount))?;
     if links::ensure_gitignored(Path::new("."))? {
         info("Added .forest/ to .gitignore (link state is machine-local and must not be committed).");
     }
@@ -152,9 +169,13 @@ pub async fn link_command(path: Option<String>, list: bool) -> Result<()> {
     // overlay, restoring/keeping everything else registry-faithful. The
     // explicit mode makes `forest link` apply even where installs would
     // default to ignoring links (CI).
-    super::install::install_command(None, None, None, false, None, Some(links::LinksMode::Apply), false).await?;
+    super::install::install_command(
+        None, None, None, false, None, Some(links::LinksMode::Apply), false, Some(link_mount.path.clone()),
+    )
+    .await?;
 
-    success(&format!("Linked {} → {}", dep_key, path));
+    let place = if mounts.len() > 1 { format!(" in {}", link_mount.path) } else { String::new() };
+    success(&format!("Linked {} → {}{}", dep_key, path, place));
     Ok(())
 }
 
@@ -210,34 +231,60 @@ fn warn_on_runnable_scripts(target: &Path, linked_manifest: &Value) {
     }
 }
 
-pub async fn unlink_command(reference: Option<String>, all: bool) -> Result<()> {
+pub async fn unlink_command(reference: Option<String>, all: bool, mount: Option<String>) -> Result<()> {
     let Some(project) = super::context::load_project()? else {
         fail("No forest.json found here.");
         return Ok(());
     };
-    let manifest = project.manifest;
+    let platform = project.platform;
+    let mounts = crate::mounts::project_mounts(&project.manifest, platform)?;
+    let scope = mount.as_deref().map(|r| crate::mounts::find_mount(&mounts, r)).transpose()?;
 
-    let stored = links::stored_links();
+    let stored: Vec<links::StoredLink> = links::stored_links()
+        .into_iter()
+        .filter(|l| scope.map_or(true, |m| l.belongs_to(m)))
+        .collect();
     if stored.is_empty() {
         info("No active links.");
         return Ok(());
     }
 
     let removed: Vec<links::StoredLink> = if all {
-        let keys = links::remove_all(Path::new("."))?;
-        stored.into_iter().filter(|l| keys.contains(&l.name)).collect()
+        if scope.is_some() {
+            for link in &stored {
+                links::remove_stored(Path::new("."), link)?;
+            }
+            stored
+        } else {
+            links::remove_all(Path::new("."))?
+        }
     } else {
         let Some(reference) = reference else {
             fail("Pass a package (scope/name), a linked path, or --all.");
             return Ok(());
         };
-        match links::remove_link(Path::new("."), &reference)? {
-            Some(key) => stored.into_iter().filter(|l| l.name == key).collect(),
-            None => {
+        match links::matching_links(Path::new("."), &stored, &reference).as_slice() {
+            [link] => {
+                links::remove_stored(Path::new("."), link)?;
+                vec![link.clone()]
+            }
+            [] => {
                 info(&format!(
                     "No active link matches {}; nothing to do.{}",
                     reference,
                     backslash_hint(&reference)
+                ));
+                return Ok(());
+            }
+            many => {
+                let places: Vec<String> = many
+                    .iter()
+                    .map(|l| l.mount.clone().unwrap_or_else(|| mounts[0].path.clone()))
+                    .collect();
+                fail(&format!(
+                    "{} is linked in several mounts: {}. Pick one with --mount.",
+                    reference,
+                    places.join(", ")
                 ));
                 return Ok(());
             }
@@ -247,14 +294,17 @@ pub async fn unlink_command(reference: Option<String>, all: bool) -> Result<()> 
     // Clear each slot so the reinstall below restores the registry version
     // (re-extracted from the verified cache). Junctions are removed as
     // links, never through them; copy-mode slots (real dirs) go through the
-    // trash bin so a live rojo never sees in-place child deletions.
-    if Platform::from_manifest(&manifest)? == Platform::Roblox {
-        let base = crate::roblox::packages_base(&manifest);
-        let container = crate::roblox::packages_container(&manifest);
-        let root_deps = normalize_forest_deps(&manifest);
+    // trash bin so a live rojo never sees in-place child deletions. A link
+    // whose mount is gone has no slot forest still manages.
+    if platform == Platform::Roblox {
         let mut trash = crate::roblox::scratch::TrashBin::new(crate::roblox::scratch::scratch_dirs().trash);
         for link in &removed {
-            if let Some(spec) = crate::utils::get_ci(&root_deps, &link.name) {
+            let Some(link_mount) = mounts.iter().find(|m| link.belongs_to(m)) else {
+                continue;
+            };
+            let base = link_mount.path.clone();
+            let container = link_mount.name().to_string();
+            if let Some(spec) = crate::utils::get_ci(&link_mount.deps, &link.name) {
                 let slot = crate::roblox::physical_path(
                     &base,
                     &container,
@@ -285,12 +335,16 @@ pub async fn unlink_command(reference: Option<String>, all: bool) -> Result<()> 
     }
 
     for link in &removed {
-        info(&format!("Unlinked {} (was → {})", link.name, link.path));
+        let place = match &link.mount {
+            Some(path) => format!(" in {}", path),
+            None => String::new(),
+        };
+        info(&format!("Unlinked {}{} (was → {})", link.name, place, link.path));
     }
 
     // Restore the exact registry versions via the normal pipeline. Apply
     // mode so any REMAINING links stay materialized while this one restores.
-    super::install::install_command(None, None, None, false, None, Some(links::LinksMode::Apply), false).await?;
+    super::install::install_command(None, None, None, false, None, Some(links::LinksMode::Apply), false, None).await?;
     success(&format!(
         "Restored {} package{} from the registry.",
         removed.len(),
@@ -300,22 +354,14 @@ pub async fn unlink_command(reference: Option<String>, all: bool) -> Result<()> 
 }
 
 /// `forest link --list` / bare `forest link`.
-fn print_links_list(manifest: &Value) {
+fn print_links_list(mounts: &[Mount], platform: Platform) {
     let stored = links::stored_links();
     if stored.is_empty() {
         info("No active links. Link one with `forest link <path>`.");
         return;
     }
-    let root_deps = normalize_forest_deps(manifest);
     let lockfile = LockFile::load();
-    let (base, container) = if Platform::from_manifest(manifest).ok() == Some(Platform::Roblox) {
-        (
-            crate::roblox::packages_base(manifest),
-            crate::roblox::packages_container(manifest),
-        )
-    } else {
-        (String::new(), String::new())
-    };
+    let roblox = platform == Platform::Roblox;
 
     println!(
         "{} link{} active:",
@@ -323,12 +369,30 @@ fn print_links_list(manifest: &Value) {
         if stored.len() == 1 { "" } else { "s" }
     );
     for link in &stored {
-        let Some((dep_key, spec)) = root_deps.iter().find(|(k, _)| same_package(k, &link.name)) else {
+        let flag = link.mount.as_ref().map(|p| format!(" --mount {}", p)).unwrap_or_default();
+        let Some(link_mount) = mounts.iter().find(|m| link.belongs_to(m)) else {
             warn(&format!(
-                "  {} → {} (no longer a dependency; `forest unlink {}` to clean up)",
-                link.name, link.path, link.name
+                "  {} → {} (mount {} is no longer declared; `forest unlink {}{}` to clean up)",
+                link.name,
+                link.path,
+                link.mount.as_deref().unwrap_or_default(),
+                link.name,
+                flag
             ));
             continue;
+        };
+        let Some((dep_key, spec)) = link_mount.deps.iter().find(|(k, _)| same_package(k, &link.name)) else {
+            warn(&format!(
+                "  {} → {} (no longer a dependency; `forest unlink {}{}` to clean up)",
+                link.name, link.path, link.name, flag
+            ));
+            continue;
+        };
+        let place = if mounts.len() > 1 { format!(" in {}", link_mount.path) } else { String::new() };
+        let (base, container) = if roblox {
+            (link_mount.path.clone(), link_mount.name().to_string())
+        } else {
+            (String::new(), String::new())
         };
         let linked_manifest: Option<Value> = fs::read_to_string(Path::new(&link.path).join("forest.json"))
             .ok()
@@ -338,7 +402,7 @@ fn print_links_list(manifest: &Value) {
             .and_then(|m| m.get("version").and_then(Value::as_str))
             .unwrap_or("?")
             .to_string();
-        let pin = pinned_version(&lockfile, dep_key).unwrap_or_else(|| "not installed".to_string());
+        let pin = pinned_version(&lockfile, link_mount, dep_key).unwrap_or_else(|| "not installed".to_string());
 
         let mode = if base.is_empty() {
             String::new()
@@ -357,8 +421,8 @@ fn print_links_list(manifest: &Value) {
             }
         };
         println!(
-            "  {} → {} (registry pin: {}, linked: {}{})",
-            dep_key, link.path, pin, linked_version, mode
+            "  {} → {}{} (registry pin: {}, linked: {}{})",
+            dep_key, link.path, place, pin, linked_version, mode
         );
         if linked_manifest.is_none() {
             warn(&format!("    target manifest unreadable at {}", link.path));
@@ -366,8 +430,8 @@ fn print_links_list(manifest: &Value) {
         }
 
         // Dependency divergence vs the pinned registry version.
-        if let Some(lf) = &lockfile {
-            let pinned_deps = lf
+        if let Some(section) = lockfile.as_ref().and_then(|lf| lf.section(link_mount)) {
+            let pinned_deps = section
                 .root_entry(dep_key)
                 .map(|e| e.dependencies.clone())
                 .unwrap_or_default();
