@@ -154,8 +154,50 @@ fn merge_fresh_version_list(state: &mut PackageState, version_data: &serde_json:
     }
 }
 
-/// Keyed by the LOWERCASED full name
-type ResolvedVersions = HashMap<String, PackageState>;
+/// Package states, one per canonical package, found by every LOWERCASED
+/// full name the graph asked for plus the canonical one. A package reached
+/// under an old address (claimed scope, renamed package) in one manifest and
+/// its current one in another is one package: one set of buckets, one
+/// lockfile entry.
+#[derive(Default)]
+struct ResolvedPackages {
+    states: Vec<PackageState>,
+    by_name: HashMap<String, usize>,
+}
+
+impl ResolvedPackages {
+    fn contains(&self, key: &str) -> bool {
+        self.by_name.contains_key(key)
+    }
+
+    fn get(&self, key: &str) -> Option<&PackageState> {
+        self.by_name.get(key).map(|&i| &self.states[i])
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut PackageState> {
+        let i = *self.by_name.get(key)?;
+        Some(&mut self.states[i])
+    }
+
+    /// Register `key` for `state`, or for the state already held for the
+    /// same canonical package (the new one is then dropped).
+    fn insert(&mut self, key: String, state: PackageState) {
+        let canonical_key = state.canonical.to_lowercase();
+        let index = match self.by_name.get(&canonical_key) {
+            Some(&i) => i,
+            None => {
+                self.states.push(state);
+                self.states.len() - 1
+            }
+        };
+        self.by_name.insert(canonical_key, index);
+        self.by_name.insert(key, index);
+    }
+
+    fn packages(&self) -> impl Iterator<Item = &PackageState> {
+        self.states.iter()
+    }
+}
 
 /// Lockfile entry for a package version.
 ///
@@ -260,7 +302,7 @@ pub async fn get_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
 }
 
 async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, overrides: &HashMap<String, String>, excludes: &HashMap<String, String>, locked_private: &LockedPrivate, platform : String, msg: &mut Message, use_meta_cache: bool) -> Result<(LockfilePackages, Vec<LicenseInfo>, HashMap<String, String>, SolveReport)> {
-    let mut resolved: ResolvedVersions = HashMap::new();
+    let mut resolved = ResolvedPackages::default();
     let mut license_warnings: Vec<LicenseInfo> = Vec::new();
 
     // Disk metadata cache. Entries only ever save round trips (threat model
@@ -338,7 +380,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
         ));
 
         // fetch available versions (first encounter under any casing)
-        if !resolved.contains_key(&key) {
+        if !resolved.contains(&key) {
             let (version_data, versions_status) = match list_prefetch.remove(&key) {
                 Some(handle) => handle.await
                     .map_err(|e| anyhow::anyhow!("Version-list task panicked: {e}"))??,
@@ -379,9 +421,13 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
         // filter by range, then drop excluded versions from the candidates
         let req = VersionReq::parse(&version_range)
             .with_context(|| format!("Invalid range {} for {}", version_range, name.full_name))?;
-        let exclude_req = excludes_lc.get(&key);
-        if exclude_req.is_some() {
-            exclude_ranges_seen.entry(key.clone()).or_default().push(version_range.clone());
+        // An exclusion names the package by the key it was written under,
+        // which may be its canonical name while this edge uses an old one.
+        let canonical_key = pkg_state.canonical.to_lowercase();
+        let exclude_key = [&key, &canonical_key].into_iter().find(|k| excludes_lc.contains_key(*k)).cloned();
+        let exclude_req = exclude_key.as_ref().and_then(|k| excludes_lc.get(k));
+        if let Some(k) = &exclude_key {
+            exclude_ranges_seen.entry(k.clone()).or_default().push(version_range.clone());
         }
         let all_versions: Vec<String> = pkg_state.versions.keys().cloned().collect();
         let raw_matches: Vec<String> = all_versions.iter()
@@ -604,7 +650,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
             let dep_key = dep_pkg.full_name.to_lowercase();
             // First sighting of this package name → start its version-list
             // request now so it's (likely) done by the time BFS reaches it.
-            if !resolved.contains_key(&dep_key) && !list_prefetch.contains_key(&dep_key) {
+            if !resolved.contains(&dep_key) && !list_prefetch.contains_key(&dep_key) {
                 let handle = spawn_version_list_fetch(
                     dep_pkg.scope.clone(),
                     dep_pkg.name.clone(),
@@ -673,13 +719,14 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
     // through their lowercased form. Every dep was queued and fetched, so
     // every lookup hits.
     let mut lockfile: LockfilePackages = HashMap::new();
-    for state in resolved.values() {
+    for state in resolved.packages() {
         let mut entries = Vec::new();
         for bucket_ver in state.buckets.keys() {
             let vs = &state.versions[bucket_ver];
             let mut deps = HashMap::new();
             for (dn, dr) in &vs.dependencies {
-                let dep_state = &resolved[&dn.to_lowercase()];
+                let dep_state = resolved.get(&dn.to_lowercase())
+                    .expect("every dep was queued and fetched");
                 // Highest matching bucket, not HashMap iteration order, so
                 // two buckets satisfying a loose range always pick the same.
                 let req = VersionReq::parse(&dr.version)
@@ -819,7 +866,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
         }
     }
     for (key, reason) in &carried {
-        let state = &resolved[key];
+        let state = resolved.get(key).expect("carried keys were resolved");
         for v in state.buckets.keys() {
             report.locked_private.push((format!("{}@{}", state.canonical, v), *reason));
         }
@@ -1138,6 +1185,27 @@ mod tests {
             });
         }
         PackageState { canonical: "Scope/Pkg".into(), buckets: HashMap::new(), versions: vs }
+    }
+
+    fn named(canonical: &str) -> PackageState {
+        PackageState { canonical: canonical.into(), ..state_with(&[("1.0.0", false)]) }
+    }
+
+    #[test]
+    fn old_and_new_addresses_share_one_package_state() {
+        let mut resolved = ResolvedPackages::default();
+        resolved.insert("gamebeast-gg/gamebeast".into(), named("gamebeast/RobloxSDK"));
+        // Reached under the old address only: the canonical name finds it too
+        assert!(resolved.contains("gamebeast/robloxsdk"));
+
+        resolved.get_mut("gamebeast-gg/gamebeast").unwrap()
+            .buckets.insert("1.0.0".into(), vec!["^1.0.0".into()]);
+        resolved.insert("gamebeast/robloxsdk".into(), named("gamebeast/RobloxSDK"));
+        assert_eq!(resolved.packages().count(), 1);
+        assert_eq!(resolved.get("gamebeast/robloxsdk").unwrap().buckets.len(), 1);
+
+        resolved.insert("other/pkg".into(), named("other/Pkg"));
+        assert_eq!(resolved.packages().count(), 2);
     }
 
     #[test]
