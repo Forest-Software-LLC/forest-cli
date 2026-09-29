@@ -165,6 +165,26 @@ Assert ((Get-Content (Join-Path $Dev "src\init.luau") -Raw) -match "DEV_MARKER")
 $linksFile = Join-Path $Project ".forest\links.json"
 Assert (-not ((Get-Content $linksFile -Raw -ErrorAction SilentlyContinue) -match "ServerPackages")) "mount's links dropped"
 
+Write-Host "== link inside a mount removed from forest.json by hand =="
+& $ForestExe mount create DevPackages *>> $log
+& $ForestExe install sleitnick/knit --mount DevPackages *>> $log
+& $ForestExe link $Dev --mount DevPackages *>> $log
+Assert ($LASTEXITCODE -eq 0) "link into DevPackages exit 0"
+$devSlot = Join-Path $Project "DevPackages\Knit"
+$item = Get-Item $devSlot -Force
+Assert (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) "DevPackages Knit is a junction"
+$manifestPath = Join-Path $Project "forest.json"
+$manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+$manifest.PSObject.Properties.Remove("mounts")
+[System.IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 20))
+& $ForestExe install *>> $log
+Assert ($LASTEXITCODE -eq 0) "install after hand-removing the mount exit 0"
+RojoAlive "install after hand-removing a linked mount"
+Assert (-not (Test-Path $devSlot)) "junction left in the old mount folder is removed"
+Assert (Test-Path $devSentinel) "dev tree sentinel survives the cleanup"
+Assert ((Get-Content (Join-Path $Dev "src\init.luau") -Raw) -match "DEV_MARKER") "dev root module survives the cleanup"
+Assert (-not ((Get-Content $linksFile -Raw -ErrorAction SilentlyContinue) -match "DevPackages")) "links into the old mount dropped"
+
 Pop-Location
 $rojo.Refresh()
 $survived = -not $rojo.HasExited

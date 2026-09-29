@@ -54,7 +54,7 @@ impl Mount {
 /// Every mount the manifest declares, default first, validated as a set.
 pub fn project_mounts(manifest: &Value, platform: Platform) -> Result<Vec<Mount>> {
     let mut mounts = vec![Mount {
-        path: platform.default_mount_path(manifest),
+        path: platform.default_mount_path(manifest)?,
         key: None,
         deps: normalize_forest_deps(manifest),
     }];

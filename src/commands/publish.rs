@@ -102,8 +102,7 @@ fn readme_is_substantial(contents: &str) -> bool {
 
 /// Load ignore patterns from `.gitignore` and `.forestignore` (either may be
 /// absent). `.forestignore` is applied last so its patterns override `.gitignore`.
-/// `forced_patterns` go last of all so ignore files can't whitelist them back in.
-fn load_forest_ignore(directory: &Path, forced_patterns: &[String]) -> Gitignore {
+fn load_forest_ignore(directory: &Path) -> Gitignore {
     let mut builder = GitignoreBuilder::new(directory);
 
     for ignore_name in [".gitignore", ".forestignore"] {
@@ -116,19 +115,43 @@ fn load_forest_ignore(directory: &Path, forced_patterns: &[String]) -> Gitignore
         }
     }
 
-    for pattern in forced_patterns {
-        if let Err(err) = builder.add_line(None, pattern) {
-            warn(&format!("Failed to apply ignore pattern {}: {}", pattern, err));
-        }
-    }
-
     // allow unparseable patterns to just be warnings, not panics
     builder.build().expect("Parsing ignore files failed")
 }
 
+/// Paths the platform keeps out of every publish (`/dir/` or `/file`,
+/// anchored at the package dir). Matched literally and case-insensitively
+/// instead of as ignore globs: a mount's forest.json key can differ in case
+/// from its folder on Windows and macOS, and a folder name can hold glob
+/// characters. Checked apart from the ignore files, so they can't whitelist
+/// these back in.
+struct ForcedExcludes {
+    dirs: Vec<String>,
+    files: Vec<String>,
+}
+
+impl ForcedExcludes {
+    fn new(patterns: &[String]) -> Self {
+        let mut forced = ForcedExcludes { dirs: Vec::new(), files: Vec::new() };
+        for pattern in patterns {
+            let path = pattern.trim_start_matches('/').to_ascii_lowercase();
+            match path.strip_suffix('/') {
+                Some(dir) => forced.dirs.push(dir.to_string()),
+                None => forced.files.push(path),
+            }
+        }
+        forced
+    }
+
+    fn matches(&self, rel: &Path, is_dir: bool) -> bool {
+        let rel = rel.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        if is_dir { self.dirs.contains(&rel) } else { self.files.contains(&rel) }
+    }
+}
+
 /// Create a gzipped tarball in-memory of the directory, honoring .gitignore /
 /// .forestignore and skipping dotfiles/dot-directories by default.
-fn create_tarball_buffer(dir: &Path, matcher: &Gitignore) -> Result<Vec<u8>> {
+fn create_tarball_buffer(dir: &Path, matcher: &Gitignore, forced: &ForcedExcludes) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
         let enc = GzEncoder::new(&mut buf, Compression::default());
@@ -153,8 +176,12 @@ fn create_tarball_buffer(dir: &Path, matcher: &Gitignore) -> Result<Vec<u8>> {
             {
                 return false;
             }
+            let is_dir = e.file_type().is_dir();
+            if forced.matches(rel, is_dir) {
+                return false;
+            }
             // if the matcher says “ignore this dir”, return false to prune
-            !matcher.matched(rel, e.file_type().is_dir()).is_ignore()
+            !matcher.matched(rel, is_dir).is_ignore()
         });
 
         for entry in walker.filter_map(|e| e.ok()) {
@@ -390,11 +417,23 @@ pub async fn publish_command(yes: bool) -> Result<()> {
     if forest_json["name"].is_string() {
         let platform = platform.as_str();
         let name = forest_json["name"].as_str().unwrap().to_string();
+        let author = forest_json["author"].as_str().unwrap().to_string();
         let msg = Message::new("Checking the registry for this package...");
-        let versions_result = api_request(&format!("v1/package/{}/{}/{}", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None).await;
-        let latest_result = packages_api_request(&format!("v1/package/{}/{}/{}/latest", forest_json["author"].as_str().unwrap(), platform, name), reqwest::Method::GET, None, None).await;
-        msg.destroy();
-        let (versions_resp, status_code) = versions_result.context("Failed to fetch package versions")?;
+        // __fresh skips the edge cache: right after a publish it can still
+        // serve the list without that version, and the proposal below would
+        // offer a version the registry then rejects as taken.
+        let buster = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let versions_result = api_request(&format!("v1/package/{}/{}/{}?__fresh={}", author, platform, name, buster), reqwest::Method::GET, None, None).await;
+        let (versions_resp, status_code) = match versions_result.context("Failed to fetch package versions") {
+            Ok(res) => res,
+            Err(e) => {
+                msg.destroy();
+                return Err(e);
+            }
+        };
 
         if status_code.is_success() {
             let versions_array = versions_resp.get("versions")
@@ -408,11 +447,41 @@ pub async fn publish_command(yes: bool) -> Result<()> {
                 .filter_map(|v| v.get("version").and_then(Value::as_str))
                 .map(String::from)
                 .collect::<Vec<String>>();
+        } else if status_code != StatusCode::NOT_FOUND {
+            // Only a 404 means the package is new; anything else would
+            // publish as if it were (visibility prompt, license compare).
+            msg.destroy();
+            anyhow::bail!("Couldn't check the registry for {} (HTTP {}). Try again.", package_label, status_code);
         }
 
-        let (latest_package_data, status_code) = latest_result.context("Failed to fetch latest package data")?;
+        // The published package's settings come from its newest release:
+        // `latest` is the newest stable one and 404s while there are only
+        // prereleases, so fall back to the newest version by SemVer.
+        let latest = if versions.is_empty() {
+            None
+        } else {
+            let base = format!("v1/package/{}/{}/{}", author, platform, name);
+            let mut result = packages_api_request(&format!("{}/latest", base), reqwest::Method::GET, None, None).await;
+            if matches!(&result, Ok((_, status)) if *status == StatusCode::NOT_FOUND) {
+                if let Some(newest) = versions.iter().filter_map(|v| semver::Version::parse(v).ok()).max() {
+                    result = packages_api_request(&format!("{}/{}", base, newest), reqwest::Method::GET, None, None).await;
+                }
+            }
+            match result.context("Failed to fetch latest package data") {
+                Ok((data, status)) if status.is_success() => Some(data),
+                Ok((_, status)) => {
+                    msg.destroy();
+                    anyhow::bail!("Couldn't read {}'s published settings (HTTP {}). Try again.", package_label, status);
+                }
+                Err(e) => {
+                    msg.destroy();
+                    return Err(e);
+                }
+            }
+        };
+        msg.destroy();
 
-        if status_code.is_success() {
+        if let Some(latest_package_data) = latest {
             metadata["public"] = latest_package_data["public"].clone();
             published_license = latest_package_data
                 .get("license")
@@ -631,7 +700,8 @@ pub async fn publish_command(yes: bool) -> Result<()> {
 
     // Prepare tarball. Platform-mandated exclusions (Roblox: every mount +
     // forest-lock.json when deps are declared) ride along here.
-    let matcher = load_forest_ignore(&cwd, &platform.publish_ignores(&mounts));
+    let matcher = load_forest_ignore(&cwd);
+    let forced = ForcedExcludes::new(&platform.publish_ignores(&mounts));
 
     // Platform pre-pack lint: the gateway hard-rejects these files, but
     // warning BEFORE the upload is the better error location.
@@ -639,7 +709,7 @@ pub async fn publish_command(yes: bool) -> Result<()> {
         msg.emit(MessageType::Warn, &warning);
     }
 
-    let tar_buf = create_tarball_buffer(&cwd, &matcher)
+    let tar_buf = create_tarball_buffer(&cwd, &matcher, &forced)
         .context("Failed to create package tarball")?;
 
     let file_size_bytes = tar_buf.len();
@@ -848,6 +918,10 @@ fn license_without_prompts(
 ) -> Result<String, String> {
     let declared = private_license(declared).map(|d| sanitize_spdx(&d).to_string());
     match (declared, detected) {
+        // UNLICENSED is what a private publish without a license file writes
+        // back. A recognized license file added since takes over, as it
+        // does interactively.
+        (Some(declared), Some((file_id, true))) if declared == PRIVATE_DEFAULT_LICENSE => Ok(file_id.to_string()),
         (Some(declared), Some((file_id, true))) => {
             let declared_is_spdx = crate::contracts::licenses().spdx_licenses.iter().any(|id| *id == declared);
             if declared_is_spdx && declared != file_id {
@@ -883,8 +957,8 @@ mod tests {
     use super::*;
 
     fn tarball_entries(dir: &Path, forced: &[String]) -> Vec<String> {
-        let matcher = load_forest_ignore(dir, forced);
-        let buf = create_tarball_buffer(dir, &matcher).unwrap();
+        let matcher = load_forest_ignore(dir);
+        let buf = create_tarball_buffer(dir, &matcher, &ForcedExcludes::new(forced)).unwrap();
         let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(buf.as_slice()));
         let mut entries: Vec<String> = archive
             .entries()
@@ -927,6 +1001,8 @@ mod tests {
     fn license_without_prompts_prefers_the_manifest_and_errors_where_a_prompt_would_ask() {
         // Declared wins, canonicalized; a matching recognized file is fine.
         assert_eq!(license_without_prompts(Some("mit"), Some(("MIT", true)), None, true).unwrap(), "MIT");
+        // A later license file replaces the UNLICENSED placeholder.
+        assert_eq!(license_without_prompts(Some("UNLICENSED"), Some(("MIT", true)), None, false).unwrap(), "MIT");
         // Two standard ids that disagree: the registry would reject it.
         assert!(license_without_prompts(Some("Apache-2.0"), Some(("MIT", true)), None, true).is_err());
         // A custom declaration alongside an unrecognized file stands.
@@ -1016,6 +1092,23 @@ mod tests {
         let entries = tarball_entries(&base, &[]);
         assert!(entries.contains(&"Packages/dep/init.lua".to_string()));
         assert!(entries.contains(&"forest-lock.json".to_string()));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn forced_ignores_match_a_mount_whose_folder_differs_in_case() {
+        // `forest mount create devpackages` adopting Wally's DevPackages/.
+        let base = std::env::temp_dir().join(format!("forest-publish-case-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("DevPackages").join("dep")).unwrap();
+        fs::create_dir_all(base.join("src [old]").join("Packages")).unwrap();
+        fs::write(base.join("forest.json"), "{}").unwrap();
+        fs::write(base.join("DevPackages").join("dep").join("init.lua"), "return {}").unwrap();
+        fs::write(base.join("src [old]").join("Packages").join("x.lua"), "return {}").unwrap();
+
+        let forced = vec!["/devpackages/".to_string(), "/src [old]/Packages/".to_string()];
+        assert_eq!(tarball_entries(&base, &forced), vec!["forest.json"]);
 
         let _ = fs::remove_dir_all(&base);
     }

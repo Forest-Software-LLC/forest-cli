@@ -197,10 +197,10 @@ impl Platform {
     /// Where the default mount (forest.json's top-level `dependencies`)
     /// installs, relative to the manifest dir. Roblox: next to the root
     /// file, named by `packagesDir`. UEFN: the shared ForestPackages mount.
-    pub fn default_mount_path(&self, manifest: &Value) -> String {
+    pub fn default_mount_path(&self, manifest: &Value) -> Result<String> {
         match self {
-            Platform::Roblox => crate::roblox::packages_base(manifest),
-            Platform::Uefn => crate::contracts::verse_rules().packages_mount.clone(),
+            Platform::Roblox => crate::roblox::checked_packages_base(manifest),
+            Platform::Uefn => Ok(crate::contracts::verse_rules().packages_mount.clone()),
         }
     }
 
@@ -219,6 +219,15 @@ impl Platform {
                 Ok(())
             }
             Platform::Uefn => Err(anyhow!("The UEFN packages folder can't be renamed.")),
+        }
+    }
+
+    /// Remove the `forest link` slots in a folder that is no longer a
+    /// mount, as links, never through them.
+    pub fn remove_link_slots(&self, path: &str) -> Result<usize> {
+        match self {
+            Platform::Roblox => crate::roblox::mount_dirs::remove_link_slots(path),
+            Platform::Uefn => Ok(0),
         }
     }
 
@@ -289,10 +298,10 @@ impl Platform {
         }
     }
 
-    /// Ignore patterns force-appended to the publish matcher AFTER
-    /// .gitignore/.forestignore, so they can't be un-ignored. Roblox excludes
-    /// every mount and `forest-lock.json` once any mount declares
-    /// dependencies.
+    /// Paths every publish leaves out (`/dir/` or `/file`), matched
+    /// literally and case-insensitively apart from .gitignore/.forestignore,
+    /// so they can't be un-ignored. Roblox excludes every mount and
+    /// `forest-lock.json` once any mount declares dependencies.
     pub fn publish_ignores(&self, mounts: &[Mount]) -> Vec<String> {
         match self {
             Platform::Roblox => crate::roblox::publish::publish_ignores(mounts),

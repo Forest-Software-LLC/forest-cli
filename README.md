@@ -51,7 +51,7 @@ forest mount remove src/server/Packages
 
 `-m`/`--mount` takes a folder path or any unique end of one (`server/Packages`), on `install`, `remove`, `update`, `audit`, `tree`, `link`, and `unlink`. Without it, `install` adds to the default folder (forest.json's top-level `dependencies`) and bulk commands cover every mount. Mounts never share packages, so the same package can sit in two at different versions. Only the default mount is published; the others exist for your project alone. Map each folder in your Rojo project as usual.
 
-Every mount belongs to forest the same way `Packages/` does.
+Every mount belongs to forest the same way `Packages/` does: install removes anything at its top level that isn't a package it installed. A folder forest has never installed into is refused instead when it holds other files, so a mistyped path in forest.json can't wipe source code.
 
 ## Coming from Wally
 

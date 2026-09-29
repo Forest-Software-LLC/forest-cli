@@ -172,6 +172,7 @@ pub async fn make_directories_roblox(
     let container = mount.name().to_string();
     let plan = plan_install(section, &root_deps, &container)?;
     let base = mount.path.clone();
+    check_takeover(&plan, &base, &container)?;
 
     // All mount deletions below go through the bin (see TrashBin) so a live
     // `rojo serve` never sees a child removal under an already-gone parent.
@@ -512,14 +513,7 @@ fn write_pointer(target_dir: &Path, init_lua: &str, trash: &mut TrashBin) -> Res
 /// mount is deleted. Returns the names of removed entries forest never
 /// installed (files and receipt-less dirs), for the caller to report.
 fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, container: &str, trash: &mut TrashBin) -> Result<Vec<String>> {
-    let prefix = format!("./{}/", container);
-    let desired: std::collections::HashSet<String> = plan.packages.iter()
-        .filter_map(|p| {
-            let rest = p.path.strip_prefix(&prefix)?;
-            if rest.contains('/') { None } else { Some(rest.to_ascii_lowercase()) }
-        })
-        .collect();
-
+    let desired = desired_top_level(plan, container);
     let mut foreign = Vec::new();
     for entry in fs::read_dir(base)? {
         let entry = entry?;
@@ -547,6 +541,48 @@ fn prune_top_level(plan: &crate::roblox::plan::InstallPlan, base: &str, containe
     }
     foreign.sort();
     Ok(foreign)
+}
+
+/// The mount's planned top-level names, lowercased.
+fn desired_top_level(plan: &crate::roblox::plan::InstallPlan, container: &str) -> std::collections::HashSet<String> {
+    let prefix = format!("./{}/", container);
+    plan.packages.iter()
+        .filter_map(|p| {
+            let rest = p.path.strip_prefix(&prefix)?;
+            if rest.contains('/') { None } else { Some(rest.to_ascii_lowercase()) }
+        })
+        .collect()
+}
+
+/// Refuse to take over a folder forest never installed into when the prune
+/// would delete things neither forest nor Wally put there. That folder may
+/// be source: a mount declared by hand in forest.json (`src/server` for
+/// `src/server/Packages`) or a packagesDir pointed at an existing folder.
+/// Once any package there carries a receipt the folder is forest's and
+/// strays are pruned as usual.
+fn check_takeover(plan: &crate::roblox::plan::InstallPlan, base: &str, container: &str) -> Result<()> {
+    let dir = Path::new(base);
+    if !dir.is_dir() || has_receipt_child(dir) {
+        return Ok(());
+    }
+    let desired = desired_top_level(plan, container);
+    let strays: Vec<String> = crate::roblox::mount_dirs::foreign_entries(dir)
+        .into_iter()
+        .filter(|name| !desired.contains(&name.to_ascii_lowercase()))
+        .collect();
+    if strays.is_empty() {
+        return Ok(());
+    }
+    let shown = if strays.len() > 5 {
+        format!("{}, and {} more", strays[..5].join(", "), strays.len() - 5)
+    } else {
+        strays.join(", ")
+    };
+    Err(anyhow!(
+        "{}/ holds files forest didn't install ({}). Installing replaces everything in a dependency folder, so forest left it alone. If this folder is meant for dependencies, move those files out and run the install again; otherwise fix the folder path in forest.json.",
+        base,
+        shown
+    ))
 }
 
 /// Find abandoned forest-managed mounts near the default one: an immediate
@@ -784,6 +820,49 @@ mod tests {
 
         assert!(mount.join("Knit").exists(), "desired alias survives under the renamed mount");
         assert!(!mount.join("Junk").exists(), "junk is still pruned");
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn takeover_refuses_a_source_folder_forest_never_installed_into() {
+        let base_dir = std::env::temp_dir().join(format!("forest-takeover-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base_dir);
+        let plan = knit_plan("server");
+
+        // `"mounts": { "src/server": {} }` meant for src/server/Packages.
+        let source = base_dir.join("src").join("server");
+        fs::create_dir_all(source.join("Services")).unwrap();
+        fs::write(source.join("Main.server.luau"), "print(1)").unwrap();
+        let err = check_takeover(&plan, &source.to_string_lossy(), "server").unwrap_err();
+        assert!(err.to_string().contains("Main.server.luau, Services"), "{}", err);
+        assert!(source.join("Main.server.luau").exists(), "nothing is touched");
+
+        // Wally leftovers and a receipt-less dir the plan installs into are
+        // fine: those are a package manager's, not source.
+        let wally = base_dir.join("Packages");
+        fs::create_dir_all(wally.join("_Index")).unwrap();
+        fs::create_dir_all(wally.join("Knit")).unwrap();
+        fs::write(wally.join("Knit.lua"), "return require(script.Parent._Index[\"x\"][\"knit\"])\n").unwrap();
+        check_takeover(&knit_plan("Packages"), &wally.to_string_lossy(), "Packages").unwrap();
+
+        // Once a package there carries a receipt the folder is forest's, and
+        // strays are the prune's business.
+        let owned = base_dir.join("Owned");
+        let pkg = owned.join("Trove");
+        fs::create_dir_all(&pkg).unwrap();
+        crate::receipts::write(&pkg, &crate::receipts::Receipt {
+            name: "acme/trove".into(),
+            version: "1.0.0".into(),
+            integrity: "cc".into(),
+            root: "init.luau".into(),
+            container: "Owned".into(),
+        })
+        .unwrap();
+        fs::write(owned.join("Util.lua"), "return {}").unwrap();
+        check_takeover(&knit_plan("Owned"), &owned.to_string_lossy(), "Owned").unwrap();
+
+        // A folder that doesn't exist yet has nothing to lose.
+        check_takeover(&plan, &base_dir.join("missing").to_string_lossy(), "missing").unwrap();
         let _ = fs::remove_dir_all(&base_dir);
     }
 

@@ -116,9 +116,18 @@ pub async fn mount_remove(reference: String, yes: bool) -> Result<()> {
         plural(mount.deps.len(), "dependency", "dependencies"),
         mount.path
     );
-    if !yes && !super::overrides::confirm(&prompt) {
-        info("Mount not removed. Pass --yes to skip the prompt.");
-        return Ok(());
+    if !yes {
+        // Deleting a folder: Enter alone must not do it, and a script that
+        // can't answer gets an error, not a silent no.
+        let confirmed = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt(&prompt)
+            .default(false)
+            .interact()
+            .map_err(|_| anyhow!("Can't ask for confirmation here. Pass --yes to remove mount {}.", mount.path))?;
+        if !confirmed {
+            info("Mount not removed. Pass --yes to skip the prompt.");
+            return Ok(());
+        }
     }
 
     // The folder goes first: if that fails, nothing else has changed.

@@ -217,9 +217,9 @@ pub struct SolveReport {
     /// Excludes that removed nothing any range would have picked; natural
     /// resolution already lands outside the banned set.
     pub exclude_inert: Vec<String>,
-    /// Private packages the registry refused (no access to the scope) that
-    /// were resolved from forest-lock.json's pins instead, as `name@version`.
-    pub locked_private: Vec<String>,
+    /// Private packages the registry refused that were resolved from
+    /// forest-lock.json's pins instead, as `name@version`, with why.
+    pub locked_private: Vec<(String, crate::install_report::DenyReason)>,
 }
 
 /// Private packages from the current forest-lock.json, keyed lowercased.
@@ -273,7 +273,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
     // cache can't satisfy (publish then install).
     let mut fresh_retried: HashSet<String> = HashSet::new();
     // Lowercased keys resolved from forest-lock.json pins (see LockedPrivate).
-    let mut carried: HashSet<String> = HashSet::new();
+    let mut carried: HashMap<String, crate::install_report::DenyReason> = HashMap::new();
 
     // Overrides force every transitive edge to a package onto one range,
     // replacing the parent's declared range. Root deps are never rewritten:
@@ -353,10 +353,18 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
                 package_state_from_list(&version_data, &name.full_name)?
             } else {
                 // Refused, but the lockfile pins it: resolve from the pins.
-                let refused = crate::install_report::DenyReason::from_status(versions_status).is_some();
-                match locked_private.get(&key).filter(|_| refused) {
-                    Some((canonical, entries)) => {
-                        carried.insert(key.clone());
+                // Anonymous requests for private packages 404, so without a
+                // credential the fix is logging in, not asking for access.
+                let refused = crate::install_report::DenyReason::from_status(versions_status).map(|reason| {
+                    if reason == crate::install_report::DenyReason::NoAccess && !crate::api_token::has_credential() {
+                        crate::install_report::DenyReason::NotLoggedIn
+                    } else {
+                        reason
+                    }
+                });
+                match refused.and_then(|reason| locked_private.get(&key).map(|pins| (reason, pins))) {
+                    Some((reason, (canonical, entries))) => {
+                        carried.insert(key.clone(), reason);
                         carried_package_state(canonical, entries)
                     }
                     None => return Err(version_list_error(&name.full_name, versions_status, &version_data)),
@@ -384,7 +392,7 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
             .filter(|v| !version_excluded(exclude_req, v))
             .cloned()
             .collect();
-        if matches.is_empty() && carried.contains(&key) {
+        if matches.is_empty() && carried.contains_key(&key) {
             let mut locked: Vec<&str> = pkg_state.versions.keys().map(String::as_str).collect();
             locked.sort();
             anyhow::bail!(
@@ -810,10 +818,10 @@ async fn resolve_lockfile_packages(root_deps: HashMap<String, DepSpec>, override
             report.exclude_inert.push(key.clone());
         }
     }
-    for key in &carried {
+    for (key, reason) in &carried {
         let state = &resolved[key];
         for v in state.buckets.keys() {
-            report.locked_private.push(format!("{}@{}", state.canonical, v));
+            report.locked_private.push((format!("{}@{}", state.canonical, v), *reason));
         }
     }
     report.locked_private.sort();

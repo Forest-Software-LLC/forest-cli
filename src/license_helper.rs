@@ -31,17 +31,22 @@ pub fn get_mit_license_text(copyright_holder: &str) -> String {
         .replace("{HOLDER}", copyright_holder)
 }
 
+/// The package's license file, matched case-insensitively (`License.md`,
+/// `license`) the way the gateway does, so a Linux publish finds the same
+/// file Windows and macOS do. Candidate order breaks ties.
 fn find_license_file(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut found_license_path = None;
-    for name in &LICENSE_CANDIDATES {
-        let p = cwd.join(name);
-        if p.exists() {
-            found_license_path = Some(p);
-            break;
-        }
-    }
-
-    return found_license_path;
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(cwd)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().map_or(false, |t| t.is_file()))
+        .map(|e| e.path())
+        .collect();
+    LICENSE_CANDIDATES.iter().find_map(|candidate| {
+        files
+            .iter()
+            .find(|p| p.file_name().map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case(candidate)))
+            .cloned()
+    })
 }
 
 /// Contract normalization: lowercase + collapse every whitespace run to a
@@ -136,6 +141,19 @@ pub fn extract_license_info(package_info: &serde_json::Value, pkg_label: &str) -
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn license_file_is_found_in_any_case() {
+        let dir = std::env::temp_dir().join(format!("forest-license-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("LICENSE")).unwrap(); // a dir never counts
+        assert_eq!(find_license_file(&dir), None);
+        std::fs::write(dir.join("Copying"), "x").unwrap();
+        std::fs::write(dir.join("License.md"), "x").unwrap();
+        let found = find_license_file(&dir).unwrap();
+        assert_eq!(found.file_name().unwrap(), "License.md", "candidate order breaks ties");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn extracts_rating_and_caveats_from_version_response() {

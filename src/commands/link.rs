@@ -238,11 +238,33 @@ pub async fn unlink_command(reference: Option<String>, all: bool, mount: Option<
     };
     let platform = project.platform;
     let mounts = crate::mounts::project_mounts(&project.manifest, platform)?;
-    let scope = mount.as_deref().map(|r| crate::mounts::find_mount(&mounts, r)).transpose()?;
+    let stored_all = links::stored_links();
+    // The mount a --mount flag picks, as a stored link records it (None =
+    // default). It may name a folder forest.json no longer declares, to
+    // clean up links into it; `forest link` lists those with that hint.
+    let scope: Option<Option<String>> = match mount.as_deref() {
+        None => None,
+        Some(reference) => match crate::mounts::find_mount(&mounts, reference) {
+            Ok(m) => Some((!m.is_default()).then(|| m.path.clone())),
+            Err(e) => {
+                let wanted = reference.trim().replace('\\', "/");
+                let wanted = wanted.trim_end_matches('/');
+                match stored_all.iter().filter_map(|l| l.mount.as_ref()).find(|p| p.eq_ignore_ascii_case(wanted)) {
+                    Some(path) => Some(Some(path.clone())),
+                    None => return Err(e),
+                }
+            }
+        },
+    };
 
-    let stored: Vec<links::StoredLink> = links::stored_links()
+    let stored: Vec<links::StoredLink> = stored_all
         .into_iter()
-        .filter(|l| scope.map_or(true, |m| l.belongs_to(m)))
+        .filter(|l| match (&scope, &l.mount) {
+            (None, _) => true,
+            (Some(None), None) => true,
+            (Some(Some(want)), Some(have)) => want.eq_ignore_ascii_case(have),
+            _ => false,
+        })
         .collect();
     if stored.is_empty() {
         info("No active links.");
@@ -295,16 +317,19 @@ pub async fn unlink_command(reference: Option<String>, all: bool, mount: Option<
     // (re-extracted from the verified cache). Junctions are removed as
     // links, never through them; copy-mode slots (real dirs) go through the
     // trash bin so a live rojo never sees in-place child deletions. A link
-    // whose mount is gone has no slot forest still manages.
+    // into a folder that is no longer a mount keeps its slot there until
+    // this (or a full install) removes it.
     if platform == Platform::Roblox {
         let mut trash = crate::roblox::scratch::TrashBin::new(crate::roblox::scratch::scratch_dirs().trash);
         for link in &removed {
-            let Some(link_mount) = mounts.iter().find(|m| link.belongs_to(m)) else {
-                continue;
+            let (base, container, spec) = match mounts.iter().find(|m| link.belongs_to(m)) {
+                Some(m) => (m.path.clone(), m.name().to_string(), crate::utils::get_ci(&m.deps, &link.name)),
+                None => match &link.mount {
+                    Some(path) => (path.clone(), path.rsplit('/').next().unwrap_or(path).to_string(), None),
+                    None => continue,
+                },
             };
-            let base = link_mount.path.clone();
-            let container = link_mount.name().to_string();
-            if let Some(spec) = crate::utils::get_ci(&link_mount.deps, &link.name) {
+            if let Some(spec) = spec {
                 let slot = crate::roblox::physical_path(
                     &base,
                     &container,

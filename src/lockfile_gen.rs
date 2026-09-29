@@ -7,7 +7,7 @@
 //! platform-owned (`Platform::install`); nothing here is platform-specific.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{Map, Value};
@@ -17,6 +17,7 @@ use reqwest::Method;
 use crate::http::packages_api_request;
 use crate::license_helper::LicenseInfo;
 use crate::lockfile::{LockFile, LockSection, LockState};
+use crate::install_report::DenyReason;
 use crate::lockfile_solver::{get_lockfile_packages, locked_private, DepSpec, SolveReport};
 use crate::message::{Message, MessageType};
 use crate::mounts::Mount;
@@ -237,6 +238,31 @@ async fn sync_mounts(manifest: &Value, msg: &mut Message, opts: &SyncOptions) ->
     if opts.frozen && (targets.iter().any(|t| t.section.is_none()) || drop_orphans) {
         bail!("--frozen: forest-lock.json is missing or out of date with forest.json. Run `forest install` locally and commit the lockfile.");
     }
+    // Local links into a folder that is no longer a mount can't apply, and
+    // their junctions would sit in a folder the user may delete with a tool
+    // that deletes through them. A full run clears both.
+    if opts.only.is_none() {
+        let mut stale_links: Vec<String> = crate::links::stored_links()
+            .into_iter()
+            .filter_map(|l| l.mount)
+            .filter(|path| !mounts.iter().any(|m| !m.is_default() && m.path.eq_ignore_ascii_case(path)))
+            .collect();
+        stale_links.sort_by_key(|p| p.to_ascii_lowercase());
+        stale_links.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        for path in &stale_links {
+            platform.remove_link_slots(path)?;
+            let dropped = crate::links::drop_mount_links(Path::new("."), path)?;
+            msg.emit(
+                MessageType::Info,
+                &format!(
+                    "Dropped {} local link{} into {}/, which is no longer a mount.",
+                    dropped.len(),
+                    if dropped.len() == 1 { "" } else { "s" },
+                    path
+                ),
+            );
+        }
+    }
     if opts.announce && !stale.is_empty() {
         let note = if mounts.len() == 1 {
             "forest.json dependencies changed; updating forest-lock.json.".to_string()
@@ -300,7 +326,18 @@ async fn sync_mounts(manifest: &Value, msg: &mut Message, opts: &SyncOptions) ->
         target.resolved = true;
     }
     if !reports.is_empty() {
-        report_solve(&merge_reports(reports), msg);
+        let every_mount = reports.len() == mounts.len();
+        let mut report = merge_reports(reports);
+        // Calling an override or exclusion unused or unneeded takes every
+        // mount's graph. A mount kept from the lockfile or left out of the
+        // run wasn't consulted and may be the one relying on it.
+        if !every_mount {
+            report.override_unused.clear();
+            report.override_unnecessary.clear();
+            report.exclude_unused.clear();
+            report.exclude_inert.clear();
+        }
+        report_solve(&report, msg);
     }
 
     // Surface registry license-safety ratings for anything caution/unsafe in
@@ -399,14 +436,22 @@ pub fn move_mount_section(old_path: &str, new_path: Option<&str>) -> Result<()> 
 /// The solver's notes on overrides, excludes, and private pins, once per
 /// run however many mounts resolved.
 fn report_solve(report: &SolveReport, msg: &mut Message) {
-    for pinned in &report.locked_private {
-        msg.emit(
-            MessageType::Warn,
-            &format!(
-                "No access to private package {}; kept the version pinned in forest-lock.json. You need to be authorized by the package maintainer to update it.",
+    for (pinned, reason) in &report.locked_private {
+        let text = match reason {
+            DenyReason::NotLoggedIn => format!(
+                "Not logged in, so private package {} kept the version pinned in forest-lock.json. Run `forest login` to update it.",
                 pinned
             ),
-        );
+            DenyReason::SessionRejected => format!(
+                "Your login was rejected, so private package {} kept the version pinned in forest-lock.json. Run `forest login` to update it.",
+                pinned
+            ),
+            DenyReason::NoAccess => format!(
+                "No access to private package {} (your account can't read it, or it no longer exists); kept the version pinned in forest-lock.json. Ask its maintainer for access to update it.",
+                pinned
+            ),
+        };
+        msg.emit(MessageType::Warn, &text);
     }
     if report.override_edges > 0 {
         msg.emit(
@@ -468,7 +513,7 @@ fn merge_reports(reports: Vec<SolveReport>) -> SolveReport {
         keys.dedup();
         keys
     };
-    let mut locked_private: Vec<String> = reports.iter().flat_map(|r| r.locked_private.iter().cloned()).collect();
+    let mut locked_private: Vec<(String, DenyReason)> = reports.iter().flat_map(|r| r.locked_private.iter().cloned()).collect();
     locked_private.sort();
     locked_private.dedup();
     SolveReport {
@@ -711,7 +756,7 @@ mod tests {
             override_unnecessary: keys(&["a/loose"]),
             exclude_unused: keys(&["b/unused"]),
             exclude_inert: keys(&["b/inert"]),
-            locked_private: keys(&["p/q@1.0.0"]),
+            locked_private: vec![("p/q@1.0.0".to_string(), DenyReason::NoAccess)],
         };
         let merged = merge_reports(vec![report]);
         assert_eq!(merged.override_edges, 3);
@@ -719,7 +764,7 @@ mod tests {
         assert_eq!(merged.override_unnecessary, keys(&["a/loose"]));
         assert_eq!(merged.exclude_unused, keys(&["b/unused"]));
         assert_eq!(merged.exclude_inert, keys(&["b/inert"]));
-        assert_eq!(merged.locked_private, keys(&["p/q@1.0.0"]));
+        assert_eq!(merged.locked_private, vec![("p/q@1.0.0".to_string(), DenyReason::NoAccess)]);
     }
 
     #[test]
