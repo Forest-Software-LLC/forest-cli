@@ -18,14 +18,27 @@ pub fn remove_mount_dir(path: &str) -> Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }
-    for entry in fs::read_dir(dir)?.flatten() {
+    remove_link_slots(path)?;
+    let mut trash = TrashBin::new(scratch_dirs().trash);
+    trash.remove_dir_all(dir).with_context(|| format!("Failed to remove {}", path))
+}
+
+/// Remove the `forest link` slots at a folder's top level, as links. They
+/// point into a developer's working tree, and some tools delete through a
+/// junction (PowerShell 5.1's Remove-Item does). Returns how many went.
+pub fn remove_link_slots(path: &str) -> Result<usize> {
+    let Ok(entries) = fs::read_dir(path) else {
+        return Ok(0);
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
         if is_link_dir(&entry.path()) {
             remove_link_path(&entry.path())
                 .with_context(|| format!("Failed to remove link at {}", entry.path().display()))?;
+            removed += 1;
         }
     }
-    let mut trash = TrashBin::new(scratch_dirs().trash);
-    trash.remove_dir_all(dir).with_context(|| format!("Failed to remove {}", path))
+    Ok(removed)
 }
 
 /// Move a mount folder, creating the new parent folders. A folder that was

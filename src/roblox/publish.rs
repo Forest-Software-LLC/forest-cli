@@ -31,39 +31,50 @@ pub fn publish_preflight(cwd: &Path, forest_json: &mut Value, interactive: bool)
     // Roblox uses `.luau`, but `.lua` is still valid, so accept either.
     const INIT_FILES: [&str; 2] = ["init.luau", "init.lua"];
 
-    let mut init_lua_path = match forest_json["root"].as_str() {
+    // A declared root is never swapped for a guess: a stale one is an
+    // error (or a prompt), not a different entry point published quietly.
+    let declared_root = forest_json["root"].as_str().map(String::from);
+    let mut init_lua_path = match &declared_root {
         Some(root) => cwd.join(root),
         None => cwd.join(INIT_FILES[0]),
     };
-    if !init_lua_path.exists() {
-        let mut found: Option<PathBuf> = None;
-
-        // Top level first.
-        for candidate in INIT_FILES {
-            let top = cwd.join(candidate);
-            if top.exists() {
-                found = Some(top);
-                break;
-            }
+    if let Some(root) = declared_root.as_ref().filter(|_| !init_lua_path.exists()) {
+        if !interactive {
+            anyhow::bail!(
+                "forest.json root \"{}\" doesn't exist. Point \"root\" at the package's root module.",
+                root
+            );
         }
-
-        // Then one directory deep.
+        warn(&format!("forest.json root \"{}\" doesn't exist.", root));
+    }
+    if declared_root.is_none() && !init_lua_path.exists() {
+        // Top level first, then one directory deep. Sorted, and more than
+        // one nested candidate is ambiguous rather than whichever the
+        // filesystem lists first.
+        let mut found: Option<PathBuf> = INIT_FILES.iter().map(|c| cwd.join(c)).find(|p| p.exists());
         if found.is_none() {
-            'search: for entry in fs::read_dir(cwd)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() {
-                    for candidate in INIT_FILES {
-                        let nested_init = path.join(candidate);
-                        if nested_init.exists() {
-                            found = Some(nested_init);
-                            break 'search;
-                        }
-                    }
-                }
+            let mut dirs: Vec<PathBuf> = fs::read_dir(cwd)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir())
+                .collect();
+            dirs.sort();
+            let nested: Vec<PathBuf> = dirs
+                .iter()
+                .filter_map(|dir| INIT_FILES.iter().map(|c| dir.join(c)).find(|p| p.exists()))
+                .collect();
+            match nested.as_slice() {
+                [only] => found = Some(only.clone()),
+                [] => {}
+                many if !interactive => anyhow::bail!(
+                    "Found several possible root modules ({}). Set \"root\" in forest.json to the right one.",
+                    many.iter()
+                        .map(|p| p.strip_prefix(cwd).unwrap_or(p).to_string_lossy().replace('\\', "/"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => {}
             }
         }
-
         if let Some(p) = found {
             init_lua_path = p;
         }
@@ -75,7 +86,9 @@ pub fn publish_preflight(cwd: &Path, forest_json: &mut Value, interactive: bool)
         );
     }
     if !init_lua_path.exists() {
-        warn("Failed to resolve root for init.luau/init.lua");
+        if declared_root.is_none() {
+            warn("Failed to resolve root for init.luau/init.lua");
+        }
         let cwd_owned = cwd.to_path_buf();
         let target_root: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("Root file (init.luau or init.lua) not found. Please provide the relative path to your root file. (e.g. src/init.luau)")
@@ -102,7 +115,7 @@ pub fn publish_preflight(cwd: &Path, forest_json: &mut Value, interactive: bool)
     Ok(Preflight::Continue)
 }
 
-/// Ignore patterns forced onto the publish matcher: when any mount declares
+/// Paths forced out of the publish tarball: when any mount declares
 /// dependencies, every mount and the lockfile are install artifacts, not
 /// package content; consumers regenerate the default mount from the
 /// manifest, and packing them would ship resolved dependencies inside the

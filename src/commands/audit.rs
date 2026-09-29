@@ -1,5 +1,5 @@
 use std::{collections::HashMap, fs};
-use anyhow::Result;
+use anyhow::{bail, Result};
 use colored::Colorize;
 use reqwest::Method;
 use semver::{Version, VersionReq};
@@ -194,6 +194,16 @@ pub async fn audit_command(target_package: Option<String>, update: bool, mount: 
         None => AuditTarget::All,
         Some(raw) => match crate::mounts::locate_dep(&mounts, scope, raw) {
             DepLocation::Found(m, key) => AuditTarget::Roots(vec![(index_of(m), key)]),
+            // Reporting on every mount is fine; rewriting ranges in all of
+            // them from one name is too broad, as with remove.
+            DepLocation::InSeveral(found) if update => {
+                msg.destroy();
+                bail!(
+                    "{} is a dependency of several mounts: {}. Pick one with --mount.",
+                    raw,
+                    DepLocation::several_paths(&found)
+                );
+            }
             DepLocation::InSeveral(found) => {
                 AuditTarget::Roots(found.into_iter().map(|(m, key)| (index_of(m), key)).collect())
             }
@@ -213,7 +223,11 @@ pub async fn audit_command(target_package: Option<String>, update: bool, mount: 
                 // lockfile's resolved trees (full key or bare name; lockfile
                 // entries carry no aliases).
                 let name = raw.as_str();
-                let keys = lockfile.as_ref().map(LockFile::package_keys).unwrap_or_default();
+                let keys: Vec<String> = match (&lockfile, scope) {
+                    (Some(lf), Some(m)) => lf.section(m).map(|s| s.packages.keys().cloned().collect()).unwrap_or_default(),
+                    (Some(lf), None) => lf.package_keys(),
+                    (None, _) => Vec::new(),
+                };
                 let candidates: Vec<&String> = keys
                     .iter()
                     .filter(|k| {
@@ -352,7 +366,7 @@ pub async fn audit_command(target_package: Option<String>, update: bool, mount: 
         let sections: Vec<&LockSection> = match &target {
             AuditTarget::All => audited.iter().filter_map(|&i| lf.section(&mounts[i])).collect(),
             AuditTarget::Roots(roots) => roots.iter().filter_map(|(i, _)| lf.section(&mounts[*i])).collect(),
-            AuditTarget::Transitive(_) => lf.sections().collect(),
+            AuditTarget::Transitive(_) => audited.iter().filter_map(|&i| lf.section(&mounts[i])).collect(),
         };
         for section in sections {
             for (name, entries) in &section.packages {

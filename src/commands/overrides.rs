@@ -11,7 +11,7 @@ use crate::http::api_request;
 use crate::lockfile::LockFile;
 use crate::lockfile_gen::{sync_or_restore, Refresh, SyncOptions};
 use crate::lockfile_solver::DepSpec;
-use crate::message::{self, Message, MessageType};
+use crate::message::{self, Message};
 use crate::utils::{
     digest_package_name, normalize_forest_excludes, normalize_forest_overrides, resolve_dep_ref,
     DepRef,
@@ -44,16 +44,14 @@ pub async fn override_command(
     remove: bool,
 ) -> Result<()> {
     let Some(project) = super::context::load_project()? else {
-        message::fail("No forest.json found. Run `forest init` to create a new package.");
-        return Ok(());
+        anyhow::bail!("No forest.json found. Run `forest init` to create a new package.");
     };
     let mut manifest = project.manifest;
     let overrides = normalize_forest_overrides(&manifest);
 
     let Some(reference) = package else {
         if remove || range.is_some() {
-            message::fail("Specify which package: forest override <scope/name> [--range <range>] [--remove]");
-            return Ok(());
+            anyhow::bail!("Specify which package: forest override <scope/name> [--range <range>] [--remove]");
         }
         list_overrides(&overrides);
         return Ok(());
@@ -61,8 +59,7 @@ pub async fn override_command(
 
     if remove {
         if range.is_some() {
-            message::fail("--range and --remove cannot be combined.");
-            return Ok(());
+            anyhow::bail!("--range and --remove cannot be combined.");
         }
         return remove_override(&mut manifest, &overrides, &reference).await;
     }
@@ -82,11 +79,10 @@ pub async fn override_command(
     if existing_key.is_none() {
         match resolve_dep_ref(&roots, &reference) {
             DepRef::Match(key) => {
-                message::fail(&format!(
+                anyhow::bail!(
                     "{} is a direct dependency; change its range with `forest install {} -v <version>` or edit forest.json. To ban specific versions of it instead, use `forest exclude {}`.",
                     key, key, key
-                ));
-                return Ok(());
+                );
             }
             DepRef::Ambiguous(_) => {} // Fall through: full scope/name is required below anyway.
             DepRef::NotFound => {}
@@ -108,11 +104,10 @@ pub async fn override_command(
             match candidates.as_slice() {
                 [key] => (*key).clone(),
                 [] => {
-                    message::fail(&format!(
+                    anyhow::bail!(
                         "\"{}\" is not in the installed tree. Use the full <scope>/<name>.",
                         reference
-                    ));
-                    return Ok(());
+                    );
                 }
                 many => {
                     let mut keys: Vec<&str> = many.iter().map(|k| k.as_str()).collect();
@@ -130,10 +125,7 @@ pub async fn override_command(
 
     // Fetch the version list once; the wizard loop validates against it
     // locally. The response also carries the canonical stored casing.
-    let (canonical, versions) = match fetch_versions(&full_name, &platform).await? {
-        Some(res) => res,
-        None => return Ok(()),
-    };
+    let (canonical, versions) = fetch_versions(&full_name, &platform).await?;
 
     // Validate and preview against the pool the solver can actually pick
     // from: versions banned by a declared exclusion are dropped up front,
@@ -142,11 +134,10 @@ pub async fn override_command(
     let (versions, banned) = drop_excluded_versions(versions, &excludes, &canonical);
     if let Some((exclude_range, removed)) = banned {
         if versions.is_empty() {
-            message::fail(&format!(
+            anyhow::bail!(
                 "Every published version of {} is banned by the excludes entry \"{}\"; remove or narrow it with `forest exclude {}` first.",
                 canonical, exclude_range, canonical
-            ));
-            return Ok(());
+            );
         }
         message::info(&format!(
             "Excludes entry \"{}\" bans {} published version{} of {}; the override cannot pick them.",
@@ -172,8 +163,7 @@ pub async fn override_command(
         Some(r) => match validate_range(&r, &versions, &canonical) {
             Ok(_) => r,
             Err(reason) => {
-                message::fail(&reason);
-                return Ok(());
+                anyhow::bail!("{}", reason);
             }
         },
         None => {
@@ -194,8 +184,7 @@ pub async fn override_command(
                 {
                     Ok(v) => v,
                     Err(_) => {
-                        message::fail("Interactive prompt unavailable; pass the range with --range.");
-                        return Ok(());
+                        anyhow::bail!("Interactive prompt unavailable; pass the range with --range.");
                     }
                 };
                 match validate_range(input.trim(), &versions, &canonical) {
@@ -231,15 +220,14 @@ pub async fn override_command(
     let slot_key = match_override_key(&overrides, &canonical).unwrap_or_else(|| canonical.clone());
     write_map_entry(&mut manifest, "overrides", slot_key, &new_range)?;
 
-    if reinstall_or_rollback(&manifest, &manifest_before).await? {
-        message::success(&format!("Override set: {} -> {}", canonical, new_range));
-    }
+    reinstall_or_rollback(&manifest, &manifest_before).await?;
+    message::success(&format!("Override set: {} -> {}", canonical, new_range));
     Ok(())
 }
 
 /// Fetch a package's published version list (sorted ascending) plus its
-/// canonical scope/name casing. `Ok(None)` = failure already reported.
-pub(crate) async fn fetch_versions(full_name: &str, platform: &str) -> Result<Option<(String, Vec<Version>)>> {
+/// canonical scope/name casing.
+pub(crate) async fn fetch_versions(full_name: &str, platform: &str) -> Result<(String, Vec<Version>)> {
     let msg = Message::new(&format!("Fetching versions for {}...", full_name));
     let pkg = digest_package_name(full_name);
     let endpoint = format!(
@@ -251,16 +239,13 @@ pub(crate) async fn fetch_versions(full_name: &str, platform: &str) -> Result<Op
     let (data, status) = match api_request(&endpoint, Method::GET, None, None).await {
         Ok(res) => res,
         Err(e) => {
-            msg.finish(MessageType::Fail, &format!("Failed to fetch package info for {}: {}", full_name, e));
-            return Ok(None);
+            msg.destroy();
+            anyhow::bail!("Failed to fetch package info for {}: {}", full_name, e);
         }
     };
     if !status.is_success() {
-        msg.finish(
-            MessageType::Fail,
-            &format!("Failed to fetch package info for {}: HTTP {}{}", full_name, status, crate::lockfile_solver::not_found_hint(status)),
-        );
-        return Ok(None);
+        msg.destroy();
+        anyhow::bail!("Failed to fetch package info for {}: HTTP {}{}", full_name, status, crate::lockfile_solver::not_found_hint(status));
     }
     msg.destroy();
 
@@ -284,10 +269,9 @@ pub(crate) async fn fetch_versions(full_name: &str, platform: &str) -> Result<Op
         .unwrap_or_default();
     versions.sort();
     if versions.is_empty() {
-        message::fail(&format!("No published versions found for {}.", canonical));
-        return Ok(None);
+        anyhow::bail!("No published versions found for {}.", canonical);
     }
-    Ok(Some((canonical, versions)))
+    Ok((canonical, versions))
 }
 
 pub(crate) fn confirm(prompt: &str) -> bool {
@@ -400,14 +384,12 @@ async fn remove_override(
     reference: &str,
 ) -> Result<()> {
     let Some(key) = match_override_key(overrides, reference) else {
-        message::fail(&format!("No override declared for {}.", reference));
-        return Ok(());
+        anyhow::bail!("No override declared for {}.", reference);
     };
     let manifest_before = fs::read_to_string("forest.json")?;
     remove_map_entry(manifest, "overrides", &key)?;
-    if reinstall_or_rollback(manifest, &manifest_before).await? {
-        message::success(&format!("Override removed: {}", key));
-    }
+    reinstall_or_rollback(manifest, &manifest_before).await?;
+    message::success(&format!("Override removed: {}", key));
     Ok(())
 }
 
@@ -443,21 +425,13 @@ pub(crate) fn lockfile_package_keys() -> Vec<String> {
 /// Re-resolve and reinstall under the updated manifest, like `audit --update`.
 /// The recorded overrides/excludes changed, so every mount resolves again.
 /// On failure the pre-change manifest is restored, so a constraint that
-/// can't resolve (or a network hiccup) never leaves forest.json poisoned;
-/// the caller should stop after a `false` return.
-pub(crate) async fn reinstall_or_rollback(manifest: &Value, manifest_before: &str) -> Result<bool> {
+/// can't resolve (or a network hiccup) never leaves forest.json poisoned,
+/// and the error fails the command.
+pub(crate) async fn reinstall_or_rollback(manifest: &Value, manifest_before: &str) -> Result<()> {
     let mut msg = Message::new("Updating packages...");
-    match sync_or_restore(manifest, manifest_before, &mut msg, &SyncOptions::new(None, Refresh::Stale)).await {
-        Ok(_) => {
-            msg.destroy();
-            Ok(true)
-        }
-        Err(e) => {
-            msg.destroy();
-            message::fail(&format!("{:#}", e));
-            Ok(false)
-        }
-    }
+    let result = sync_or_restore(manifest, manifest_before, &mut msg, &SyncOptions::new(None, Refresh::Stale)).await;
+    msg.destroy();
+    result.map(|_| ())
 }
 
 #[cfg(test)]

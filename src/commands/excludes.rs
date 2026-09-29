@@ -32,16 +32,14 @@ pub async fn exclude_command(
     remove: bool,
 ) -> Result<()> {
     let Some(project) = super::context::load_project()? else {
-        message::fail("No forest.json found. Run `forest init` to create a new package.");
-        return Ok(());
+        anyhow::bail!("No forest.json found. Run `forest init` to create a new package.");
     };
     let mut manifest = project.manifest;
     let excludes = normalize_forest_excludes(&manifest);
 
     let Some(reference) = package else {
         if remove || range.is_some() {
-            message::fail("Specify which package: forest exclude <scope/name> [--range <range>] [--remove]");
-            return Ok(());
+            anyhow::bail!("Specify which package: forest exclude <scope/name> [--range <range>] [--remove]");
         }
         list_excludes(&excludes);
         return Ok(());
@@ -49,18 +47,15 @@ pub async fn exclude_command(
 
     if remove {
         if range.is_some() {
-            message::fail("--range and --remove cannot be combined.");
-            return Ok(());
+            anyhow::bail!("--range and --remove cannot be combined.");
         }
         let Some(key) = match_override_key(&excludes, &reference) else {
-            message::fail(&format!("No exclusion declared for {}.", reference));
-            return Ok(());
+            anyhow::bail!("No exclusion declared for {}.", reference);
         };
         let manifest_before = fs::read_to_string("forest.json")?;
         remove_map_entry(&mut manifest, "excludes", &key)?;
-        if reinstall_or_rollback(&manifest, &manifest_before).await? {
-            message::success(&format!("Exclusion removed: {}", key));
-        }
+        reinstall_or_rollback(&manifest, &manifest_before).await?;
+        message::success(&format!("Exclusion removed: {}", key));
         return Ok(());
     }
 
@@ -98,11 +93,10 @@ pub async fn exclude_command(
                 match candidates.as_slice() {
                     [key] => (*key).clone(),
                     [] => {
-                        message::fail(&format!(
+                        anyhow::bail!(
                             "\"{}\" is not in the installed tree. Use the full <scope>/<name>.",
                             reference
-                        ));
-                        return Ok(());
+                        );
                     }
                     many => {
                         let mut keys: Vec<&str> = many.iter().map(|k| k.as_str()).collect();
@@ -119,10 +113,7 @@ pub async fn exclude_command(
         },
     };
 
-    let (canonical, versions) = match fetch_versions(&full_name, &platform).await? {
-        Some(res) => res,
-        None => return Ok(()),
-    };
+    let (canonical, versions) = fetch_versions(&full_name, &platform).await?;
 
     let current_exclude = match_override_key(&excludes, &canonical).map(|k| excludes[&k].clone());
 
@@ -131,8 +122,7 @@ pub async fn exclude_command(
         Some(r) => match validate_exclude_range(&r, &versions, &canonical) {
             Ok(check) => (r, check),
             Err(reason) => {
-                message::fail(&reason);
-                return Ok(());
+                anyhow::bail!("{}", reason);
             }
         },
         None => {
@@ -147,8 +137,7 @@ pub async fn exclude_command(
                 {
                     Ok(v) => v,
                     Err(_) => {
-                        message::fail("Interactive prompt unavailable; pass the range with --range.");
-                        return Ok(());
+                        anyhow::bail!("Interactive prompt unavailable; pass the range with --range.");
                     }
                 };
                 match validate_exclude_range(input.trim(), &versions, &canonical) {
@@ -196,9 +185,7 @@ pub async fn exclude_command(
     let slot_key = match_override_key(&excludes, &canonical).unwrap_or_else(|| canonical.clone());
     write_map_entry(&mut manifest, "excludes", slot_key, &new_range)?;
 
-    if !reinstall_or_rollback(&manifest, &manifest_before).await? {
-        return Ok(());
-    }
+    reinstall_or_rollback(&manifest, &manifest_before).await?;
 
     // The honest preview: what the versions actually became.
     let after = installed_versions(&canonical);

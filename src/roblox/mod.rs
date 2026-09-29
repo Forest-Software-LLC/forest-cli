@@ -53,6 +53,24 @@ pub fn packages_base(manifest: &serde_json::Value) -> String {
     }
 }
 
+/// `packages_base`, checked the way extra mount paths are: `packagesDir`
+/// must be a plain folder name and the whole path must stay inside the
+/// project. An install empties the mount's top level, so a `root` or
+/// `packagesDir` that climbs out of the project would empty an outside
+/// folder.
+pub fn checked_packages_base(manifest: &serde_json::Value) -> anyhow::Result<String> {
+    crate::mounts::validate_folder_name(&packages_container(manifest))
+        .map_err(|reason| anyhow::anyhow!("Invalid packagesDir in forest.json: {}", reason))?;
+    let base = packages_base(manifest);
+    crate::mounts::normalize_mount_path(&base).map_err(|reason| {
+        anyhow::anyhow!(
+            "The dependency folder {} (from root and packagesDir in forest.json) is not valid: {}",
+            base,
+            reason
+        )
+    })
+}
+
 /// Map a plan-format path (`./<container>/...`) to its physical location
 /// under `base`. Plan/receipt/reconcile strings stay base-agnostic so the
 /// planning layer never learns where the mount physically sits; `container`
@@ -178,6 +196,22 @@ mod tests {
             packages_base(&json!({ "packagesDir": "roblox_packages", "root": "src/init.luau" })),
             "src/roblox_packages"
         );
+    }
+
+    #[test]
+    fn checked_packages_base_stays_inside_the_project() {
+        assert_eq!(checked_packages_base(&json!({})).unwrap(), "Packages");
+        assert_eq!(checked_packages_base(&json!({ "root": "./src/init.luau" })).unwrap(), "src/Packages");
+        // An install empties the folder, so none of these may reach one.
+        for manifest in [
+            json!({ "packagesDir": "../victim" }),
+            json!({ "packagesDir": "a/b" }),
+            json!({ "packagesDir": "C:/Users" }),
+            json!({ "root": "../other/init.luau" }),
+            json!({ "root": "/abs/init.luau" }),
+        ] {
+            assert!(checked_packages_base(&manifest).is_err(), "{} must be rejected", manifest);
+        }
     }
 
     #[test]
