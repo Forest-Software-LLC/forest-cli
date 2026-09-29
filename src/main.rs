@@ -274,7 +274,7 @@ enum MountAction {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     // Load .env based on NODE_ENV or fallback to ".env"
     if env::var("ENV") == Ok("dev".to_string()) {
         env::set_var("FOREST_API_URL", "http://localhost:3001/");
@@ -309,12 +309,12 @@ async fn main() -> anyhow::Result<()> {
     // Skipped private packages print even when a later step failed, and
     // always fail the run so CI can't pass on a partial tree.
     let skipped = install_report::report();
-    result?;
-    if skipped {
+    if let Err(err) = &result {
+        crate::message::error(err);
+    }
+    if skipped || result.is_err() {
         std::process::exit(1);
     }
-
-    Ok(())
 }
 
 async fn run(command: Commands) -> anyhow::Result<()> {

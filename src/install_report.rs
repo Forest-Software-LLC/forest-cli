@@ -5,7 +5,6 @@
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
-use colored::Colorize;
 
 /// Why the registry refused a private package's download URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,16 +87,16 @@ pub fn render(denied: &[DeniedPackage]) -> (String, Vec<String>) {
     );
     let mut sorted: Vec<&DeniedPackage> = denied.iter().collect();
     sorted.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
-    let mut lines: Vec<String> = sorted.iter().map(|d| format!("   {}@{}", d.name, d.version)).collect();
+    let mut lines: Vec<String> = sorted.iter().map(|d| format!("{}@{}", d.name, d.version)).collect();
 
     let reasons: BTreeSet<DenyReason> = denied.iter().map(|d| d.reason).collect();
     for reason in reasons {
         lines.push(match reason {
             DenyReason::NotLoggedIn => {
-                "   You're not logged in. Run `forest login`, or set FOREST_TOKEN to an API token in CI.".to_string()
+                "You're not logged in. Run `forest login`, or set FOREST_TOKEN to an API token in CI.".to_string()
             }
             DenyReason::SessionRejected => {
-                "   Your login has expired. Run `forest login` and install again.".to_string()
+                "Your login has expired. Run `forest login` and install again.".to_string()
             }
             DenyReason::NoAccess => {
                 let scopes: BTreeSet<&str> = denied
@@ -106,7 +105,7 @@ pub fn render(denied: &[DeniedPackage]) -> (String, Vec<String>) {
                     .map(DeniedPackage::scope)
                     .collect();
                 format!(
-                    "   Make sure you're authorized to the scope{} that failed: {}. The package maintainer has to grant you access.",
+                    "Make sure you're authorized to the scope{} that failed: {}. The package maintainer has to grant you access.",
                     if scopes.len() == 1 { "" } else { "s" },
                     scopes.into_iter().collect::<Vec<_>>().join(", ")
                 )
@@ -124,10 +123,7 @@ pub fn report() -> bool {
         return false;
     }
     let (headline, lines) = render(&denied);
-    crate::message::fail(&headline);
-    for line in lines {
-        println!("{}", line.red());
-    }
+    crate::message::error_block(&headline, &lines);
     true
 }
 
@@ -165,10 +161,10 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "   acme/core@1.2.0",
-                "   acme/net@0.3.1",
-                "   zeta/tools@2.0.0",
-                "   Make sure you're authorized to the scopes that failed: acme, zeta. The package maintainer has to grant you access.",
+                "acme/core@1.2.0",
+                "acme/net@0.3.1",
+                "zeta/tools@2.0.0",
+                "Make sure you're authorized to the scopes that failed: acme, zeta. The package maintainer has to grant you access.",
             ]
         );
     }
