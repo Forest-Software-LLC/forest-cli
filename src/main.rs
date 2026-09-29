@@ -13,6 +13,7 @@ mod message;
 mod lockfile;
 mod lockfile_gen;
 mod lockfile_solver;
+mod renames;
 mod meta_cache;
 mod mounts;
 mod roblox;

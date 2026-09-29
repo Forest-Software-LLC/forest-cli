@@ -458,6 +458,37 @@ mod tests {
     }
 
     #[test]
+    fn wally_import_of_a_renamed_package_keeps_the_wally_require_name() {
+        // gamebeast-gg/gamebeast is published on forest as
+        // gamebeast/RobloxSDK. Wally code requires the wally alias, so the
+        // install folder must stay that alias after the resolve re-keys it.
+        let import = crate::roblox::wally::parse_wally_manifest(
+            "[dependencies]\nGamebeast = \"gamebeast-gg/gamebeast@0.10.1\"\n\n[server-dependencies]\ngamebeast = \"gamebeast-gg/gamebeast@0.10.1\"\n",
+        )
+        .unwrap();
+        let renames = std::collections::HashMap::from([(
+            "gamebeast-gg/gamebeast".to_string(),
+            "gamebeast/RobloxSDK".to_string(),
+        )]);
+
+        // Alias differs from the name: imported as explicit, left alone
+        let mut shared = dep_map(&import.dependencies);
+        crate::renames::canonicalize_deps(&mut shared, &renames);
+        assert_eq!(
+            Value::Object(shared),
+            json!({ "gamebeast/RobloxSDK": { "version": "^0.10.1", "alias": "Gamebeast" } })
+        );
+
+        // Alias equal to the name: dropped on import, kept by the rename
+        let mut server = dep_map(&import.server_dependencies);
+        crate::renames::canonicalize_deps(&mut server, &renames);
+        assert_eq!(
+            Value::Object(server),
+            json!({ "gamebeast/RobloxSDK": { "version": "^0.10.1", "alias": "gamebeast" } })
+        );
+    }
+
+    #[test]
     fn a_packages_dir_colliding_with_a_wally_folder_fails_before_writing() {
         let base = fixture("wally-collide");
         let err = scaffold_project(&base, "DevPackages", &wally_import()).unwrap_err();

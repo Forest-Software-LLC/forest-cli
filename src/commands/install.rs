@@ -241,10 +241,24 @@ pub async fn install_command(
             .to_string();
         let canonical_full = format!("{}/{}", canonical_scope, canonical_name);
 
+        // A renamed package installs under the name typed, declared as an
+        // explicit alias, so requires written against it keep working.
+        let kept = if alias.is_none() && plat.alias_error().is_none() {
+            crate::renames::kept_alias(&pkg, &canonical_full)
+        } else {
+            None
+        };
+        let alias = alias.or_else(|| kept.clone());
+
         // Target name for the installed package.
         let resolved_name = alias.clone().unwrap_or_else(|| canonical_name.clone());
 
-        if canonical_full != pkg {
+        if kept.is_some() {
+            msg.emit(
+                MessageType::Info,
+                &crate::renames::renamed_notice(&pkg, &canonical_full, &resolved_name),
+            );
+        } else if canonical_full != pkg {
             msg.emit(
                 MessageType::Info,
                 &plat.resolved_note(&pkg, &canonical_full, &resolved_name),
@@ -271,11 +285,16 @@ pub async fn install_command(
         }
 
         // Already declared (case-insensitive: a hand-edited manifest key
-        // that differs only by case is still the same package)? Declared is
-        // not the same as ON DISK - a hand-deleted folder loses its receipt,
-        // so materializing the lockfile below restores it. When everything
-        // is present this ends in "Already up to date!".
-        if let Some(existing_key) = deps.keys().find(|k| k.eq_ignore_ascii_case(&canonical_full)).cloned() {
+        // that differs only by case is still the same package; the typed
+        // old address counts too, the sync rewrites it)? Declared is not the
+        // same as ON DISK: a hand-deleted folder loses its receipt, so
+        // materializing the lockfile below restores it. When everything is
+        // present this ends in "Already up to date!".
+        if let Some(existing_key) = deps
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(&canonical_full) || k.eq_ignore_ascii_case(&pkg))
+            .cloned()
+        {
             let place = if mounts.len() > 1 { format!(" (mount {})", add_to.path) } else { String::new() };
             msg.emit(
                 MessageType::Info,
